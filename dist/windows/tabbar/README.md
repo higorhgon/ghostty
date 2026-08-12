@@ -1,0 +1,99 @@
+# Native Windows tab bar for Ghostty
+
+A real WinUI `TabView` — the same control Windows Terminal, Notepad and
+File Explorer use — hosted inside Ghostty's plain Win32 window via XAML
+Islands, exposed to Zig through a flat C ABI.
+
+## Why this exists
+
+Win32 has no native tab control with the Windows 11 look. `SysTabControl32`
+is XP-era. Every app with Fluent tabs gets them from WinUI's `TabView`, so
+matching that appearance means actually using that control, not imitating
+it.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `ghostty-tabbar/` | **The real deliverable.** `ghostty_tabbar.dll` + its C ABI, plus a plain-C test host. |
+| `poc1/` | Proves XAML Islands host system XAML in a Win32 HWND. No NuGet, no packaging. |
+| `poc2/` | Proves WinUI 2's `TabView` renders when MSIX-packaged. |
+| `poc3/` | Same for WinUI 3, unpackaged. Kept for comparison. |
+| `fetch-deps.ps1` | Downloads NuGet packages and generates the C++/WinRT projections. |
+
+## Building
+
+```powershell
+.\fetch-deps.ps1              # once, ~600 MB, not committed
+.\ghostty-tabbar\build.bat    # builds the DLL and the C test host
+```
+
+WinUI 2 only activates for a process with package identity, so the test
+host must be registered before it will run:
+
+```powershell
+Add-AppxPackage -Register .\ghostty-tabbar\AppxManifest.xml   # needs Developer Mode
+Start-Process "shell:AppsFolder\Ghostty.TabBarTestHost_qdspqvpm741bc!App"
+```
+
+Logs land in `%TEMP%\ghostty_tabbar.log` and
+`%TEMP%\ghostty_tabbar_testhost.log` — a packaged app cannot write to its
+own install directory.
+
+## Design
+
+The DLL is deliberately dumb: it draws tabs and reports what was clicked.
+Ghostty keeps all policy — which shells exist, what a tab maps to, whether
+one may close. Closing is a *request*: the DLL never removes a tab on its
+own, it calls `on_close_requested` and waits for Ghostty to decide.
+
+## Hard-won details
+
+Each of these cost real debugging time; they are not obvious and the error
+messages mostly do not point at them.
+
+**Initialization order inside the `Application` subclass.** The base
+`Application` constructor must run, then
+`WindowsXamlManager::InitializeForCurrentThread()`, and only then may
+`Resources()` be touched. Any other order throws `RPC_E_WRONG_THREAD`.
+This one bug is what made an earlier C#/WinUI 3 attempt look impossible.
+
+**`Application::Current()` throws** — it does not return null — before any
+XAML exists in the process. It must be wrapped in try/catch.
+
+**The host `.exe` needs its own embedded manifest** declaring
+`<maxversiontested>`, *even when* MSIX-packaged with `MaxVersionTested`
+already in the package manifest. Without it XAML Islands fails with a bare
+`E_UNEXPECTED` and no explanation.
+
+**`XamlControlsResources` is XAML markup**, so parsing it needs type
+metadata. The `Application` must therefore also implement
+`IXamlMetadataProvider`, delegating to WinUI's
+`XamlControlsXamlMetaDataProvider`.
+
+**The root element needs an explicit theme and background.** Without one,
+unselected tabs render white-on-white — which looks exactly like the tabs
+failing to be added, and sends you debugging the wrong thing entirely.
+
+**XAML Island popups are clipped to the island's HWND.** The island here is
+only as tall as the tab strip, so a XAML `MenuFlyout` for the shell picker
+opens completely invisible. That is why the picker is a Win32
+`TrackPopupMenu` instead: a separate top-level window escapes those bounds.
+The tabs themselves remain a real `TabView`.
+
+Fixing that properly would mean the island owning the whole window and the
+terminal rendering into a `SwapChainPanel` — the full Windows Terminal
+architecture, and a port of Ghostty's renderer from OpenGL to Direct3D.
+
+## Routes considered
+
+Both were built and compared side by side before choosing.
+
+WinUI 3 works **unpackaged** (see `poc3/`), which would keep Ghostty a
+plain `.exe`, but requires the Windows App Runtime installed on the user's
+machine.
+
+WinUI 2 requires MSIX packaging, because its theme resources are addressed
+as `ms-appx://Microsoft.UI.Xaml.2.8/...` and that URI only resolves with
+real package identity. In exchange the installer carries every dependency
+and the user installs nothing extra. That is the route taken.

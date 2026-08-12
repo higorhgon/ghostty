@@ -1,0 +1,5 @@
+#include <winuser.h>
+
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID (the manifest the loader applies
+// to the process itself).
+1 RT_MANIFEST "app.manifest"
