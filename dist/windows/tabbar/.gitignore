@@ -27,3 +27,4 @@ shot*.png
 
 # Reference captures of other applications, kept locally only.
 ref_*.png
+cmp_*.png

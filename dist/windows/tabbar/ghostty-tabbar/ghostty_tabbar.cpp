@@ -128,6 +128,20 @@ struct GhosttyTabBar {
     // window state.
     WUX::Controls::FontIcon max_glyph{nullptr};
 
+    /// Brushes owned by the merged theme dictionary. Re-theming mutates
+    /// their Color in place rather than replacing them: WinUI resolves
+    /// these once when the TabViewItem template is applied, so swapping
+    /// the brush object afterwards would have no effect, while changing
+    /// the colour of the brush already in use propagates immediately.
+    WUX::Media::SolidColorBrush b_selected{nullptr};
+    WUX::Media::SolidColorBrush b_unselected{nullptr};
+    WUX::Media::SolidColorBrush b_hover{nullptr};
+    /// Every theme slot's copy, so recolouring reaches whichever one the
+    /// resource lookup actually resolves against.
+    std::vector<WUX::Media::SolidColorBrush> extra_brushes;
+    std::vector<WUX::Media::SolidColorBrush> extra_unselected;
+    std::vector<WUX::Media::SolidColorBrush> extra_hover;
+
     std::unordered_map<GhosttyTabId, MUX::Controls::TabViewItem> tabs;
     GhosttyTabId next_id = 1;
 
@@ -141,6 +155,95 @@ struct GhosttyTabBar {
 };
 
 namespace {
+
+/// Installs the named tab brushes and keeps handles so they can be
+/// recoloured in place.
+///
+/// STATUS: the brushes are created and recoloured correctly, but WinUI
+/// 2.8's stock TabViewItem does not read them -- its background is a
+/// translucent white overlay baked into the default ControlTemplate.
+/// Overriding the documented keys was measured having no effect through
+/// four different scopes: the TabView's ResourceDictionary, the
+/// Application's, each item's own, and these merged ThemeDictionaries
+/// (both the "Default" and "Dark" slots). Rendered values stayed at
+/// 46,48,53 unselected and 103,105,108 selected in every case.
+///
+/// They are kept because the fix is a ControlTemplate override for
+/// TabViewItem, and that template will bind to exactly these brushes.
+/// Until then the tabs use WinUI's default colours.
+bool InstallThemeOverrides(GhosttyTabBar* bar) {
+    // Placeholder colours; set_theme recolours these brushes in place.
+    static constexpr wchar_t kXaml[] =
+        LR"(<ResourceDictionary
+              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+              <ResourceDictionary.ThemeDictionaries>
+                <!-- "Default" is the dark slot by convention, but an
+                     element with an explicit RequestedTheme may look up
+                     "Dark" by name, so both are provided. -->
+                <ResourceDictionary x:Key="Default">
+                  <SolidColorBrush x:Key="GhosttyTabSelected" Color="#FF202020"/>
+                  <SolidColorBrush x:Key="GhosttyTabUnselected" Color="#FF141414"/>
+                  <SolidColorBrush x:Key="GhosttyTabHover" Color="#FF2D2D2D"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelected" ResourceKey="GhosttyTabSelected"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPointerOver" ResourceKey="GhosttyTabSelected"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPressed" ResourceKey="GhosttyTabSelected"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackground" ResourceKey="GhosttyTabUnselected"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundPointerOver" ResourceKey="GhosttyTabHover"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundPressed" ResourceKey="GhosttyTabHover"/>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                  <SolidColorBrush x:Key="GhosttyTabSelectedDark" Color="#FF202020"/>
+                  <SolidColorBrush x:Key="GhosttyTabUnselectedDark" Color="#FF141414"/>
+                  <SolidColorBrush x:Key="GhosttyTabHoverDark" Color="#FF2D2D2D"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelected" ResourceKey="GhosttyTabSelectedDark"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPointerOver" ResourceKey="GhosttyTabSelectedDark"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPressed" ResourceKey="GhosttyTabSelectedDark"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackground" ResourceKey="GhosttyTabUnselectedDark"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundPointerOver" ResourceKey="GhosttyTabHoverDark"/>
+                  <StaticResource x:Key="TabViewItemHeaderBackgroundPressed" ResourceKey="GhosttyTabHoverDark"/>
+                </ResourceDictionary>
+              </ResourceDictionary.ThemeDictionaries>
+            </ResourceDictionary>)";
+
+    auto app = WUX::Application::Current();
+    if (!app) return false;
+
+    auto obj = WUX::Markup::XamlReader::Load(kXaml);
+    auto dict = obj.try_as<WUX::ResourceDictionary>();
+    if (!dict) {
+        Log("theme: XamlReader did not yield a ResourceDictionary");
+        return false;
+    }
+    app.Resources().MergedDictionaries().Append(dict);
+
+    // Reach through the theme dictionary to keep the brush instances.
+    // Collect the brushes from every theme slot so recolouring hits
+    // whichever one the lookup actually settles on.
+    auto themes = dict.ThemeDictionaries();
+    for (auto const& slot : {L"Default", L"Dark"}) {
+        auto sub = themes.TryLookup(winrt::box_value(slot))
+                       .try_as<WUX::ResourceDictionary>();
+        if (!sub) continue;
+        const bool dark_slot = (std::wstring_view{slot} == L"Dark");
+        auto grab = [&](wchar_t const* base) {
+            std::wstring key{base};
+            if (dark_slot) key += L"Dark";
+            return sub.TryLookup(winrt::box_value(key))
+                .try_as<WUX::Media::SolidColorBrush>();
+        };
+        if (auto b = grab(L"GhosttyTabSelected")) bar->extra_brushes.push_back(b);
+        if (auto b = grab(L"GhosttyTabUnselected")) bar->extra_unselected.push_back(b);
+        if (auto b = grab(L"GhosttyTabHover")) bar->extra_hover.push_back(b);
+    }
+    if (!bar->extra_brushes.empty()) bar->b_selected = bar->extra_brushes.front();
+    if (!bar->extra_unselected.empty()) bar->b_unselected = bar->extra_unselected.front();
+    if (!bar->extra_hover.empty()) bar->b_hover = bar->extra_hover.front();
+
+    Log("theme: overrides installed (selected=%d unselected=%d hover=%d)",
+        bar->b_selected ? 1 : 0, bar->b_unselected ? 1 : 0, bar->b_hover ? 1 : 0);
+    return bar->b_selected != nullptr;
+}
 
 GhosttyTabId IdOf(MUX::Controls::TabViewItem const& item) {
     if (!item) return 0;
@@ -300,6 +403,10 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
             Log("create: reusing existing Application");
         }
 
+        // Must precede the TabView: the overrides are only picked up when
+        // an item's template is applied, which is too late once tabs exist.
+        InstallThemeOverrides(bar);
+
         bar->source = WUX::Hosting::DesktopWindowXamlSource();
         Log("create: DesktopWindowXamlSource OK");
         auto native = bar->source.as<IDesktopWindowXamlSourceNative>();
@@ -344,7 +451,8 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // gets no Content: supplying a FontIcon here stacks a second glyph
         // beside the built-in one.
         MUX::Controls::DropDownButton chevron;
-        chevron.Padding(WUX::ThicknessHelper::FromLengths(6, 4, 6, 4));
+        chevron.Padding(WUX::ThicknessHelper::FromLengths(10, 0, 10, 0));
+        chevron.VerticalAlignment(WUX::VerticalAlignment::Stretch);
         // Flat, like the "+" beside it -- the default button chrome draws
         // a filled box that reads as out of place in a title bar.
         chevron.Background(WUX::Media::SolidColorBrush(
@@ -354,7 +462,21 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // button just raises Click and we open a Win32 menu ourselves.
         chevron.Click([bar](auto&&, auto&&) { ShowProfileMenu(bar); });
         bar->chevron = chevron;
-        tv.TabStripFooter(chevron);
+
+        // Windows Terminal separates "+" from the profile chevron with a
+        // hairline rule; without it the two read as one wide button.
+        WUX::Controls::Border separator;
+        separator.Width(1);
+        separator.Margin(WUX::ThicknessHelper::FromLengths(2, 10, 2, 10));
+        separator.Background(WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{60, 255, 255, 255}));
+
+        WUX::Controls::StackPanel footer;
+        footer.Orientation(WUX::Controls::Orientation::Horizontal);
+        footer.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+        footer.Children().Append(separator);
+        footer.Children().Append(chevron);
+        tv.TabStripFooter(footer);
 
         // The strip doubles as the window's title bar, so it is laid out
         // in three columns, matching Windows Terminal:
@@ -576,15 +698,62 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_maximized(
     }
 }
 
+namespace {
+
+uint8_t Scale(uint8_t c, double factor) {
+    const double v = static_cast<double>(c) * factor;
+    return static_cast<uint8_t>(v < 0.0 ? 0.0 : (v > 255.0 ? 255.0 : v));
+}
+
+winrt::Windows::UI::Color Rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return winrt::Windows::UI::Color{255, r, g, b};
+}
+
+void PutBrush(WUX::ResourceDictionary const& res, wchar_t const* key,
+              winrt::Windows::UI::Color color) {
+    res.Insert(winrt::box_value(key), WUX::Media::SolidColorBrush(color));
+}
+
+} // namespace
+
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
     GhosttyTabBar* bar, uint8_t r, uint8_t g, uint8_t b, int32_t dark) {
-    if (!bar || !bar->root) return;
+    if (!bar || !bar->root || !bar->tab_view) return;
     try {
         bar->root.RequestedTheme(dark ? WUX::ElementTheme::Dark
                                       : WUX::ElementTheme::Light);
-        bar->root.Background(WUX::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{255, r, g, b}));
+
+        // Windows Terminal's colour model, which is the opposite of the
+        // obvious one: the *selected* tab takes the terminal's exact
+        // background so it reads as continuous with the content below it,
+        // and the strip around it is darker (lighter, on a light theme).
+        //
+        // Painting the strip with the terminal colour instead leaves WinUI
+        // to derive the selected tab from it, and its default overlay
+        // darkens -- which inverts the whole thing and is what this used
+        // to look like.
+        const double strip_factor = dark ? 0.62 : 1.12;
+        const double hover_factor = dark ? 0.80 : 1.06;
+        const auto content = Rgb(r, g, b);
+        const auto strip = Rgb(Scale(r, strip_factor), Scale(g, strip_factor),
+                               Scale(b, strip_factor));
+        const auto hover = Rgb(Scale(r, hover_factor), Scale(g, hover_factor),
+                               Scale(b, hover_factor));
+
+        bar->root.Background(WUX::Media::SolidColorBrush(strip));
+
+        // Recolour in place: the brushes are already bound into applied
+        // templates, so replacing the objects would change nothing.
+        for (auto& b : bar->extra_brushes) b.Color(content);
+        for (auto& b : bar->extra_unselected) b.Color(strip);
+        for (auto& b : bar->extra_hover) b.Color(hover);
+
+        Log("set_theme: content=%02X%02X%02X strip=%02X%02X%02X",
+            content.R, content.G, content.B, strip.R, strip.G, strip.B);
+    } catch (hresult_error const& e) {
+        Log("set_theme: FAILED 0x%08X: %ls", (unsigned)e.code(), e.message().c_str());
     } catch (...) {
+        Log("set_theme: FAILED (unknown)");
     }
 }
 
