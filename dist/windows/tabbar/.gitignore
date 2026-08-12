@@ -24,3 +24,6 @@ shot*.png
 
 # Runtime logs from verification runs.
 *_log.txt
+
+# Reference captures of other applications, kept locally only.
+ref_*.png

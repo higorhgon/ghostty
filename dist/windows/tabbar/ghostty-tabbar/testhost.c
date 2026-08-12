@@ -3,6 +3,7 @@
 // COM/WinRT, which is exactly Zig's situation.
 
 #include <windows.h>
+#include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
 #include <stdio.h>
 #include "ghostty_tabbar.h"
 
@@ -62,23 +63,92 @@ static void OnNewTab(void* ctx, GhosttyProfileId profile) {
     ghostty_tabbar_set_selected(g_bar, id);
 }
 
+static void OnCaption(void* ctx, GhosttyCaptionButton which);
+static void OnDragStart(void* ctx);
+static void OnDragDoubleClick(void* ctx);
+
+static HWND g_hwnd = NULL;
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    // Remove the system title bar while keeping a real, resizable frame.
+    // Letting DefWindowProc compute the client rect and then restoring
+    // rc.top gives us the caption's space as client area, which is where
+    // the tab strip is drawn.
+    case WM_NCCALCSIZE:
+        if (wp == TRUE) {
+            NCCALCSIZE_PARAMS* p = (NCCALCSIZE_PARAMS*)lp;
+            LONG top = p->rgrc[0].top;
+            DefWindowProcW(hwnd, msg, wp, lp);
+            p->rgrc[0].top = top;
+            return 0;
+        }
+        break;
+
+    // With the caption gone, the top resize edge has to be restored by
+    // hand or the window can only be resized from three sides.
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        if (hit == HTCLIENT) {
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            if (pt.y < GetSystemMetrics(SM_CYFRAME) +
+                       GetSystemMetrics(SM_CXPADDEDBORDER)) {
+                return HTTOP;
+            }
+        }
+        return hit;
+    }
+
     case WM_SIZE:
         if (g_bar) {
-            // The island is only as tall as the strip -- matching how
-            // Ghostty will lay it out, with the terminal surface below.
-            // The shell picker is a Win32 menu precisely because a XAML
-            // flyout would be clipped by these bounds.
+            // A maximized window with a custom frame is positioned offset
+            // by the frame thickness, pushing the top of the client area
+            // off-screen. Pad by that much or the strip gets clipped.
+            int pad = (wp == SIZE_MAXIMIZED)
+                ? GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)
+                : 0;
+            // The strip spans the full width at the top -- it *is* the
+            // title bar. The terminal surface would occupy everything
+            // below it.
             int h = ghostty_tabbar_height(g_bar);
-            ghostty_tabbar_resize(g_bar, 0, 0, LOWORD(lp), h);
+            ghostty_tabbar_resize(g_bar, 0, pad, LOWORD(lp), h);
+            ghostty_tabbar_set_maximized(g_bar, wp == SIZE_MAXIMIZED);
         }
         return 0;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OnCaption(void* ctx, GhosttyCaptionButton which) {
+    (void)ctx;
+    switch (which) {
+    case GHOSTTY_CAPTION_MINIMIZE:
+        ShowWindow(g_hwnd, SW_MINIMIZE);
+        break;
+    case GHOSTTY_CAPTION_MAXIMIZE_RESTORE:
+        ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+        break;
+    case GHOSTTY_CAPTION_CLOSE:
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        break;
+    }
+}
+
+// Hand the drag off to the system's own move loop.
+static void OnDragStart(void* ctx) {
+    (void)ctx;
+    ReleaseCapture();
+    SendMessageW(g_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+}
+
+static void OnDragDoubleClick(void* ctx) {
+    (void)ctx;
+    ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE);
 }
 
 int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE p, PWSTR c, int s) {
@@ -90,7 +160,10 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE p, PWSTR c, int s) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hinst;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    // Dark fill standing in for where Ghostty's terminal surface would be,
+    // so the strip is judged against a realistic backdrop rather than
+    // white.
+    wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 46));
     wc.lpszClassName = L"GhosttyTabBarTestHost";
     RegisterClassExW(&wc);
 
@@ -98,12 +171,22 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE p, PWSTR c, int s) {
         L"ghostty_tabbar.dll test host", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1100, 320, NULL, NULL, hinst, NULL);
     if (!hwnd) { Log("FATAL: CreateWindowExW failed"); return 1; }
+    g_hwnd = hwnd;
+
+    // Force a WM_NCCALCSIZE now that the frame rules changed, so the
+    // caption area is surrendered before the window is first shown.
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                 SWP_NOZORDER | SWP_NOACTIVATE);
 
     GhosttyTabBarCallbacks cb = {0};
     cb.ctx = NULL;
     cb.on_selected = OnSelected;
     cb.on_close_requested = OnCloseRequested;
     cb.on_new_tab = OnNewTab;
+    cb.on_caption_button = OnCaption;
+    cb.on_drag_start = OnDragStart;
+    cb.on_drag_double_click = OnDragDoubleClick;
 
     g_bar = ghostty_tabbar_create(hwnd, cb);
     if (!g_bar) { Log("FATAL: ghostty_tabbar_create returned NULL"); return 2; }

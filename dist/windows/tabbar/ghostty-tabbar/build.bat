@@ -14,7 +14,10 @@ if errorlevel 1 (
 
 cd /d "%~dp0"
 
-cl /nologo /std:c++17 /EHsc /LD /MD ^
+REM /utf-8 is required: without it MSVC reads this UTF-8 source using the
+REM system ANSI codepage, so the Segoe Fluent Icons codepoints in the
+REM caption glyphs decode into garbage and render as tofu boxes.
+cl /nologo /std:c++17 /EHsc /LD /MD /utf-8 ^
    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_UNICODE /DUNICODE ^
    /I "%PROJ%" ^
    ghostty_tabbar.cpp ^
@@ -34,7 +37,7 @@ REM app.res goes after /link: with /TC, cl would otherwise try to compile
 REM the .res file as C source.
 cl /nologo /TC /MD /DWIN32_LEAN_AND_MEAN /D_UNICODE /DUNICODE ^
    testhost.c ^
-   /link /SUBSYSTEM:WINDOWS app.res user32.lib ghostty_tabbar.lib ^
+   /link /SUBSYSTEM:WINDOWS app.res user32.lib gdi32.lib ghostty_tabbar.lib ^
    /OUT:testhost.exe
 if errorlevel 1 exit /b 1
 

@@ -52,11 +52,39 @@ typedef void (*GhosttyNewTabFn)(void* ctx, GhosttyProfileId profile);
 
 #define GHOSTTY_PROFILE_DEFAULT ((GhosttyProfileId)0xFFFFFFFFu)
 
+// Which caption button was pressed. The strip doubles as the title bar
+// (Windows Terminal style), so it draws these itself -- removing the
+// system title bar also removes the system's buttons.
+typedef enum {
+    GHOSTTY_CAPTION_MINIMIZE = 0,
+    GHOSTTY_CAPTION_MAXIMIZE_RESTORE = 1,
+    GHOSTTY_CAPTION_CLOSE = 2,
+} GhosttyCaptionButton;
+
+typedef void (*GhosttyCaptionFn)(void* ctx, GhosttyCaptionButton button);
+
+// The user pressed the empty part of the strip. The host should begin a
+// window drag, conventionally:
+//     ReleaseCapture();
+//     SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+//
+// This callback exists because the island is a child HWND and therefore
+// consumes the mouse: WM_NCHITTEST on the parent never sees these points,
+// so the strip cannot become draggable by hit-testing alone.
+typedef void (*GhosttyDragStartFn)(void* ctx);
+
+// The user double-clicked the empty strip, which by convention toggles
+// maximize.
+typedef void (*GhosttyDragDoubleClickFn)(void* ctx);
+
 typedef struct {
     void* ctx;
     GhosttyTabSelectedFn on_selected;
     GhosttyTabCloseRequestedFn on_close_requested;
     GhosttyNewTabFn on_new_tab;
+    GhosttyCaptionFn on_caption_button;
+    GhosttyDragStartFn on_drag_start;
+    GhosttyDragDoubleClickFn on_drag_double_click;
 } GhosttyTabBarCallbacks;
 
 // Creates the tab strip as a child of `parent_hwnd`. Returns NULL on
@@ -107,6 +135,11 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar);
 // it blends into the terminal below.
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
     GhosttyTabBar* bar, uint8_t r, uint8_t g, uint8_t b, int32_t dark);
+
+// Swaps the maximize glyph for the restore glyph and back. Call from the
+// host's WM_SIZE so the button reflects the real window state.
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_maximized(
+    GhosttyTabBar* bar, int32_t maximized);
 
 #ifdef __cplusplus
 }

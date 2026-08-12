@@ -8,12 +8,16 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.h>
+// PointerPoint::Properties() is declared in Windows.UI.Input; without the
+// definition the drag handler cannot read which button is down.
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
@@ -120,6 +124,9 @@ struct GhosttyTabBar {
     WUX::Controls::Grid root{nullptr};
     MUX::Controls::TabView tab_view{nullptr};
     MUX::Controls::DropDownButton chevron{nullptr};
+    // Maximize/restore share one button; its glyph is swapped to match the
+    // window state.
+    WUX::Controls::FontIcon max_glyph{nullptr};
 
     std::unordered_map<GhosttyTabId, MUX::Controls::TabViewItem> tabs;
     GhosttyTabId next_id = 1;
@@ -150,6 +157,60 @@ GhosttyTabId IdOf(MUX::Controls::TabViewItem const& item) {
 // UI exists, and the menu is built fresh each time it opens.
 std::unordered_map<GhosttyTabBar*, std::vector<std::pair<GhosttyProfileId, std::wstring>>>
     g_profiles;
+
+// Caption button metrics, matching the system title bar at 96 DPI.
+constexpr double kCaptionButtonWidth = 46.0;
+
+// Segoe Fluent Icons / Segoe MDL2 Assets codepoints for the caption
+// glyphs. Written as escapes rather than literal characters so the source
+// file stays pure ASCII -- a literal glyph here is easy to mangle in
+// transit and renders as tofu.
+constexpr wchar_t kGlyphMinimize[] = L"";
+constexpr wchar_t kGlyphMaximize[] = L"";
+constexpr wchar_t kGlyphRestore[]  = L"";
+constexpr wchar_t kGlyphClose[]    = L"";
+
+// Builds one caption button. `danger` gives the close button the standard
+// red hover treatment.
+WUX::Controls::Button MakeCaptionButton(
+    GhosttyTabBar* bar, wchar_t const* glyph, GhosttyCaptionButton which,
+    bool danger, WUX::Controls::FontIcon* out_icon) {
+    WUX::Controls::FontIcon icon;
+    icon.Glyph(glyph);
+    icon.FontFamily(WUX::Media::FontFamily(L"Segoe Fluent Icons, Segoe MDL2 Assets"));
+    icon.FontSize(10);
+    if (out_icon) *out_icon = icon;
+
+    WUX::Controls::Button btn;
+    btn.Content(icon);
+    btn.Width(kCaptionButtonWidth);
+    btn.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+    btn.Padding(WUX::ThicknessHelper::FromUniformLength(0));
+    btn.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
+    btn.CornerRadius(WUX::CornerRadiusHelper::FromUniformRadius(0));
+    btn.Background(WUX::Media::SolidColorBrush(
+        winrt::Windows::UI::Color{0, 0, 0, 0}));
+
+    if (danger) {
+        // WinUI has no "close button" style, so the red hover is applied
+        // by overriding the button's own hover brushes.
+        auto red = WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{255, 196, 43, 28});
+        btn.Resources().Insert(winrt::box_value(L"ButtonBackgroundPointerOver"), red);
+        auto pressed = WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{255, 165, 36, 24});
+        btn.Resources().Insert(winrt::box_value(L"ButtonBackgroundPressed"), pressed);
+        auto white = WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{255, 255, 255, 255});
+        btn.Resources().Insert(winrt::box_value(L"ButtonForegroundPointerOver"), white);
+        btn.Resources().Insert(winrt::box_value(L"ButtonForegroundPressed"), white);
+    }
+
+    btn.Click([bar, which](auto&&, auto&&) {
+        if (bar->cb.on_caption_button) bar->cb.on_caption_button(bar->cb.ctx, which);
+    });
+    return btn;
+}
 
 // The shell picker is a Win32 popup menu rather than a XAML MenuFlyout.
 //
@@ -284,12 +345,25 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // beside the built-in one.
         MUX::Controls::DropDownButton chevron;
         chevron.Padding(WUX::ThicknessHelper::FromLengths(6, 4, 6, 4));
+        // Flat, like the "+" beside it -- the default button chrome draws
+        // a filled box that reads as out of place in a title bar.
+        chevron.Background(WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{0, 0, 0, 0}));
+        chevron.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
         // No XAML Flyout is attached (see ShowProfileMenu for why); the
         // button just raises Click and we open a Win32 menu ourselves.
         chevron.Click([bar](auto&&, auto&&) { ShowProfileMenu(bar); });
         bar->chevron = chevron;
         tv.TabStripFooter(chevron);
 
+        // The strip doubles as the window's title bar, so it is laid out
+        // in three columns, matching Windows Terminal:
+        //
+        //   [ tabs + "+" + chevron ][ drag area ][ - o x ]
+        //         Auto                  *          Auto
+        //
+        // The middle column is elastic and does nothing but absorb space
+        // and start window drags.
         WUX::Controls::Grid root;
         // An explicit theme + background is required: without it the strip
         // paints on an undefined surface and unselected tabs can render
@@ -297,9 +371,51 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         root.RequestedTheme(WUX::ElementTheme::Dark);
         root.Background(WUX::Media::SolidColorBrush(
             winrt::Windows::UI::Color{255, 32, 32, 32}));
-        root.Children().Append(tv);
-        bar->root = root;
 
+        {
+            WUX::Controls::ColumnDefinition c0, c1, c2;
+            c0.Width(WUX::GridLengthHelper::Auto());
+            c1.Width(WUX::GridLengthHelper::FromValueAndType(1, WUX::GridUnitType::Star));
+            c2.Width(WUX::GridLengthHelper::Auto());
+            root.ColumnDefinitions().Append(c0);
+            root.ColumnDefinitions().Append(c1);
+            root.ColumnDefinitions().Append(c2);
+        }
+
+        WUX::Controls::Grid::SetColumn(tv, 0);
+        root.Children().Append(tv);
+
+        // Transparent drag surface. A Border with a fully transparent
+        // brush still receives pointer input, whereas a null Background
+        // would let events fall through.
+        WUX::Controls::Border drag;
+        drag.Background(WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{0, 0, 0, 0}));
+        drag.PointerPressed([bar](auto&&, WUX::Input::PointerRoutedEventArgs const& e) {
+            auto props = e.GetCurrentPoint(nullptr).Properties();
+            if (!props.IsLeftButtonPressed()) return;
+            if (bar->cb.on_drag_start) bar->cb.on_drag_start(bar->cb.ctx);
+        });
+        drag.DoubleTapped([bar](auto&&, auto&&) {
+            if (bar->cb.on_drag_double_click) bar->cb.on_drag_double_click(bar->cb.ctx);
+        });
+        WUX::Controls::Grid::SetColumn(drag, 1);
+        root.Children().Append(drag);
+
+        WUX::Controls::StackPanel caption;
+        caption.Orientation(WUX::Controls::Orientation::Horizontal);
+        caption.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+        caption.Children().Append(MakeCaptionButton(
+            bar, kGlyphMinimize, GHOSTTY_CAPTION_MINIMIZE, false, nullptr));
+        caption.Children().Append(MakeCaptionButton(
+            bar, kGlyphMaximize, GHOSTTY_CAPTION_MAXIMIZE_RESTORE, false,
+            &bar->max_glyph));
+        caption.Children().Append(MakeCaptionButton(
+            bar, kGlyphClose, GHOSTTY_CAPTION_CLOSE, true, nullptr));
+        WUX::Controls::Grid::SetColumn(caption, 2);
+        root.Children().Append(caption);
+
+        bar->root = root;
         bar->source.Content(root);
         Log("create: content set OK");
     } catch (hresult_error const& e) {
@@ -344,6 +460,27 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_resize(
     GhosttyTabBar* bar, int32_t x, int32_t y, int32_t width, int32_t height) {
     if (!bar || !bar->island_hwnd) return;
     ::SetWindowPos(bar->island_hwnd, nullptr, x, y, width, height, SWP_SHOWWINDOW);
+
+    // The TabView sits in an Auto-width column, so left alone it demands
+    // its full natural width and squeezes the drag area and caption
+    // buttons off the end of the strip. Cap it explicitly at whatever is
+    // left after the caption buttons, in DIPs.
+    if (!bar->tab_view) return;
+    UINT dpi = 96;
+    if (bar->parent_hwnd) {
+        UINT d = ::GetDpiForWindow(bar->parent_hwnd);
+        if (d) dpi = d;
+    }
+    const double dips = static_cast<double>(width) * 96.0 / static_cast<double>(dpi);
+    const double reserved = kCaptionButtonWidth * 3.0;
+    // Always leave a slice of drag area, otherwise a full-width tab strip
+    // would make the window impossible to move by its title bar.
+    constexpr double kMinDragArea = 32.0;
+    const double avail = dips - reserved - kMinDragArea;
+    try {
+        bar->tab_view.MaxWidth(avail > 0.0 ? avail : 0.0);
+    } catch (...) {
+    }
 }
 
 GHOSTTY_TABBAR_API int32_t ghostty_tabbar_pretranslate(
@@ -428,6 +565,15 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar) {
     if (!bar) return;
     g_profiles[bar].clear();
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_maximized(
+    GhosttyTabBar* bar, int32_t maximized) {
+    if (!bar || !bar->max_glyph) return;
+    try {
+        bar->max_glyph.Glyph(maximized ? kGlyphRestore : kGlyphMaximize);
+    } catch (...) {
+    }
 }
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
