@@ -32,6 +32,19 @@ const compat_fd = @import("../lib/compat/fd.zig");
 
 const log = std.log.scoped(.io_exec);
 
+/// Closes a pipe/fd created via `internal_os.pipe()`. On non-Windows this is
+/// just `posix.system.close`. On Windows, `posix.fd_t` is a raw `HANDLE`
+/// (not a CRT file descriptor number), and `posix.system.close` is not a
+/// linkable symbol against the MSVC CRT (it's only provided by MinGW's libc
+/// shim), so we close it with `CloseHandle` directly instead.
+fn closeFd(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
+}
+
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
 
@@ -123,8 +136,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closeFd(pipe[0]);
+    errdefer closeFd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -203,21 +216,54 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
-        .SUCCESS => {},
+    //
+    // On Windows, posix.system.write() does not actually perform a
+    // WriteFile() on a raw (non-CRT) HANDLE like our quit pipe -- the byte
+    // silently never lands in the pipe, so the read thread's PeekNamedPipe
+    // check below never sees it and the thread (and thus this join()) hangs
+    // forever. Call WriteFile() directly instead.
+    if (comptime builtin.os.tag == .windows) {
+        var written: windows.DWORD = 0;
+        if (windows.exp.kernel32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                // The read thread's end is already closed, which is fine.
+                .BROKEN_PIPE, .NO_DATA => {},
+                else => |err| log.warn(
+                    "error writing to read thread quit pipe err={}",
+                    .{err},
+                ),
+            }
+        }
+    } else {
+        switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+            .SUCCESS => {},
 
-        // EPIPE means that our read thread is closed already, which is
-        // completely fine since that is what we were trying to achieve.
-        .PIPE => {},
+            // EPIPE means that our read thread is closed already, which is
+            // completely fine since that is what we were trying to achieve.
+            .PIPE => {},
 
-        else => |e| log.warn(
-            "error writing to read thread quit pipe err=E{s}",
-            .{@tagName(e)},
-        ),
+            else => |e| log.warn(
+                "error writing to read thread quit pipe err=E{s}",
+                .{@tagName(e)},
+            ),
+        }
     }
 
     if (comptime builtin.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
+        // Interrupt the blocking read so the thread can see the quit
+        // message. The read thread does a *synchronous* (non-overlapped)
+        // ReadFile, so CancelSynchronousIo (which targets the blocked
+        // thread) is what actually wakes it up; CancelIoEx is kept as a
+        // best-effort fallback in case the read happens to be pending as
+        // overlapped I/O for some reason.
+        if (windows.exp.kernel32.CancelSynchronousIo(
+            exec.read_thread.getHandle(),
+        ) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                .NOT_FOUND => {},
+                else => |err| log.warn("error interrupting read thread (sync) err={}", .{err}),
+            }
+        }
         if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
             switch (windows.GetLastError()) {
                 .NOT_FOUND => {},
@@ -547,7 +593,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closeFd(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -1776,7 +1822,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer closeFd(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{

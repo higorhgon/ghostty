@@ -690,6 +690,7 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtkNg(step),
+            .win32 => self.addWin32(step),
         }
     }
 
@@ -890,6 +891,22 @@ fn addGtkNg(
         translated.mod.addCSourceFile(.{ .file = dist.resources_c.path(b), .flags = &.{} });
         step.root_module.addImport("ghostty_gtk_resources", translated.mod);
     }
+}
+
+/// Setup the dependencies for the native win32 apprt build. This is a
+/// minimal, hand-rolled Win32/WGL windowed application (no GTK, no
+/// libadwaita) so we only need to link the base system libraries.
+fn addWin32(
+    self: *const SharedDeps,
+    step: *std.Build.Step.Compile,
+) void {
+    _ = self;
+    step.root_module.linkSystemLibrary("user32", .{});
+    step.root_module.linkSystemLibrary("gdi32", .{});
+    step.root_module.linkSystemLibrary("opengl32", .{});
+    step.root_module.linkSystemLibrary("shell32", .{});
+    step.root_module.linkSystemLibrary("ole32", .{});
+    step.root_module.linkSystemLibrary("dwmapi", .{});
 }
 
 /// Add only the dependencies required for `Config.simd` enabled. This also

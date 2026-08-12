@@ -45,6 +45,18 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+/// Pixel offset (in the destination framebuffer, using OpenGL's
+/// bottom-left-origin window-space convention) at which `present()` blits
+/// its target. `glBlitFramebuffer`'s destination rect is always in
+/// absolute framebuffer pixels -- it ignores the current `glViewport` --
+/// so an apprt that renders multiple independent surfaces into different
+/// regions of one shared window (e.g. split panes; see apprt/win32.zig)
+/// needs to set this explicitly before each surface's `drawFrame`.
+/// Defaults to (0,0), i.e. the whole window, which is a no-op for apprts
+/// with exactly one surface per window/GL context.
+present_offset_x: i32 = 0,
+present_offset_y: i32 = 0,
+
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
 ///       can't actually fail.
@@ -165,8 +177,14 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
-        // GTK uses global OpenGL context so we load from null.
+        // GTK uses global OpenGL context so we load from null. Win32
+        // similarly already has its WGL context current on this thread
+        // (made current in apprt/win32.zig right before this is called),
+        // so glad's built-in loader (which knows how to resolve function
+        // pointers via wglGetProcAddress/GetProcAddress) works the same
+        // way.
         apprt.gtk,
+        apprt.win32,
         => try prepareContext(null),
 
         apprt.embedded => {
@@ -201,11 +219,14 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
-        apprt.gtk => {
+        apprt.gtk, apprt.win32 => {
             // GTK doesn't support threaded OpenGL operations as far as I can
             // tell, so we use the renderer thread to setup all the state
             // but then do the actual draws and texture syncs and all that
-            // on the main thread. As such, we don't do anything here.
+            // on the main thread. As such, we don't do anything here. Win32
+            // follows the same model: the WGL context stays current on the
+            // app/main thread for the process lifetime (see apprt/win32.zig),
+            // so there's nothing to acquire on the renderer thread.
         },
 
         apprt.embedded => {
@@ -223,8 +244,8 @@ pub fn threadExit(self: *const OpenGL) void {
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
-        apprt.gtk => {
-            // We don't need to do any unloading for GTK because we may
+        apprt.gtk, apprt.win32 => {
+            // We don't need to do any unloading for GTK/win32 because we may
             // be sharing the global bindings with other windows.
         },
 
@@ -312,16 +333,20 @@ pub fn present(self: *OpenGL, target: Target) !void {
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();
 
-    // Blit
+    // Blit. The destination rect is offset by present_offset_{x,y} so
+    // apprts that render several surfaces into one shared window (split
+    // panes) can position each one correctly -- glBlitFramebuffer's
+    // destination is always in absolute framebuffer pixels regardless of
+    // the current glViewport.
     gl.glad.context.BlitFramebuffer.?(
         0,
         0,
         @intCast(target.width),
         @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
+        self.present_offset_x,
+        self.present_offset_y,
+        self.present_offset_x + @as(i32, @intCast(target.width)),
+        self.present_offset_y + @as(i32, @intCast(target.height)),
         gl.c.GL_COLOR_BUFFER_BIT,
         gl.c.GL_NEAREST,
     );

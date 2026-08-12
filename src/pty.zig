@@ -415,13 +415,62 @@ const WindowsPty = struct {
         //     _ = windows.CloseHandle(pty.in_pipe);
         // }
 
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == windows.FALSE) {
+        // The out_pipe (read side, consumed by a dedicated blocking read
+        // thread rather than the xev/IOCP loop) also needs to be a named
+        // pipe rather than an anonymous CreatePipe() pipe. Anonymous pipes
+        // cannot have a pending synchronous ReadFile cancelled via
+        // CancelIoEx/CancelSynchronousIo -- only named pipes (and regular
+        // files) support that. Without this, closing a Ghostty window
+        // deadlocks forever joining this thread, since it stays blocked
+        // in ReadFile on the child shell's pty output pipe even after the
+        // shell process has been signalled to stop.
+        var out_pipe_path_buf: [128]u8 = undefined;
+        var out_pipe_path_buf_w: [128]u16 = undefined;
+        const out_pipe_path = std.fmt.bufPrintZ(
+            &out_pipe_path_buf,
+            "\\\\.\\pipe\\LOCAL\\ghostty-pty-out-{d}-{d}",
+            .{
+                windows.GetCurrentProcessId(),
+                pipe_name_counter.fetchAdd(1, .monotonic),
+            },
+        ) catch unreachable;
+        const out_pipe_path_w_len = std.unicode.utf8ToUtf16Le(
+            &out_pipe_path_buf_w,
+            out_pipe_path,
+        ) catch unreachable;
+        out_pipe_path_buf_w[out_pipe_path_w_len] = 0;
+        const out_pipe_path_w = out_pipe_path_buf_w[0..out_pipe_path_w_len :0];
+
+        pty.out_pipe = windows.exp.kernel32.CreateNamedPipeW(
+            out_pipe_path_w.ptr,
+            windows.PIPE_ACCESS_INBOUND |
+                windows.FILE_FLAG_FIRST_PIPE_INSTANCE,
+            windows.PIPE_TYPE_BYTE,
+            1,
+            4096,
+            4096,
+            0,
+            &security_attributes,
+        );
+        if (pty.out_pipe == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer {
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
+
+        var security_attributes_write = security_attributes;
+        pty.out_pipe_pty = windows.exp.kernel32.CreateFileW(
+            out_pipe_path_w.ptr,
+            windows.GENERIC_WRITE,
+            0,
+            &security_attributes_write,
+            windows.OPEN_EXISTING,
+            windows.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (pty.out_pipe_pty == windows.INVALID_HANDLE_VALUE) {
+            return windows.unexpectedError(windows.GetLastError());
         }
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
 
         const SetHandleInformation = struct {
             fn f(hObject: windows.HANDLE) !void {
