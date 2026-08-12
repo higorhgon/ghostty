@@ -1,0 +1,8 @@
+# Build output. `dotnet build` with SelfContained=true drops the whole
+# .NET runtime plus the Windows App SDK here -- ~195 MB against 21 KB of
+# actual source.
+bin/
+obj/
+
+# Per-user Visual Studio state.
+*.csproj.user

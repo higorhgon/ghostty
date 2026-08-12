@@ -19,6 +19,7 @@ it.
 | `poc1/` | Proves XAML Islands host system XAML in a Win32 HWND. No NuGet, no packaging. |
 | `poc2/` | Proves WinUI 2's `TabView` renders when MSIX-packaged. |
 | `poc3/` | Same for WinUI 3, unpackaged. Kept for comparison. |
+| `../tabhost/` | The abandoned C#/WinUI 3 attempt this replaced. Not built. |
 | `fetch-deps.ps1` | Downloads NuGet packages and generates the C++/WinRT projections. |
 
 ## Building
@@ -56,7 +57,8 @@ messages mostly do not point at them.
 `Application` constructor must run, then
 `WindowsXamlManager::InitializeForCurrentThread()`, and only then may
 `Resources()` be touched. Any other order throws `RPC_E_WRONG_THREAD`.
-This one bug is what made an earlier C#/WinUI 3 attempt look impossible.
+This one bug is what made an earlier C#/WinUI 3 attempt look impossible;
+that attempt is kept in `../tabhost/` with the details.
 
 **`Application::Current()` throws** — it does not return null — before any
 XAML exists in the process. It must be wrapped in try/catch.
