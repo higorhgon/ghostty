@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MSIX manifest for the Windows build.
+     Packaging is not optional here: the native tab strip is a WinUI 2
+     TabView, and WinUI 2 only activates for a process with real package
+     identity. Run unpackaged and the strip silently degrades to the
+     hand-drawn GDI fallback.
+     The PackageDependency entries are also what make the installer
+     self-sufficient: the frameworks come down with it, so the user
+     installs nothing else. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="Ghostty.Terminal"
+    Publisher="CN=Ghostty"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Ghostty</DisplayName>
+    <PublisherDisplayName>Ghostty</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>A fast, feature-rich terminal emulator.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+    <PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.33728.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+    <PackageDependency Name="Microsoft.UI.Xaml.2.8" MinVersion="8.2511.26001.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- Windows.FullTrustApplication: an ordinary Win32 program that gains
+         package identity, not a sandboxed UWP app. -->
+    <Application Id="Ghostty" Executable="bin\ghostty.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Ghostty"
+        Description="A fast, feature-rich terminal emulator."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

@@ -22,6 +22,7 @@ const CoreSurface = @import("../Surface.zig");
 const input = @import("../input.zig");
 const global = @import("../global.zig");
 const internal_os = @import("../os/main.zig");
+const tabbar = @import("win32/tabbar.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -216,6 +217,33 @@ const w32 = struct {
     pub const WM_MOUSEWHEEL: UINT = 0x020A;
     pub const WM_MOUSELEAVE: UINT = 0x02A3;
     pub const WM_NCCREATE: UINT = 0x0081;
+    pub const WM_NCCALCSIZE: UINT = 0x0083;
+    pub const WM_NCHITTEST: UINT = 0x0084;
+    pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+
+    pub const HTCLIENT: LRESULT = 1;
+    pub const HTCAPTION: LRESULT = 2;
+    pub const HTTOP: LRESULT = 12;
+
+    pub const SW_MINIMIZE: c_int = 6;
+    pub const SW_MAXIMIZE: c_int = 3;
+    pub const SW_RESTORE: c_int = 9;
+
+    pub const SIZE_MAXIMIZED: WPARAM = 2;
+
+    pub const SM_CYFRAME: c_int = 33;
+    pub const SM_CXPADDEDBORDER: c_int = 92;
+
+    pub const SWP_NOSIZE: UINT = 0x0001;
+    pub const SWP_NOMOVE: UINT = 0x0002;
+    pub const SWP_NOZORDER: UINT = 0x0004;
+    pub const SWP_NOACTIVATE: UINT = 0x0010;
+    pub const SWP_FRAMECHANGED: UINT = 0x0020;
+
+    pub const NCCALCSIZE_PARAMS = extern struct {
+        rgrc: [3]RECT,
+        lppos: ?*anyopaque,
+    };
     pub const WM_APP: UINT = 0x8000;
 
     pub const PFD_DRAW_TO_WINDOW: DWORD = 0x00000004;
@@ -327,6 +355,13 @@ const w32 = struct {
     pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, UINT) callconv(.winapi) c_int;
     pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
     pub extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
+    pub extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, UINT) callconv(.winapi) BOOL;
+    pub extern "user32" fn PostMessageW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) BOOL;
+    pub extern "user32" fn SendMessageW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+    pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+    pub extern "user32" fn IsZoomed(HWND) callconv(.winapi) BOOL;
+    pub extern "user32" fn GetSystemMetrics(c_int) callconv(.winapi) c_int;
+    pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
 
     pub const TME_LEAVE: DWORD = 0x00000002;
     pub const TRACKMOUSEEVENT = extern struct {
@@ -471,6 +506,12 @@ pub fn run(self: *App) !void {
     while (!self.quitting) {
         const ret = w32.GetMessageW(&msg, null, 0, 0);
         if (ret == 0 or ret == -1) break;
+
+        // The XAML island gets first refusal, or it never sees keyboard
+        // input (tab navigation, accelerators). It reports back whether it
+        // consumed the message, in which case we must not dispatch it.
+        if (self.pretranslate(&msg)) continue;
+
         _ = w32.TranslateMessage(&msg);
         _ = w32.DispatchMessageW(&msg);
 
@@ -478,6 +519,34 @@ pub fn run(self: *App) !void {
             log.warn("app tick failed err={}", .{err});
         };
     }
+}
+
+/// Offers a message to every window's native tab strip. Returns true if
+/// one of them consumed it.
+///
+/// This walks the window list because the strip lives in a child HWND per
+/// window and only that window's island knows whether the message was
+/// meant for it.
+fn pretranslate(self: *App, msg: *w32.MSG) bool {
+    // Surfaces are panes, so many of them share a window; offering the
+    // same island the same message repeatedly would be wrong as well as
+    // wasteful. Windows are few, so a small stack set is enough.
+    var seen: [16]*Window = undefined;
+    var seen_len: usize = 0;
+
+    outer: for (self.core_app.surfaces.items) |surf| {
+        const window = surf.tab.window;
+        const bar = window.tab_bar orelse continue;
+        for (seen[0..seen_len]) |w| {
+            if (w == window) continue :outer;
+        }
+        if (seen_len < seen.len) {
+            seen[seen_len] = window;
+            seen_len += 1;
+        }
+        if (tabbar.ghostty_tabbar_pretranslate(bar, @ptrCast(msg)) != 0) return true;
+    }
+    return false;
 }
 
 /// Called by CoreApp to wake up the event loop (e.g. when another thread
@@ -616,7 +685,36 @@ pub const Window = struct {
     tabs: std.ArrayListUnmanaged(*Tab) = .empty,
     active: usize = 0,
     /// What the mouse is currently hovering in the tab strip, if anything.
+    /// Only meaningful when `tab_bar` is null (the GDI fallback).
     hover: HoverTarget = .none,
+
+    /// The native WinUI tab strip, or null when it could not be created --
+    /// which is the normal case for an unpackaged build, since WinUI 2
+    /// only activates for a process with MSIX package identity. When null
+    /// we fall back to the hand-drawn GDI strip.
+    tab_bar: ?*tabbar.TabBar = null,
+    /// Shells offered in the new-tab dropdown.
+    profiles: []tabbar.Profile = &.{},
+
+    /// True while the tab strip owns the title bar, which is only the case
+    /// when the native strip is up. The GDI fallback keeps the system
+    /// title bar, because it has no caption buttons of its own.
+    fn customFrame(self: *const Window) bool {
+        return self.tab_bar != null;
+    }
+
+    fn stripHeight(self: *Window) i32 {
+        if (self.tab_bar) |bar| return tabbar.ghostty_tabbar_height(bar);
+        return tab_bar_height;
+    }
+
+    /// Finds the tab the native strip knows by `id`.
+    fn tabById(self: *Window, id: tabbar.TabId) ?usize {
+        for (self.tabs.items, 0..) |t, i| {
+            if (t.bar_id == id) return i;
+        }
+        return null;
+    }
 
     /// Rect of the "+" (new tab) button, in frame client coordinates.
     fn addButtonRect(self: *Window) w32.RECT {
@@ -668,6 +766,9 @@ pub const Tab = struct {
     panes: std.ArrayListUnmanaged(*Surface) = .empty,
     split: ?SplitDir = null,
     focused: usize = 0,
+    /// This tab's identity in the native strip, or 0 when running on the
+    /// GDI fallback.
+    bar_id: tabbar.TabId = 0,
 
     fn focusedPane(self: *Tab) ?*Surface {
         if (self.focused >= self.panes.items.len) return null;
@@ -732,6 +833,147 @@ fn applyTitlebarTheme(hwnd: w32.HWND, config: *const Config) void {
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_TEXT_COLOR, &text_color, @sizeOf(w32.COLORREF));
 }
 
+/// Callbacks from the native tab strip. Each one carries the *Window as
+/// its context and does nothing the keyboard shortcuts don't already do --
+/// they funnel into the same switchTab/closeTabAt/newTab used elsewhere,
+/// so the strip cannot drift out of sync with the rest of the app.
+const bar_callbacks = struct {
+    fn window(ctx: ?*anyopaque) ?*Window {
+        return @ptrCast(@alignCast(ctx orelse return null));
+    }
+
+    fn onSelected(ctx: ?*anyopaque, id: tabbar.TabId) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        const index = win.tabById(id) orelse return;
+        switchTab(win, index);
+    }
+
+    fn onCloseRequested(ctx: ?*anyopaque, id: tabbar.TabId) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        const index = win.tabById(id) orelse return;
+        closeTabAt(win, index);
+    }
+
+    fn onNewTab(ctx: ?*anyopaque, profile: tabbar.ProfileId) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        // TODO: honor `profile` by overriding the command for this tab.
+        // Until then every entry opens the configured default shell, so
+        // the dropdown is cosmetic rather than wrong.
+        _ = profile;
+        _ = win.app.newTab(win, .tab) catch |err| {
+            log.warn("failed to create tab err={}", .{err});
+        };
+    }
+
+    fn onCaptionButton(ctx: ?*anyopaque, button: tabbar.CaptionButton) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        switch (button) {
+            .minimize => _ = w32.ShowWindow(win.hwnd, w32.SW_MINIMIZE),
+            .maximize_restore => _ = w32.ShowWindow(
+                win.hwnd,
+                if (w32.IsZoomed(win.hwnd) != 0) w32.SW_RESTORE else w32.SW_MAXIMIZE,
+            ),
+            .close => _ = w32.PostMessageW(win.hwnd, w32.WM_CLOSE, 0, 0),
+        }
+    }
+
+    /// Hand the drag to the system's move loop. The strip is a child HWND
+    /// and swallows the mouse, so WM_NCHITTEST on the frame never sees
+    /// these points and cannot report HTCAPTION for them.
+    fn onDragStart(ctx: ?*anyopaque) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        _ = w32.ReleaseCapture();
+        _ = w32.SendMessageW(win.hwnd, w32.WM_NCLBUTTONDOWN, w32.HTCAPTION, 0);
+    }
+
+    fn onDragDoubleClick(ctx: ?*anyopaque) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        _ = w32.ShowWindow(
+            win.hwnd,
+            if (w32.IsZoomed(win.hwnd) != 0) w32.SW_RESTORE else w32.SW_MAXIMIZE,
+        );
+    }
+};
+
+/// Brings up the native tab strip for `window`, leaving `tab_bar` null if
+/// it can't be created (see the field's doc comment).
+fn initTabBar(self: *App, window: *Window) void {
+    const bar = tabbar.ghostty_tabbar_create(@ptrCast(window.hwnd), .{
+        .ctx = window,
+        .on_selected = bar_callbacks.onSelected,
+        .on_close_requested = bar_callbacks.onCloseRequested,
+        .on_new_tab = bar_callbacks.onNewTab,
+        .on_caption_button = bar_callbacks.onCaptionButton,
+        .on_drag_start = bar_callbacks.onDragStart,
+        .on_drag_double_click = bar_callbacks.onDragDoubleClick,
+    }) orelse {
+        log.info(
+            "native tab strip unavailable, using the GDI strip " ++
+                "(WinUI needs an MSIX-packaged build)",
+            .{},
+        );
+        return;
+    };
+    window.tab_bar = bar;
+
+    window.profiles = tabbar.detectProfiles(self.core_app.alloc) catch |err| blk: {
+        log.warn("shell detection failed err={}", .{err});
+        break :blk &.{};
+    };
+    for (window.profiles) |p| {
+        var buf: [256:0]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(buf[0..255], p.name) catch continue;
+        buf[n] = 0;
+        tabbar.ghostty_tabbar_add_profile(bar, p.id, buf[0..n :0]);
+    }
+
+    applyTabBarTheme(window);
+
+    // The strip only becomes the title bar once it actually exists, so the
+    // frame style has to be recomputed here rather than at creation.
+    _ = w32.SetWindowPos(
+        window.hwnd,
+        null,
+        0,
+        0,
+        0,
+        0,
+        w32.SWP_FRAMECHANGED | w32.SWP_NOMOVE | w32.SWP_NOSIZE |
+            w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+    );
+}
+
+/// Matches the strip to the configured theme, picking light or dark chrome
+/// from the background's perceived luminance.
+fn applyTabBarTheme(window: *Window) void {
+    const bar = window.tab_bar orelse return;
+    const bg = window.app.config.background;
+    const luminance =
+        (@as(u32, bg.r) * 299 + @as(u32, bg.g) * 587 + @as(u32, bg.b) * 114) / 1000;
+    tabbar.ghostty_tabbar_set_theme(bar, bg.r, bg.g, bg.b, if (luminance < 128) 1 else 0);
+}
+
+/// Pushes a tab's current title into the native strip.
+fn syncTabTitle(tab: *Tab) void {
+    const window = tab.window;
+    const bar = window.tab_bar orelse return;
+    if (tab.bar_id == 0) return;
+
+    const surf = tab.focusedPane();
+    var buf: [513:0]u16 = undefined;
+    const n = if (surf) |s|
+        (std.unicode.utf8ToUtf16Le(buf[0..512], s.title_buf[0..s.title_len]) catch 0)
+    else
+        0;
+    if (n == 0) {
+        const fallback = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        tabbar.ghostty_tabbar_set_title(bar, tab.bar_id, fallback);
+        return;
+    }
+    buf[n] = 0;
+    tabbar.ghostty_tabbar_set_title(bar, tab.bar_id, buf[0..n :0]);
+}
+
 fn newWindow(self: *App) !*Window {
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);
@@ -760,6 +1002,10 @@ fn newWindow(self: *App) !*Window {
     ) orelse return error.Unexpected;
     window.hwnd = hwnd;
 
+    // Before the first tab exists, so the strip is ready to receive it and
+    // so the frame style is settled before the window is shown.
+    self.initTabBar(window);
+
     var client_rect: w32.RECT = undefined;
     _ = w32.GetClientRect(hwnd, &client_rect);
 
@@ -769,9 +1015,9 @@ fn newWindow(self: *App) !*Window {
         std.unicode.utf8ToUtf16LeStringLiteral(""),
         w32.WS_CHILD | w32.WS_VISIBLE,
         0,
-        tab_bar_height,
+        window.stripHeight(),
         client_rect.right - client_rect.left,
-        @max(0, (client_rect.bottom - client_rect.top) - tab_bar_height),
+        @max(0, (client_rect.bottom - client_rect.top) - window.stripHeight()),
         hwnd,
         null,
         self.hinstance,
@@ -803,7 +1049,9 @@ fn newWindow(self: *App) !*Window {
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.UpdateWindow(hwnd);
     _ = w32.SetFocus(gl_hwnd);
-    applyTitlebarTheme(hwnd, &self.config);
+    // Only meaningful on the GDI fallback: with the native strip there is
+    // no system title bar left to theme.
+    if (!window.customFrame()) applyTitlebarTheme(hwnd, &self.config);
 
     return window;
 }
@@ -868,6 +1116,13 @@ fn newTab(
 
     try window.tabs.append(alloc, tab);
     window.active = window.tabs.items.len - 1;
+
+    if (window.tab_bar) |bar| {
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        tab.bar_id = tabbar.ghostty_tabbar_add_tab(bar, title);
+        if (tab.bar_id != 0) tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
+    }
+
     reflow(window);
     invalidateTabBar(window);
 
@@ -945,6 +1200,9 @@ fn closeTabStruct(tab: *Tab) void {
         }
     }
     const i = index orelse return;
+    if (window.tab_bar) |bar| {
+        if (tab.bar_id != 0) tabbar.ghostty_tabbar_remove_tab(bar, tab.bar_id);
+    }
     alloc.destroy(tab);
     _ = window.tabs.orderedRemove(i);
 
@@ -978,6 +1236,14 @@ fn switchTab(window: *Window, index: usize) void {
     if (index >= window.tabs.items.len) return;
     if (window.active == index) return;
     window.active = index;
+
+    // Harmless when the strip is what asked for this switch: the DLL
+    // suppresses the selection event it would otherwise echo back.
+    if (window.tab_bar) |bar| {
+        const tab = window.tabs.items[index];
+        if (tab.bar_id != 0) tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
+    }
+
     reflow(window);
     invalidateTabBar(window);
 }
@@ -1015,9 +1281,12 @@ fn reflow(window: *Window) void {
             var zbuf: [513:0]u16 = undefined;
             const wn = std.unicode.utf8ToUtf16Le(zbuf[0..512], focused.title_buf[0..focused.title_len]) catch 0;
             zbuf[wn] = 0;
+            // Still worth setting with a custom frame: it is what the task
+            // bar and Alt-Tab show, even though no title bar displays it.
             _ = w32.SetWindowTextW(window.hwnd, zbuf[0..wn :0]);
         }
     }
+    syncTabTitle(tab);
 
     var client_rect: w32.RECT = undefined;
     if (w32.GetClientRect(window.gl_hwnd, &client_rect) == w32.FALSE) return;
@@ -1598,6 +1867,9 @@ fn frameWndProc(
             }
             window.tabs.deinit(alloc);
 
+            if (window.tab_bar) |bar| tabbar.ghostty_tabbar_destroy(bar);
+            if (window.profiles.len > 0) tabbar.freeProfiles(alloc, window.profiles);
+
             _ = w32.wglMakeCurrent(null, null);
             _ = w32.wglDeleteContext(window.hglrc);
             _ = w32.ReleaseDC(window.gl_hwnd, window.hdc);
@@ -1616,24 +1888,75 @@ fn frameWndProc(
         },
 
         w32.WM_SIZE => {
-            const width = w32.LOWORD(lparam);
-            const height = w32.HIWORD(lparam);
+            const width: i32 = w32.LOWORD(lparam);
+            const height: i32 = w32.HIWORD(lparam);
+            const strip = window.stripHeight();
+
+            // A maximized window with a custom frame is positioned offset
+            // by the frame thickness, which would push the top of the
+            // strip off-screen. Pad by exactly that much.
+            const maximized = wparam == w32.SIZE_MAXIMIZED;
+            const pad: i32 = if (window.customFrame() and maximized)
+                w32.GetSystemMetrics(w32.SM_CYFRAME) +
+                    w32.GetSystemMetrics(w32.SM_CXPADDEDBORDER)
+            else
+                0;
+
+            if (window.tab_bar) |bar| {
+                tabbar.ghostty_tabbar_resize(bar, 0, pad, width, strip);
+                tabbar.ghostty_tabbar_set_maximized(bar, if (maximized) 1 else 0);
+            }
+
             _ = w32.MoveWindow(
                 window.gl_hwnd,
                 0,
-                tab_bar_height,
+                pad + strip,
                 width,
-                @max(0, @as(i32, height) - tab_bar_height),
+                @max(0, height - strip - pad),
                 w32.TRUE,
             );
             return 0;
+        },
+
+        // Surrender the caption's space to the client area so the tab
+        // strip can occupy it. Letting DefWindowProc compute the client
+        // rect and then restoring rc.top keeps the resizable side and
+        // bottom borders intact.
+        w32.WM_NCCALCSIZE => {
+            if (!window.customFrame() or wparam == 0)
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            const params: *w32.NCCALCSIZE_PARAMS =
+                @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const top = params.rgrc[0].top;
+            _ = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            params.rgrc[0].top = top;
+            return 0;
+        },
+
+        // With the caption gone the top resize edge goes with it, so it
+        // has to be reported by hand or the window resizes from only three
+        // sides.
+        w32.WM_NCHITTEST => {
+            const hit = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (!window.customFrame() or hit != w32.HTCLIENT) return hit;
+
+            var pt: w32.POINT = .{
+                .x = @as(i16, @bitCast(w32.LOWORD(lparam))),
+                .y = @as(i16, @bitCast(w32.HIWORD(lparam))),
+            };
+            _ = w32.ScreenToClient(hwnd, &pt);
+            const border = w32.GetSystemMetrics(w32.SM_CYFRAME) +
+                w32.GetSystemMetrics(w32.SM_CXPADDEDBORDER);
+            if (pt.y < border) return w32.HTTOP;
+            return hit;
         },
 
         w32.WM_PAINT => {
             var ps: w32.PAINTSTRUCT = undefined;
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);
-            paintTabBar(window, hdc);
+            // The native strip paints itself; only the fallback needs us.
+            if (!window.customFrame()) paintTabBar(window, hdc);
             return 0;
         },
 

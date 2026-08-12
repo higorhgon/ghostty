@@ -907,6 +907,24 @@ fn addWin32(
     step.root_module.linkSystemLibrary("shell32", .{});
     step.root_module.linkSystemLibrary("ole32", .{});
     step.root_module.linkSystemLibrary("dwmapi", .{});
+
+    // ghostty_tabbar.dll hosts the WinUI tab strip. It is built separately
+    // (see dist/windows/tabbar/) because it needs C++/WinRT and the MSVC
+    // toolchain, neither of which the Zig build drives.
+    //
+    // Linking it lazily would be preferable -- a missing DLL currently
+    // means the exe won't start at all -- but the MSIX package this build
+    // ships in always carries it, and the strip degrades to the GDI
+    // fallback when WinUI itself is unavailable.
+    // Reference the import library by path rather than by name: the DLL
+    // sits beside it in the same directory and the linker picks that up
+    // first, failing with "bad file type".
+    // The import library lives in its own directory. Beside the DLL, the
+    // linker resolves the .dll first and rejects it as "bad file type".
+    step.root_module.addLibraryPath(
+        step.step.owner.path("dist/windows/tabbar/ghostty-tabbar/lib"),
+    );
+    step.root_module.linkSystemLibrary("ghostty_tabbar", .{});
 }
 
 /// Add only the dependencies required for `Config.simd` enabled. This also

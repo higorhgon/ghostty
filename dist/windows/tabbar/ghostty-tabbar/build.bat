@@ -14,6 +14,11 @@ if errorlevel 1 (
 
 cd /d "%~dp0"
 
+REM The import library goes in its own directory: with the .dll beside it
+REM the Zig build's linker finds the DLL first and rejects it as "bad file
+REM type".
+if not exist lib mkdir lib
+
 REM /utf-8 is required: without it MSVC reads this UTF-8 source using the
 REM system ANSI codepage, so the Segoe Fluent Icons codepoints in the
 REM caption glyphs decode into garbage and render as tofu boxes.
@@ -22,6 +27,7 @@ cl /nologo /std:c++17 /EHsc /LD /MD /utf-8 ^
    /I "%PROJ%" ^
    ghostty_tabbar.cpp ^
    /link user32.lib gdi32.lib windowsapp.lib ^
+   /IMPLIB:lib\ghostty_tabbar.lib ^
    /OUT:ghostty_tabbar.dll
 if errorlevel 1 exit /b 1
 
@@ -37,7 +43,7 @@ REM app.res goes after /link: with /TC, cl would otherwise try to compile
 REM the .res file as C source.
 cl /nologo /TC /MD /DWIN32_LEAN_AND_MEAN /D_UNICODE /DUNICODE ^
    testhost.c ^
-   /link /SUBSYSTEM:WINDOWS app.res user32.lib gdi32.lib ghostty_tabbar.lib ^
+   /link /SUBSYSTEM:WINDOWS app.res user32.lib gdi32.lib lib\ghostty_tabbar.lib ^
    /OUT:testhost.exe
 if errorlevel 1 exit /b 1
 
