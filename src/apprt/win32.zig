@@ -34,6 +34,38 @@ const tab_bar_height: i32 = 32;
 const tab_width: i32 = 180;
 /// Width in pixels of the divider line drawn between two split panes.
 const split_divider: i32 = 2;
+/// Corner radius used when drawing each tab's rounded top corners.
+const tab_radius: i32 = 8;
+/// Size (both dimensions) of the per-tab close (x) button hit-box.
+const close_btn_size: i32 = 18;
+/// Gap between the close button and the tab's right edge.
+const close_btn_margin: i32 = 8;
+/// Width of the trailing "+" (new tab) button at the end of the strip.
+const add_btn_width: i32 = 36;
+
+/// What part of the tab strip the mouse is currently over, used to draw
+/// hover feedback (and repaint only when it actually changes).
+const HoverTarget = union(enum) {
+    none,
+    tab: usize,
+    close: usize,
+    add,
+
+    fn eql(a: HoverTarget, b: HoverTarget) bool {
+        return switch (a) {
+            .none => b == .none,
+            .add => b == .add,
+            .tab => |i| switch (b) {
+                .tab => |j| i == j,
+                else => false,
+            },
+            .close => |i| switch (b) {
+                .close => |j| i == j,
+                else => false,
+            },
+        };
+    }
+};
 
 /// Hand-rolled Win32 API bindings. Zig's std.os.windows only covers
 /// kernel32/ntdll-style syscalls, not user32/gdi32/opengl32 GUI APIs, so
@@ -182,6 +214,7 @@ const w32 = struct {
     pub const WM_MBUTTONDOWN: UINT = 0x0207;
     pub const WM_MBUTTONUP: UINT = 0x0208;
     pub const WM_MOUSEWHEEL: UINT = 0x020A;
+    pub const WM_MOUSELEAVE: UINT = 0x02A3;
     pub const WM_NCCREATE: UINT = 0x0081;
     pub const WM_APP: UINT = 0x8000;
 
@@ -293,6 +326,15 @@ const w32 = struct {
     pub extern "user32" fn FillRect(HDC, *const RECT, HBRUSH) callconv(.winapi) c_int;
     pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, UINT) callconv(.winapi) c_int;
     pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
+    pub extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
+
+    pub const TME_LEAVE: DWORD = 0x00000002;
+    pub const TRACKMOUSEEVENT = extern struct {
+        cbSize: DWORD = @sizeOf(TRACKMOUSEEVENT),
+        dwFlags: DWORD,
+        hwndTrack: HWND,
+        dwHoverTime: DWORD = 0,
+    };
 
     pub extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
     pub extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
@@ -301,6 +343,10 @@ const w32 = struct {
     pub extern "gdi32" fn DeleteObject(HGDIOBJ) callconv(.winapi) BOOL;
     pub extern "gdi32" fn SetBkMode(HDC, c_int) callconv(.winapi) c_int;
     pub extern "gdi32" fn SetTextColor(HDC, COLORREF) callconv(.winapi) DWORD;
+    pub extern "gdi32" fn RoundRect(HDC, i32, i32, i32, i32, i32, i32) callconv(.winapi) BOOL;
+    pub extern "gdi32" fn SelectObject(HDC, HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
+    pub extern "gdi32" fn GetStockObject(c_int) callconv(.winapi) ?HGDIOBJ;
+    pub const NULL_PEN: c_int = 8;
 
     pub extern "opengl32" fn wglCreateContext(HDC) callconv(.winapi) ?HGLRC;
     pub extern "opengl32" fn wglMakeCurrent(?HDC, ?HGLRC) callconv(.winapi) BOOL;
@@ -569,6 +615,38 @@ pub const Window = struct {
     hglrc: w32.HGLRC,
     tabs: std.ArrayListUnmanaged(*Tab) = .empty,
     active: usize = 0,
+    /// What the mouse is currently hovering in the tab strip, if anything.
+    hover: HoverTarget = .none,
+
+    /// Rect of the "+" (new tab) button, in frame client coordinates.
+    fn addButtonRect(self: *Window) w32.RECT {
+        const left: i32 = @as(i32, @intCast(self.tabs.items.len)) * tab_width;
+        return .{ .left = left, .top = 0, .right = left + add_btn_width, .bottom = tab_bar_height };
+    }
+
+    /// Hit-tests a point in frame client coordinates against the tab strip,
+    /// returning what it landed on (a tab, a tab's close button, the add
+    /// button, or nothing).
+    fn hitTestTabBar(self: *Window, x: i32, y: i32) HoverTarget {
+        if (y < 0 or y >= tab_bar_height or x < 0) return .none;
+
+        const add_rect = self.addButtonRect();
+        if (x >= add_rect.left and x < add_rect.right) return .add;
+
+        const index: usize = @intCast(@divTrunc(x, tab_width));
+        if (index >= self.tabs.items.len) return .none;
+
+        const tab_left = @as(i32, @intCast(index)) * tab_width;
+        const close_left = tab_left + tab_width - close_btn_margin - close_btn_size;
+        const close_top = @divTrunc(tab_bar_height - close_btn_size, 2);
+        if (x >= close_left and x < close_left + close_btn_size and
+            y >= close_top and y < close_top + close_btn_size)
+        {
+            return .{ .close = index };
+        }
+
+        return .{ .tab = index };
+    }
 
     fn activeTabPtr(self: *Window) ?*Tab {
         if (self.active >= self.tabs.items.len) return null;
@@ -880,6 +958,22 @@ fn closeTabStruct(tab: *Tab) void {
     invalidateTabBar(window);
 }
 
+/// Closes every pane of the tab at `index` (e.g. from clicking its close
+/// button), which in turn closes the tab itself once its last pane is
+/// gone. Unlike `closeTabStruct`, this is safe to call on a tab that still
+/// has panes.
+fn closeTabAt(window: *Window, index: usize) void {
+    if (index >= window.tabs.items.len) return;
+    const tab = window.tabs.items[index];
+    var n = tab.panes.items.len;
+    while (n > 0) : (n -= 1) {
+        // Once `n` reaches 1, this call closes the last pane and cascades
+        // into closeTabStruct, freeing `tab` -- so we never touch `tab`
+        // again after that point.
+        closePane(tab.panes.items[0]);
+    }
+}
+
 fn switchTab(window: *Window, index: usize) void {
     if (index >= window.tabs.items.len) return;
     if (window.active == index) return;
@@ -997,6 +1091,59 @@ fn scaleChannel(c: u8, factor: f32) u8 {
     return @intFromFloat(std.math.clamp(v, 0, 255));
 }
 
+/// Adds `amount` to a single color channel (e.g. to lighten for hover
+/// feedback), clamped to a valid byte.
+fn lightenChannel(c: u8, amount: u8) u8 {
+    return @intCast(@min(255, @as(u16, c) + @as(u16, amount)));
+}
+
+/// Fills `rect` with `color`, rounding the top-left/top-right corners by
+/// `radius` pixels and leaving the bottom edge square -- gives tabs the
+/// familiar "folder tab" silhouette that sits flush against the content
+/// below the active one.
+fn fillTabShape(hdc: w32.HDC, rect: w32.RECT, color: w32.COLORREF, radius: i32) void {
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(@ptrCast(brush));
+
+    const old_brush = w32.SelectObject(hdc, @ptrCast(brush));
+    defer if (old_brush) |ob| {
+        _ = w32.SelectObject(hdc, ob);
+    };
+    const null_pen = w32.GetStockObject(w32.NULL_PEN);
+    const old_pen = if (null_pen) |np| w32.SelectObject(hdc, np) else null;
+    defer if (old_pen) |op| {
+        _ = w32.SelectObject(hdc, op);
+    };
+
+    _ = w32.RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+    if (radius > 0) {
+        // Square off the bottom two corners that RoundRect just rounded.
+        var bottom_rect = rect;
+        bottom_rect.top = rect.bottom - radius;
+        _ = w32.FillRect(hdc, &bottom_rect, brush);
+    }
+}
+
+/// Draws a single centered glyph (used for the close "x" and add "+"
+/// buttons) in `color`, optionally over a rounded highlight background
+/// when `hovered`.
+fn drawGlyphButton(
+    hdc: w32.HDC,
+    rect: w32.RECT,
+    glyph: *const [1:0]u16,
+    color: w32.COLORREF,
+    hovered: bool,
+    hover_color: w32.COLORREF,
+) void {
+    if (hovered) {
+        const radius = @divTrunc(rect.right - rect.left, 2);
+        fillTabShape(hdc, rect, hover_color, radius);
+    }
+    _ = w32.SetTextColor(hdc, color);
+    var text_rect = rect;
+    _ = w32.DrawTextW(hdc, glyph, @intCast(glyph.len), &text_rect, w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE);
+}
+
 fn paintTabBar(window: *Window, hdc: w32.HDC) void {
     const bg = window.app.config.background;
     const fg = window.app.config.foreground;
@@ -1018,14 +1165,20 @@ fn paintTabBar(window: *Window, hdc: w32.HDC) void {
         scaleChannel(fg.b, 0.6),
     );
 
-    const active_brush = w32.CreateSolidBrush(active_color);
-    defer if (active_brush) |b| {
-        _ = w32.DeleteObject(@ptrCast(b));
-    };
     const inactive_brush = w32.CreateSolidBrush(inactive_color);
     defer if (inactive_brush) |b| {
         _ = w32.DeleteObject(@ptrCast(b));
     };
+
+    // Hover tints: a subtle lightening for inactive tabs and the add
+    // button, and a Windows-style red for the close buttons (matching the
+    // native title bar close control's hover color).
+    const hover_color = w32.RGB(
+        lightenChannel(scaleChannel(bg.r, 0.6), 18),
+        lightenChannel(scaleChannel(bg.g, 0.6), 18),
+        lightenChannel(scaleChannel(bg.b, 0.6), 18),
+    );
+    const close_hover_color = w32.RGB(196, 43, 28);
 
     // Clear the whole strip first. Without this, closing a tab (or
     // otherwise shrinking the tab count) leaves stale pixels behind from
@@ -1040,10 +1193,19 @@ fn paintTabBar(window: *Window, hdc: w32.HDC) void {
 
     for (window.tabs.items, 0..) |tab, i| {
         const left: i32 = @as(i32, @intCast(i)) * tab_width;
-        var rect: w32.RECT = .{ .left = left, .top = 0, .right = left + tab_width, .bottom = tab_bar_height };
+        const rect: w32.RECT = .{ .left = left, .top = 0, .right = left + tab_width, .bottom = tab_bar_height };
 
         const is_active = i == window.active;
-        if (w32.FillRect(hdc, &rect, (if (is_active) active_brush else inactive_brush) orelse continue) == 0) {}
+        const is_hover_tab = window.hover.eql(.{ .tab = i });
+        const is_hover_close = window.hover.eql(.{ .close = i });
+
+        const fill_color = if (is_active)
+            active_color
+        else if (is_hover_tab or is_hover_close)
+            hover_color
+        else
+            inactive_color;
+        fillTabShape(hdc, rect, fill_color, tab_radius);
         _ = w32.SetTextColor(hdc, if (is_active) active_text else inactive_text);
 
         const title_surf = tab.focusedPane();
@@ -1052,7 +1214,8 @@ fn paintTabBar(window: *Window, hdc: w32.HDC) void {
             (std.unicode.utf8ToUtf16Le(&title_w, s.title_buf[0..s.title_len]) catch 0)
         else
             0;
-        var text_rect: w32.RECT = .{ .left = left + 10, .top = 0, .right = left + tab_width - 10, .bottom = tab_bar_height };
+        const close_left = left + tab_width - close_btn_margin - close_btn_size;
+        var text_rect: w32.RECT = .{ .left = left + 10, .top = 0, .right = close_left - 4, .bottom = tab_bar_height };
         if (title_len > 0) {
             _ = w32.DrawTextW(
                 hdc,
@@ -1071,7 +1234,36 @@ fn paintTabBar(window: *Window, hdc: w32.HDC) void {
                 w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_END_ELLIPSIS,
             );
         }
+
+        const close_top = @divTrunc(tab_bar_height - close_btn_size, 2);
+        const close_rect: w32.RECT = .{
+            .left = close_left,
+            .top = close_top,
+            .right = close_left + close_btn_size,
+            .bottom = close_top + close_btn_size,
+        };
+        const close_glyph = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
+        drawGlyphButton(
+            hdc,
+            close_rect,
+            close_glyph,
+            if (is_hover_close) w32.RGB(255, 255, 255) else if (is_active) active_text else inactive_text,
+            is_hover_close,
+            close_hover_color,
+        );
     }
+
+    const add_rect = window.addButtonRect();
+    const is_hover_add = window.hover.eql(.add);
+    const add_glyph = std.unicode.utf8ToUtf16LeStringLiteral("+");
+    drawGlyphButton(
+        hdc,
+        add_rect,
+        add_glyph,
+        if (is_hover_add) active_text else inactive_text,
+        is_hover_add,
+        hover_color,
+    );
 }
 
 /// A single pane: owns a CoreSurface and belongs to exactly one Tab. This
@@ -1455,12 +1647,39 @@ fn frameWndProc(
 
         w32.WM_ERASEBKGND => return 1,
 
+        w32.WM_MOUSEMOVE => {
+            const x: i16 = @bitCast(w32.LOWORD(lparam));
+            const y: i16 = @bitCast(w32.HIWORD(lparam));
+            const target = window.hitTestTabBar(@as(i32, x), @as(i32, y));
+            if (!window.hover.eql(target)) {
+                window.hover = target;
+                invalidateTabBar(window);
+            }
+            // One-shot: must be re-armed on every WM_MOUSEMOVE to keep
+            // getting WM_MOUSELEAVE when the cursor exits the window.
+            var tme: w32.TRACKMOUSEEVENT = .{ .dwFlags = w32.TME_LEAVE, .hwndTrack = hwnd };
+            _ = w32.TrackMouseEvent(&tme);
+            return 0;
+        },
+
+        w32.WM_MOUSELEAVE => {
+            if (!window.hover.eql(.none)) {
+                window.hover = .none;
+                invalidateTabBar(window);
+            }
+            return 0;
+        },
+
         w32.WM_LBUTTONDOWN => {
             const x: i16 = @bitCast(w32.LOWORD(lparam));
             const y: i16 = @bitCast(w32.HIWORD(lparam));
-            if (y >= 0 and y < tab_bar_height and x >= 0) {
-                const index: usize = @intCast(@divTrunc(@as(i32, x), tab_width));
-                switchTab(window, index);
+            switch (window.hitTestTabBar(@as(i32, x), @as(i32, y))) {
+                .none => {},
+                .tab => |index| switchTab(window, index),
+                .close => |index| closeTabAt(window, index),
+                .add => _ = window.app.newTab(window, .tab) catch |err| {
+                    log.warn("failed to create tab err={}", .{err});
+                },
             }
             return 0;
         },
