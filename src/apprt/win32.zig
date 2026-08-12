@@ -576,7 +576,7 @@ pub fn performAction(
         .new_tab => {
             switch (target) {
                 .app => _ = try self.newWindow(),
-                .surface => |core| _ = try self.newTab(core.rt_surface.tab.window, .tab),
+                .surface => |core| _ = try self.newTab(core.rt_surface.tab.window, .tab, null),
             }
             return true;
         },
@@ -856,11 +856,12 @@ const bar_callbacks = struct {
 
     fn onNewTab(ctx: ?*anyopaque, profile: tabbar.ProfileId) callconv(.c) void {
         const win = window(ctx) orelse return;
-        // TODO: honor `profile` by overriding the command for this tab.
-        // Until then every entry opens the configured default shell, so
-        // the dropdown is cosmetic rather than wrong.
-        _ = profile;
-        _ = win.app.newTab(win, .tab) catch |err| {
+        // The plain "+" sends profile_default, which matches nothing and
+        // so leaves the configured command alone.
+        const argv: ?[]const []const u8 = for (win.profiles) |p| {
+            if (p.id == profile) break p.argv;
+        } else null;
+        _ = win.app.newTab(win, .tab, argv) catch |err| {
             log.warn("failed to create tab err={}", .{err});
         };
     }
@@ -1044,7 +1045,7 @@ fn newWindow(self: *App) !*Window {
     window.hglrc = hglrc;
     if (w32.wglMakeCurrent(hdc, hglrc) == w32.FALSE) return error.Unexpected;
 
-    _ = try self.newTab(window, .window);
+    _ = try self.newTab(window, .window, null);
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.UpdateWindow(hwnd);
@@ -1061,6 +1062,9 @@ fn newPane(
     window: *Window,
     tab: *Tab,
     context: apprt.surface.NewSurfaceContext,
+    /// Overrides the configured command for this surface only. Used by the
+    /// new-tab dropdown, where each entry is a different shell.
+    argv: ?[]const []const u8,
 ) !*Surface {
     const alloc = self.core_app.alloc;
     const surf = try alloc.create(Surface);
@@ -1081,6 +1085,18 @@ fn newPane(
     var config = try apprt.surface.newConfig(self.core_app, &self.config, context);
     defer config.deinit();
 
+    // The strings are copied into the config's arena because `argv` is
+    // owned by the window's profile list, which outlives this call but is
+    // not what the config's lifetime is tied to. `.direct` rather than
+    // `.shell` so paths with spaces ("C:\Program Files\Git\...") survive:
+    // the shell form is split on whitespace on Windows.
+    if (argv) |a| if (a.len > 0) {
+        const arena = config._arena.?.allocator();
+        const owned = try arena.alloc([:0]const u8, a.len);
+        for (a, owned) |src, *dst| dst.* = try arena.dupeZ(u8, src);
+        config.command = .{ .direct = owned };
+    };
+
     if (w32.wglMakeCurrent(window.hdc, window.hglrc) == w32.FALSE) return error.Unexpected;
 
     try CoreSurface.init(
@@ -1100,13 +1116,16 @@ fn newTab(
     self: *App,
     window: *Window,
     context: apprt.surface.NewSurfaceContext,
+    /// The command for the new tab, or null to use the configured one.
+    /// Set when the tab came from a profile in the new-tab dropdown.
+    argv: ?[]const []const u8,
 ) !*Surface {
     const alloc = self.core_app.alloc;
     const tab = try alloc.create(Tab);
     errdefer alloc.destroy(tab);
     tab.* = .{ .window = window };
 
-    const surf = try self.newPane(window, tab, context);
+    const surf = try self.newPane(window, tab, context, argv);
     errdefer {
         self.core_app.deleteSurface(surf);
         if (surf.core_ready) surf.core_surface.deinit();
@@ -1138,7 +1157,9 @@ fn newSplit(self: *App, pane: *Surface, dir: SplitDir) !*Surface {
     const window = tab.window;
     const alloc = self.core_app.alloc;
 
-    const new_pane = try self.newPane(window, tab, .split);
+    // Splits inherit the configured command; only the dropdown picks a
+    // specific shell.
+    const new_pane = try self.newPane(window, tab, .split, null);
     errdefer {
         self.core_app.deleteSurface(new_pane);
         if (new_pane.core_ready) new_pane.core_surface.deinit();
@@ -1815,7 +1836,7 @@ fn handleTabShortcut(window: *Window, wparam: w32.WPARAM) bool {
 
     switch (vk) {
         w32.VK_T => {
-            _ = window.app.newTab(window, .tab) catch |err| {
+            _ = window.app.newTab(window, .tab, null) catch |err| {
                 log.warn("failed to create tab err={}", .{err});
             };
             return true;
@@ -2000,7 +2021,7 @@ fn frameWndProc(
                 .none => {},
                 .tab => |index| switchTab(window, index),
                 .close => |index| closeTabAt(window, index),
-                .add => _ = window.app.newTab(window, .tab) catch |err| {
+                .add => _ = window.app.newTab(window, .tab, null) catch |err| {
                     log.warn("failed to create tab err={}", .{err});
                 },
             }

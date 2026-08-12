@@ -907,6 +907,8 @@ fn addWin32(
     step.root_module.linkSystemLibrary("shell32", .{});
     step.root_module.linkSystemLibrary("ole32", .{});
     step.root_module.linkSystemLibrary("dwmapi", .{});
+    // Reading the WSL distribution list out of HKCU (see apprt/win32/tabbar.zig).
+    step.root_module.linkSystemLibrary("advapi32", .{});
 
     // ghostty_tabbar.dll hosts the WinUI tab strip. It is built separately
     // (see dist/windows/tabbar/) because it needs C++/WinRT and the MSVC

@@ -17,6 +17,8 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.win32_tabbar);
+
 pub const TabId = u64;
 pub const ProfileId = u32;
 
@@ -111,9 +113,9 @@ pub const Profile = struct {
     id: ProfileId,
     /// Shown in the dropdown.
     name: []const u8,
-    /// argv[0] for the shell. Empty means "whatever the config says",
-    /// which is what the plain "+" button uses.
-    command: []const u8,
+    /// The command to run, index zero being the executable. Empty means
+    /// "whatever the config says", which is what the plain "+" uses.
+    argv: []const []const u8,
 };
 
 // Shell discovery uses Win32 directly rather than std: SearchPathW is
@@ -138,20 +140,17 @@ const invalid_file_attributes: u32 = 0xFFFF_FFFF;
 /// actually exist are returned, so the menu never offers something that
 /// would fail to launch.
 ///
-/// Caller owns the returned slice and the strings within it.
+/// Caller owns the returned slice and everything reachable from it.
 pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
     var list: std.ArrayListUnmanaged(Profile) = .empty;
     errdefer {
-        for (list.items) |p| {
-            alloc.free(p.name);
-            alloc.free(p.command);
-        }
+        for (list.items) |p| freeProfile(alloc, p);
         list.deinit(alloc);
     }
 
     const Candidate = struct {
         name: []const u8,
-        command: []const u8,
+        argv: []const []const u8,
         /// Absolute paths are checked directly; bare names go through
         /// SearchPathW. pwsh in particular lands in different places
         /// depending on whether it came from the MSI, the Store or winget.
@@ -159,28 +158,60 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
     };
 
     const candidates = [_]Candidate{
-        .{ .name = "Command Prompt", .command = "cmd.exe" },
-        .{ .name = "Windows PowerShell", .command = "powershell.exe" },
-        .{ .name = "PowerShell 7", .command = "pwsh.exe" },
+        .{ .name = "Command Prompt", .argv = &.{"cmd.exe"} },
+        .{ .name = "Windows PowerShell", .argv = &.{"powershell.exe"} },
+        .{ .name = "PowerShell 7", .argv = &.{"pwsh.exe"} },
         .{
             .name = "Git Bash",
-            .command = "C:\\Program Files\\Git\\bin\\bash.exe",
+            // --login -i is what makes this an interactive login shell, so
+            // the user's .bash_profile runs. Without it the prompt is bare
+            // "bash-5.2$" and none of their setup is loaded.
+            .argv = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "--login", "-i" },
             .absolute = true,
         },
     };
 
     var next_id: ProfileId = 1;
     for (candidates) |c| {
-        if (!exists(c.command, c.absolute)) continue;
-        try list.append(alloc, .{
-            .id = next_id,
-            .name = try alloc.dupe(u8, c.name),
-            .command = try alloc.dupe(u8, c.command),
-        });
+        if (!exists(c.argv[0], c.absolute)) continue;
+        try list.append(alloc, try makeProfile(alloc, next_id, c.name, c.argv));
         next_id += 1;
     }
 
+    // WSL distributions come last: they're the long tail, and grouping
+    // them below the Windows shells matches how Windows Terminal orders
+    // its generated profiles.
+    appendWslProfiles(alloc, &list, &next_id) catch |err| {
+        // A machine without WSL is the normal case, not an error worth
+        // losing the rest of the menu over.
+        log.debug("WSL enumeration failed err={}", .{err});
+    };
+
     return list.toOwnedSlice(alloc);
+}
+
+fn makeProfile(
+    alloc: std.mem.Allocator,
+    id: ProfileId,
+    name: []const u8,
+    argv: []const []const u8,
+) !Profile {
+    const owned_argv = try alloc.alloc([]const u8, argv.len);
+    var filled: usize = 0;
+    errdefer {
+        for (owned_argv[0..filled]) |a| alloc.free(a);
+        alloc.free(owned_argv);
+    }
+    for (argv, owned_argv) |src, *dst| {
+        dst.* = try alloc.dupe(u8, src);
+        filled += 1;
+    }
+
+    return .{
+        .id = id,
+        .name = try alloc.dupe(u8, name),
+        .argv = owned_argv,
+    };
 }
 
 fn exists(path: []const u8, absolute: bool) bool {
@@ -195,10 +226,137 @@ fn exists(path: []const u8, absolute: bool) bool {
     return SearchPathW(null, name, null, 0, null, null) != 0;
 }
 
-pub fn freeProfiles(alloc: std.mem.Allocator, profiles: []Profile) void {
-    for (profiles) |p| {
-        alloc.free(p.name);
-        alloc.free(p.command);
+// WSL distributions are registered under HKCU. This is the same source
+// Windows Terminal reads, and it is deliberately preferred over shelling
+// out to `wsl.exe --list`: that spawns a console process (a visible flash
+// from a GUI app) and prints UTF-16 with a localized header.
+const HKEY = ?*anyopaque;
+
+extern "advapi32" fn RegOpenKeyExW(
+    hKey: HKEY,
+    lpSubKey: ?[*:0]const u16,
+    ulOptions: u32,
+    samDesired: u32,
+    phkResult: *HKEY,
+) callconv(.winapi) i32;
+
+extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) i32;
+
+extern "advapi32" fn RegEnumKeyExW(
+    hKey: HKEY,
+    dwIndex: u32,
+    lpName: [*]u16,
+    lpcchName: *u32,
+    lpReserved: ?*u32,
+    lpClass: ?[*]u16,
+    lpcchClass: ?*u32,
+    lpftLastWriteTime: ?*anyopaque,
+) callconv(.winapi) i32;
+
+extern "advapi32" fn RegGetValueW(
+    hkey: HKEY,
+    lpSubKey: ?[*:0]const u16,
+    lpValue: ?[*:0]const u16,
+    dwFlags: u32,
+    pdwType: ?*u32,
+    pvData: ?*anyopaque,
+    pcbData: ?*u32,
+) callconv(.winapi) i32;
+
+const error_success: i32 = 0;
+const key_read: u32 = 0x2_0019;
+const rrf_rt_reg_sz: u32 = 0x0000_0002;
+const rrf_rt_reg_dword: u32 = 0x0000_0018;
+
+fn hkeyCurrentUser() HKEY {
+    return @ptrFromInt(0x8000_0001);
+}
+
+const lxss_path = std.unicode.utf8ToUtf16LeStringLiteral(
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss",
+);
+
+/// Adds one profile per installed WSL distribution.
+fn appendWslProfiles(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Profile),
+    next_id: *ProfileId,
+) !void {
+    // wsl.exe itself gates everything: the Lxss key can survive an
+    // uninstall, and a profile we cannot launch is worse than none.
+    if (!exists("wsl.exe", false)) return;
+
+    var lxss: HKEY = null;
+    if (RegOpenKeyExW(hkeyCurrentUser(), lxss_path, 0, key_read, &lxss) != error_success) {
+        return error.NoWslRegistryKey;
     }
+    defer _ = RegCloseKey(lxss);
+
+    var index: u32 = 0;
+    while (true) : (index += 1) {
+        // Subkey names are GUIDs, so this is generously sized.
+        var guid: [128:0]u16 = undefined;
+        var guid_len: u32 = guid.len;
+        if (RegEnumKeyExW(lxss, index, &guid, &guid_len, null, null, null, null) != error_success) {
+            break;
+        }
+        guid[guid_len] = 0;
+
+        // State 1 is "installed". Anything else is mid-install or
+        // mid-uninstall and would fail to launch.
+        var state: u32 = 0;
+        var state_len: u32 = @sizeOf(u32);
+        if (RegGetValueW(
+            lxss,
+            guid[0..guid_len :0],
+            std.unicode.utf8ToUtf16LeStringLiteral("State"),
+            rrf_rt_reg_dword,
+            null,
+            &state,
+            &state_len,
+        ) != error_success) continue;
+        if (state != 1) continue;
+
+        var name_buf: [256:0]u16 = undefined;
+        var name_len: u32 = @sizeOf(@TypeOf(name_buf));
+        if (RegGetValueW(
+            lxss,
+            guid[0..guid_len :0],
+            std.unicode.utf8ToUtf16LeStringLiteral("DistributionName"),
+            rrf_rt_reg_sz,
+            null,
+            &name_buf,
+            &name_len,
+        ) != error_success) continue;
+
+        // name_len counts bytes and includes the terminator.
+        if (name_len < 2 * @sizeOf(u16)) continue;
+        const name_utf16 = name_buf[0 .. name_len / @sizeOf(u16) - 1];
+
+        var utf8: [512]u8 = undefined;
+        const n = std.unicode.utf16LeToUtf8(&utf8, name_utf16) catch continue;
+        const name = utf8[0..n];
+
+        // Docker Desktop registers two hidden distros that exist to hold
+        // its VM state. Neither has a usable shell.
+        if (std.mem.startsWith(u8, name, "docker-desktop")) continue;
+
+        // --cd ~ lands in the distro's home directory. Without it WSL
+        // inherits our Windows working directory and drops the user in
+        // /mnt/c/..., which is not where anyone wants to start.
+        const argv = [_][]const u8{ "wsl.exe", "-d", name, "--cd", "~" };
+        try list.append(alloc, try makeProfile(alloc, next_id.*, name, &argv));
+        next_id.* += 1;
+    }
+}
+
+fn freeProfile(alloc: std.mem.Allocator, p: Profile) void {
+    for (p.argv) |a| alloc.free(a);
+    alloc.free(p.argv);
+    alloc.free(p.name);
+}
+
+pub fn freeProfiles(alloc: std.mem.Allocator, profiles: []Profile) void {
+    for (profiles) |p| freeProfile(alloc, p);
     alloc.free(profiles);
 }
