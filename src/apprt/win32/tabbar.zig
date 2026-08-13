@@ -82,6 +82,14 @@ pub extern "ghostty_tabbar" fn ghostty_tabbar_set_title(
     title: [*:0]const u16,
 ) callconv(.c) void;
 
+/// `icon_path` is any file whose shell icon should represent the tab, on
+/// the same terms as `ghostty_tabbar_add_profile`. Null clears the icon.
+pub extern "ghostty_tabbar" fn ghostty_tabbar_set_tab_icon(
+    bar: *TabBar,
+    tab: TabId,
+    icon_path: ?[*:0]const u16,
+) callconv(.c) void;
+
 pub extern "ghostty_tabbar" fn ghostty_tabbar_set_selected(
     bar: *TabBar,
     tab: TabId,

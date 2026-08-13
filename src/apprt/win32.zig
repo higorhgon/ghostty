@@ -1367,6 +1367,61 @@ fn startPane(self: *App, surf: *Surface) !void {
     };
 }
 
+/// Gives a tab the icon of the shell it is running, which is how Windows
+/// Terminal makes a row of tabs readable at a glance. Best-effort: a tab
+/// whose shell we cannot put a face to simply shows none, and the strip
+/// collapses the icon column for it.
+fn setTabIcon(
+    self: *App,
+    window: *Window,
+    tab: *Tab,
+    profile: ?*const tabbar.Profile,
+) void {
+    const bar = window.tab_bar orelse return;
+    const path = if (profile) |p| p.icon else defaultIconPath(self, window);
+    if (path.len == 0) return;
+
+    var buf: [512:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(buf[0..511], path) catch return;
+    buf[n] = 0;
+    tabbar.ghostty_tabbar_set_tab_icon(bar, tab.bar_id, buf[0..n :0].ptr);
+}
+
+/// The icon for a tab opened without a profile -- the first tab, and the
+/// plain "+" -- which runs whatever the config's `command` says.
+///
+/// Answered by matching that command against the detected profiles rather
+/// than resolving it again: they already carry an absolute path, and
+/// SHGetFileInfo needs one. A bare "cmd.exe" yields the generic
+/// unknown-file icon, which is worse than no icon at all.
+fn defaultIconPath(self: *App, window: *Window) []const u8 {
+    // What Ghostty falls back to on Windows when nothing is configured.
+    var argv0: []const u8 = "cmd.exe";
+    if (self.config.command) |cmd| argv0 = switch (cmd) {
+        .direct => |a| if (a.len > 0) a[0] else return "",
+        // A shell command is one string for the shell to expand, so the
+        // executable is its first word -- which is also how this apprt
+        // splits it when it runs it.
+        .shell => |s| std.mem.sliceTo(s, ' '),
+    };
+
+    for (window.profiles) |p| {
+        if (p.argv.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(fileName(p.argv[0]), fileName(argv0))) {
+            return p.icon;
+        }
+    }
+    return "";
+}
+
+/// The file name part of a path. What identifies a shell across the two
+/// forms in play here: the config may name it bare ("cmd.exe") where the
+/// profile carries the absolute path it resolved to.
+fn fileName(path: []const u8) []const u8 {
+    const i = std.mem.lastIndexOfAny(u8, path, "\\/") orelse return path;
+    return path[i + 1 ..];
+}
+
 fn newTab(
     self: *App,
     window: *Window,
@@ -1402,7 +1457,10 @@ fn newTab(
     if (window.tab_bar) |bar| {
         const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
         tab.bar_id = tabbar.ghostty_tabbar_add_tab(bar, title);
-        if (tab.bar_id != 0) tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
+        if (tab.bar_id != 0) {
+            setTabIcon(self, window, tab, profile);
+            tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
+        }
     }
 
     reflow(window);

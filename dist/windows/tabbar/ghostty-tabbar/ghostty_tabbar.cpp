@@ -872,6 +872,23 @@ WUX::Media::Imaging::WriteableBitmap LoadShellIcon(std::wstring const& path) {
     return bmp;
 }
 
+/// LoadShellIcon, memoized by path.
+///
+/// Tabs ask for their icon on every creation and several tabs running the
+/// same shell is the ordinary case, so without this the strip goes to disk
+/// through SHGetFileInfo once per tab -- on the UI thread. A failed lookup
+/// is cached as null too, so a path that has no icon is not retried
+/// forever.
+WUX::Media::Imaging::WriteableBitmap CachedShellIcon(std::wstring const& path) {
+    static std::unordered_map<std::wstring,
+                              WUX::Media::Imaging::WriteableBitmap> cache;
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+    auto bmp = LoadShellIcon(path);
+    cache.emplace(path, bmp);
+    return bmp;
+}
+
 /// Builds one row: icon, then label, filling the menu's width.
 ///
 /// A Border with its own brushes and hand-rolled hover, rather than a
@@ -890,7 +907,7 @@ WUX::FrameworkElement MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
     row.ColumnDefinitions().Append(icon_col);
     row.ColumnDefinitions().Append(text_col);
 
-    if (auto bmp = LoadShellIcon(p.icon_path)) {
+    if (auto bmp = CachedShellIcon(p.icon_path)) {
         WUX::Controls::Image image;
         image.Source(bmp);
         image.Width(kMenuIconSize);
@@ -1497,6 +1514,29 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_title(
     if (it == bar->tabs.end()) return;
     try {
         it->second.Header(winrt::box_value(hstring{title ? title : L""}));
+    } catch (...) {
+    }
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_tab_icon(
+    GhosttyTabBar* bar, GhosttyTabId tab, const wchar_t* icon_path) {
+    if (!bar) return;
+    auto it = bar->tabs.find(tab);
+    if (it == bar->tabs.end()) return;
+    try {
+        if (!icon_path || !*icon_path) {
+            it->second.IconSource(nullptr);
+            return;
+        }
+        auto bmp = CachedShellIcon(icon_path);
+        if (!bmp) return;
+        // ImageIconSource rather than BitmapIconSource: the latter takes a
+        // URI and would mean writing the icon out to a file first, and it
+        // recolours what it draws to match the foreground, which would
+        // flatten a shell's logo into a monochrome silhouette.
+        MUX::Controls::ImageIconSource source;
+        source.ImageSource(bmp);
+        it->second.IconSource(source);
     } catch (...) {
     }
 }

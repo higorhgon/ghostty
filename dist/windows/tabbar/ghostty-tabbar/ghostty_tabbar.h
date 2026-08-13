@@ -118,6 +118,16 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_remove_tab(
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_title(
     GhosttyTabBar* bar, GhosttyTabId tab, const wchar_t* title);
 
+// Sets the icon drawn at the left of a tab, the way Windows Terminal shows
+// which shell a tab is running.
+//
+// `icon_path` is any file whose shell icon should represent the tab, on the
+// same terms as ghostty_tabbar_add_profile: the shell's own executable, or
+// for a WSL distribution its Start Menu shortcut. NULL or empty clears the
+// icon, which collapses the tab's icon column.
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_tab_icon(
+    GhosttyTabBar* bar, GhosttyTabId tab, const wchar_t* icon_path);
+
 // Selects a tab without firing on_selected (this is Ghostty telling the
 // strip about a change, not the user driving it).
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_selected(
