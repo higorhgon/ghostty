@@ -68,12 +68,17 @@ void Log(const char* fmt, ...) {
 // a public metric, so it's mirrored from the TabView default style.
 constexpr int32_t kTabStripHeight96 = 40;
 
-// Geometry of the buttons trailing the tabs, measured off Windows
-// Terminal's strip at 100% scaling so the chevron lines up with the "+"
-// WinUI draws inside the TabView. See where the chevron is built.
+// Geometry of the "+" / chevron split button trailing the tabs.
+//
+// The height and width come from Windows Terminal's strip at 100%
+// scaling. The bottom gap does not: it is set so the glyphs land on the
+// same baseline as a tab's close button, which sits with its glyph
+// centred at y=23 in a 39px strip. A 24px button 5px off the bottom puts
+// its centre at 23 too.
 constexpr double kFooterButtonHeight = 24;
-constexpr double kFooterButtonBottomGap = 3;
-constexpr double kChevronWidth = 26;
+constexpr double kFooterButtonWidth = 32;
+constexpr double kFooterButtonBottomGap = 5;
+constexpr double kFooterCornerRadius = 4;
 
 // Application + metadata provider.
 //
@@ -139,7 +144,11 @@ struct GhosttyTabBar {
 
     WUX::Controls::Grid root{nullptr};
     MUX::Controls::TabView tab_view{nullptr};
-    MUX::Controls::DropDownButton chevron{nullptr};
+    // The two halves of the new-tab split button, plus the rule between
+    // them. Held so the pair can be lit while the profile menu is open.
+    WUX::Controls::Button plus{nullptr};
+    WUX::Controls::Button chevron{nullptr};
+    WUX::Controls::Border footer_divider{nullptr};
     // Maximize/restore share one button; its glyph is swapped to match the
     // window state.
     WUX::Controls::FontIcon max_glyph{nullptr};
@@ -532,10 +541,62 @@ std::unordered_map<GhosttyTabBar*, std::vector<std::pair<GhosttyProfileId, std::
 // Caption button metrics, matching the system title bar at 96 DPI.
 constexpr double kCaptionButtonWidth = 46.0;
 
-// Segoe Fluent Icons / Segoe MDL2 Assets codepoints for the caption
-// glyphs. Written as escapes rather than literal characters so the source
-// file stays pure ASCII -- a literal glyph here is easy to mangle in
-// transit and renders as tofu.
+// Puts Win32 popup menus into dark or light mode.
+//
+// TrackPopupMenu draws a classic menu, which does not follow the app's
+// XAML theme and defaults to light -- so the shell picker came up white
+// on a dark title bar. The switch for this is uxtheme's SetPreferredAppMode,
+// which has no header and no name in the export table: it is ordinal 135
+// (and FlushMenuThemes, needed to repaint already-created menu theme data,
+// is 136). This is what Explorer, Windows Terminal and Notepad++ all use.
+//
+// Undocumented means it can vanish; every step is failure-tolerant and a
+// menu that stays light is the worst case. Ordinal 135 was AllowDarkModeForApp
+// taking a BOOL before Windows 10 1903, so this is gated on the build.
+void SetMenuTheme(bool dark) {
+    enum class PreferredAppMode { Default, AllowDark, ForceDark, ForceLight };
+    using SetPreferredAppModeFn = PreferredAppMode(WINAPI*)(PreferredAppMode);
+    using FlushMenuThemesFn = void(WINAPI*)();
+
+    static HMODULE uxtheme = ::LoadLibraryExW(
+        L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!uxtheme) return;
+
+    // RtlGetVersion rather than GetVersionEx: the latter lies about the
+    // build number unless the app manifest opts in per OS release.
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    static const DWORD build = [] () -> DWORD {
+        HMODULE nt = ::GetModuleHandleW(L"ntdll.dll");
+        if (!nt) return 0;
+        auto fn = reinterpret_cast<RtlGetVersionFn>(
+            ::GetProcAddress(nt, "RtlGetVersion"));
+        if (!fn) return 0;
+        RTL_OSVERSIONINFOW vi{};
+        vi.dwOSVersionInfoSize = sizeof(vi);
+        if (fn(&vi) != 0) return 0;
+        return vi.dwBuildNumber;
+    }();
+    if (build < 18362) return;
+
+    static auto set_mode = reinterpret_cast<SetPreferredAppModeFn>(
+        ::GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
+    static auto flush = reinterpret_cast<FlushMenuThemesFn>(
+        ::GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+    if (!set_mode) return;
+
+    set_mode(dark ? PreferredAppMode::ForceDark : PreferredAppMode::ForceLight);
+    if (flush) flush();
+}
+
+// Segoe Fluent Icons / Segoe MDL2 Assets codepoints. These are literal
+// characters in the private use area, so they show up blank in most
+// editors: Add E710, Chevron E70D, Minimize E921, Maximize E922, Restore
+// E923, Close E8BB. Writing them as \uXXXX escapes instead does not
+// stick -- something in this checkout rewrites them back to literals --
+// which is exactly why build.bat must pass /utf-8. Without it MSVC reads
+// them in the system ANSI codepage and every one renders as tofu.
+constexpr wchar_t kGlyphAdd[]      = L"";
+constexpr wchar_t kGlyphChevron[]  = L"";
 constexpr wchar_t kGlyphMinimize[] = L"";
 constexpr wchar_t kGlyphMaximize[] = L"";
 constexpr wchar_t kGlyphRestore[]  = L"";
@@ -596,6 +657,29 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
 
     HMENU menu = ::CreatePopupMenu();
     if (!menu) return;
+
+    // Light both halves for as long as the menu is up. Picking a profile
+    // opens a new tab, so the "+" is as much a part of this action as the
+    // chevron; leaving it dark makes the menu look unrelated to it.
+    //
+    // TrackPopupMenu below is modal and returns before this scope ends, so
+    // the highlight is guaranteed to come back off.
+    // Restores the transparent background explicitly rather than calling
+    // ClearValue: clearing the local value hands the button back to the
+    // default style, which paints the filled box this deliberately avoids.
+    struct Lit {
+        GhosttyTabBar* bar;
+        ~Lit() {
+            WUX::Media::SolidColorBrush clear{
+                winrt::Windows::UI::Color{0, 0, 0, 0}};
+            if (bar->plus) bar->plus.Background(clear);
+            if (bar->chevron) bar->chevron.Background(clear);
+        }
+    } lit{bar};
+    if (bar->b_hover) {
+        if (bar->plus) bar->plus.Background(bar->b_hover);
+        if (bar->chevron) bar->chevron.Background(bar->b_hover);
+    }
 
     // Menu command ids are 1-based indices into `profiles`; 0 means the
     // user dismissed the menu.
@@ -684,18 +768,17 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
 
         MUX::Controls::TabView tv;
         tv.TabWidthMode(MUX::Controls::TabViewWidthMode::Equal);
-        tv.IsAddTabButtonVisible(true);
         // Ghostty owns the terminal surface; the TabView draws headers
         // only, so every item's content stays empty.
         tv.CanDragTabs(false);
         tv.CanReorderTabs(true);
         bar->tab_view = tv;
 
-        // "+" opens the default profile, matching Windows Terminal.
-        tv.AddTabButtonClick([bar](auto&&, auto&&) {
-            if (bar->cb.on_new_tab)
-                bar->cb.on_new_tab(bar->cb.ctx, GHOSTTY_PROFILE_DEFAULT);
-        });
+        // WinUI's own add button is switched off and rebuilt below,
+        // alongside the chevron. Its geometry and corner radii are baked
+        // into the TabView template with no API to reach them, and a split
+        // button needs both halves under the same control.
+        tv.IsAddTabButtonVisible(false);
 
         tv.TabCloseRequested(
             [bar](MUX::Controls::TabView const&,
@@ -714,50 +797,70 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
             if (id && bar->cb.on_selected) bar->cb.on_selected(bar->cb.ctx, id);
         });
 
-        // Chevron button next to "+" that drops down the shell list.
-        // DropDownButton renders its own chevron glyph, so it deliberately
-        // gets no Content: supplying a FontIcon here stacks a second glyph
-        // beside the built-in one.
+        // The "+" and the chevron, built as a two-segment split button:
+        // equal boxes, a rule between them, and rounding only on the outer
+        // corners so the pair reads as one control rather than two.
         //
-        // Geometry mirrors the "+" so the two read as one split button
-        // rather than two unrelated controls. Measured off Windows
-        // Terminal at 100% scaling: its "+" occupies a 32x24 box sitting
-        // 3px off the bottom of a 39px strip, and its chevron is the same
-        // height immediately to the right.
-        //
-        // Bottom, not Stretch: the add button is bottom-aligned inside the
-        // TabView template (it lines up with the tabs, which grow from the
-        // bottom), so a stretched chevron is both too tall and centred
-        // 4px higher than the "+" beside it.
-        MUX::Controls::DropDownButton chevron;
-        chevron.Width(kChevronWidth);
-        chevron.MinWidth(0);
-        chevron.Height(kFooterButtonHeight);
-        chevron.MinHeight(0);
-        chevron.Padding(WUX::ThicknessHelper::FromUniformLength(0));
-        chevron.VerticalAlignment(WUX::VerticalAlignment::Bottom);
-        chevron.Margin(WUX::ThicknessHelper::FromLengths(0, 0, 0, kFooterButtonBottomGap));
-        chevron.CornerRadius(WUX::CornerRadiusHelper::FromUniformRadius(4));
-        // Flat, like the "+" beside it -- the default button chrome draws
-        // a filled box that reads as out of place in a title bar.
-        chevron.Background(WUX::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{0, 0, 0, 0}));
-        chevron.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
+        // Both are plain Buttons. A DropDownButton would supply its own
+        // chevron glyph, but it reserves a content column beside it and
+        // ends up drawing the glyph ~5px right of its own centre, which no
+        // amount of padding straightens out.
+        auto make_button = [&](wchar_t const* glyph, WUX::CornerRadius radius) {
+            WUX::Controls::Button b;
+            WUX::Controls::FontIcon icon;
+            icon.Glyph(glyph);
+            icon.FontFamily(WUX::Media::FontFamily(L"Segoe Fluent Icons"));
+            icon.FontSize(12);
+            b.Content(icon);
+            b.Width(kFooterButtonWidth);
+            b.Height(kFooterButtonHeight);
+            // Buttons carry a MinWidth/MinHeight far larger than this;
+            // without clearing them the explicit size is ignored.
+            b.MinWidth(0);
+            b.MinHeight(0);
+            b.Padding(WUX::ThicknessHelper::FromUniformLength(0));
+            b.CornerRadius(radius);
+            // Flat: the default button chrome draws a filled box that
+            // reads as out of place in a title bar.
+            b.Background(WUX::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{0, 0, 0, 0}));
+            b.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
+            return b;
+        };
+
+        // FromRadii is (topLeft, topRight, bottomRight, bottomLeft): the
+        // square corners are the ones meeting the divider.
+        auto plus = make_button(
+            kGlyphAdd, WUX::CornerRadiusHelper::FromRadii(
+                           kFooterCornerRadius, 0, 0, kFooterCornerRadius));
+        plus.Click([bar](auto&&, auto&&) {
+            if (bar->cb.on_new_tab)
+                bar->cb.on_new_tab(bar->cb.ctx, GHOSTTY_PROFILE_DEFAULT);
+        });
+        bar->plus = plus;
+
+        auto chevron = make_button(
+            kGlyphChevron, WUX::CornerRadiusHelper::FromRadii(
+                               0, kFooterCornerRadius, kFooterCornerRadius, 0));
         // No XAML Flyout is attached (see ShowProfileMenu for why); the
         // button just raises Click and we open a Win32 menu ourselves.
         chevron.Click([bar](auto&&, auto&&) { ShowProfileMenu(bar); });
         bar->chevron = chevron;
 
-        // Deliberately no separator between "+" and the chevron. An
-        // earlier version drew a hairline rule here, on the assumption
-        // Windows Terminal had one. Sampling its strip shows it does not:
-        // at rest the two buttons are bare glyphs on the strip, and the
-        // only edge that ever appears is the rounded hover highlight on
-        // whichever half the pointer is over. A standing rule reads as a
-        // border around nothing, which is exactly how it looked.
+        WUX::Controls::Border divider;
+        divider.Width(1);
+        divider.Height(kFooterButtonHeight);
+        divider.Background(WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{40, 255, 255, 255}));
+        bar->footer_divider = divider;
+
         WUX::Controls::StackPanel footer;
         footer.Orientation(WUX::Controls::Orientation::Horizontal);
         footer.VerticalAlignment(WUX::VerticalAlignment::Bottom);
+        footer.Margin(
+            WUX::ThicknessHelper::FromLengths(0, 0, 0, kFooterButtonBottomGap));
+        footer.Children().Append(plus);
+        footer.Children().Append(divider);
         footer.Children().Append(chevron);
         tv.TabStripFooter(footer);
 
@@ -1005,6 +1108,10 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
     try {
         bar->root.RequestedTheme(dark ? WUX::ElementTheme::Dark
                                       : WUX::ElementTheme::Light);
+
+        // The shell picker is a Win32 menu, which has no idea the XAML
+        // above it just changed theme.
+        SetMenuTheme(dark != 0);
 
         // Windows Terminal's colour model, which is the opposite of the
         // obvious one: the *selected* tab takes the terminal's exact
