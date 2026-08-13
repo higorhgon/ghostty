@@ -135,6 +135,13 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar);
 
+// Non-zero once the strip has composed its first frame. Before that the
+// island paints white, so a host that shows its window immediately gets a
+// white title bar for a few hundred milliseconds. Note XAML does not
+// compose while the host window is hidden -- the window has to be visible,
+// even if only off-screen, for this to ever become true.
+GHOSTTY_TABBAR_API int32_t ghostty_tabbar_rendered(GhosttyTabBar* bar);
+
 // Matches the strip to Ghostty's configured theme. `dark` selects the
 // light/dark resource set; the RGB triple paints the strip background so
 // it blends into the terminal below.

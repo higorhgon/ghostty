@@ -225,6 +225,7 @@ const w32 = struct {
     pub const HTCAPTION: LRESULT = 2;
     pub const HTTOP: LRESULT = 12;
 
+    pub const SW_SHOWNOACTIVATE: c_int = 4;
     pub const SW_MINIMIZE: c_int = 6;
     pub const SW_MAXIMIZE: c_int = 3;
     pub const SW_RESTORE: c_int = 9;
@@ -341,6 +342,10 @@ const w32 = struct {
     pub extern "user32" fn UpdateWindow(HWND) callconv(.winapi) BOOL;
     pub extern "user32" fn DestroyWindow(HWND) callconv(.winapi) BOOL;
     pub extern "user32" fn GetMessageW(*MSG, ?HWND, UINT, UINT) callconv(.winapi) BOOL;
+    pub extern "user32" fn PeekMessageW(*MSG, ?HWND, UINT, UINT, UINT) callconv(.winapi) BOOL;
+    pub const PM_REMOVE: UINT = 0x0001;
+    pub extern "user32" fn GetWindowRect(HWND, *RECT) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     pub extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
     pub extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;
     pub extern "user32" fn PostQuitMessage(c_int) callconv(.winapi) void;
@@ -828,6 +833,18 @@ pub const Window = struct {
     }
 };
 
+/// Drains any pending messages, routing them the same way the main loop
+/// does. Used while waiting for the tab strip's first frame, before the
+/// real loop has started.
+fn pumpOnce(self: *App) void {
+    var msg: w32.MSG = undefined;
+    while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != w32.FALSE) {
+        if (self.pretranslate(&msg)) continue;
+        _ = w32.TranslateMessage(&msg);
+        _ = w32.DispatchMessageW(&msg);
+    }
+}
+
 /// Tells every surface in `window` whether it currently has focus.
 ///
 /// Exactly one surface can be focused: the focused pane of the active tab,
@@ -1198,6 +1215,35 @@ fn newWindow(self: *App) !*Window {
     if (w32.wglMakeCurrent(hdc, hglrc) == w32.FALSE) return error.Unexpected;
 
     _ = try self.newTab(window, .window, null);
+
+    // Show off-screen first, let the strip compose, then bring the window
+    // to where it belongs.
+    //
+    // A XAML island paints white until it has a frame to present, so
+    // showing the window straight away puts a white title bar on screen
+    // for a few hundred milliseconds before the theme snaps in. Waiting
+    // while hidden is not an option: XAML does not compose at all for a
+    // hidden window, so the wait would never end. Off-screen is visible as
+    // far as XAML is concerned and invisible as far as the user is.
+    if (window.tab_bar) |bar| {
+        var rect: w32.RECT = undefined;
+        if (w32.GetWindowRect(hwnd, &rect) != w32.FALSE) {
+            const flags = w32.SWP_NOSIZE | w32.SWP_NOZORDER | w32.SWP_NOACTIVATE;
+            _ = w32.SetWindowPos(hwnd, null, -32000, -32000, 0, 0, flags);
+            _ = w32.ShowWindow(hwnd, w32.SW_SHOWNOACTIVATE);
+
+            // Bounded: a strip that never reports a frame must not keep
+            // the window off-screen forever.
+            var waited: u32 = 0;
+            while (tabbar.ghostty_tabbar_rendered(bar) == 0 and waited < 1000) {
+                pumpOnce(self);
+                w32.Sleep(4);
+                waited += 4;
+            }
+
+            _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, 0, 0, flags);
+        }
+    }
 
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.UpdateWindow(hwnd);

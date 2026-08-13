@@ -96,6 +96,11 @@ pub extern "ghostty_tabbar" fn ghostty_tabbar_add_profile(
 
 pub extern "ghostty_tabbar" fn ghostty_tabbar_clear_profiles(bar: *TabBar) callconv(.c) void;
 
+/// Non-zero once the strip has composed its first frame. XAML does not
+/// compose while the host window is hidden, so the window must be visible
+/// -- if only off-screen -- for this to ever become true.
+pub extern "ghostty_tabbar" fn ghostty_tabbar_rendered(bar: *TabBar) callconv(.c) i32;
+
 pub extern "ghostty_tabbar" fn ghostty_tabbar_set_theme(
     bar: *TabBar,
     r: u8,

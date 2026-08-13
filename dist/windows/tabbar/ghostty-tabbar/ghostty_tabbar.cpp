@@ -183,6 +183,12 @@ struct GhosttyTabBar {
     // must not report it back as if the user had clicked.
     bool suppress_selection = false;
 
+    /// Set on the strip's first composed frame. Until then the island
+    /// paints white, so the host keeps the window off-screen.
+    int frames = 0;
+    bool rendered = false;
+    winrt::event_token rendering_token{};
+
     /// GetMessageTime of the moment the profile menu last closed, so a
     /// click on the chevron that closed it cannot immediately reopen it.
     LONG menu_closed_at = 0;
@@ -1341,6 +1347,21 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         bar->root = root;
         bar->source.Content(root);
         Log("create: content set OK");
+
+        // CompositionTarget::Rendering fires once XAML has a frame to
+        // present. It is the only honest answer to "has the strip painted
+        // yet" -- laid out is not the same as composed, and the island
+        // shows white right up until the latter.
+        // Several frames, not one. The first Rendering tick fires for the
+        // frame that is still blank -- reporting ready then put the window
+        // on screen white anyway, just for less time.
+        bar->rendering_token = WUX::Media::CompositionTarget::Rendering(
+            [bar](auto&&, auto&&) {
+                if (bar->rendered) return;
+                if (++bar->frames < 4) return;
+                bar->rendered = true;
+                WUX::Media::CompositionTarget::Rendering(bar->rendering_token);
+            });
     } catch (hresult_error const& e) {
         Log("create: FAILED hresult 0x%08X: %ls", (unsigned)e.code(),
             e.message().c_str());
@@ -1500,6 +1521,10 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
     if (!bar) return;
     g_profiles[bar].push_back(Profile{profile, name ? name : L"",
                                       icon_path ? icon_path : L""});
+}
+
+GHOSTTY_TABBAR_API int32_t ghostty_tabbar_rendered(GhosttyTabBar* bar) {
+    return (bar && bar->rendered) ? 1 : 0;
 }
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar) {
