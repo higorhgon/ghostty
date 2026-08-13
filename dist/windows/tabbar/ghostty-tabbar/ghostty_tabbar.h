@@ -125,8 +125,13 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_selected(
 
 // Adds an entry to the new-tab dropdown. Call once per available shell,
 // in display order, before or after creation.
+//
+// `icon_path` is any file whose shell icon should represent the entry --
+// the shell's own executable, or for a WSL distribution its Start Menu
+// shortcut, which carries the distro logo. May be NULL for no icon.
 GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
-    GhosttyTabBar* bar, GhosttyProfileId profile, const wchar_t* name);
+    GhosttyTabBar* bar, GhosttyProfileId profile, const wchar_t* name,
+    const wchar_t* icon_path);
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar);
 

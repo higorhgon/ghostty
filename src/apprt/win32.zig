@@ -366,6 +366,8 @@ const w32 = struct {
     pub extern "user32" fn FillRect(HDC, *const RECT, HBRUSH) callconv(.winapi) c_int;
     pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, UINT) callconv(.winapi) c_int;
     pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
+    pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+    pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
     pub extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
     pub extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, UINT) callconv(.winapi) BOOL;
     pub extern "user32" fn PostMessageW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) BOOL;
@@ -1023,7 +1025,15 @@ fn initTabBar(self: *App, window: *Window) void {
         var buf: [256:0]u16 = undefined;
         const n = std.unicode.utf8ToUtf16Le(buf[0..255], p.name) catch continue;
         buf[n] = 0;
-        tabbar.ghostty_tabbar_add_profile(bar, p.id, buf[0..n :0]);
+
+        var icon_buf: [512:0]u16 = undefined;
+        const icon: ?[*:0]const u16 = if (p.icon.len == 0) null else icon: {
+            const in = std.unicode.utf8ToUtf16Le(icon_buf[0..511], p.icon) catch
+                break :icon null;
+            icon_buf[in] = 0;
+            break :icon icon_buf[0..in :0].ptr;
+        };
+        tabbar.ghostty_tabbar_add_profile(bar, p.id, buf[0..n :0], icon);
     }
 
     applyTabBarTheme(window);
@@ -1446,7 +1456,18 @@ fn toggleFocus(window: *Window) void {
 /// only one pane's content is updated would show a torn/incomplete frame.
 fn reflow(window: *Window) void {
     const tab = window.activeTabPtr() orelse return;
-    _ = w32.SetFocus(window.gl_hwnd);
+
+    // Keep keyboard focus on the terminal, but never take it. reflow also
+    // draws, so it runs on every frame: grabbing focus unconditionally
+    // here yanked it back ~60 times a second, which is why the profile
+    // menu -- a window of ours on the same thread -- was deactivated the
+    // instant it appeared. GetActiveWindow is per-thread, so this reads as
+    // "only when nothing else of ours is up".
+    if (w32.GetActiveWindow() == window.hwnd and
+        w32.GetFocus() != window.gl_hwnd)
+    {
+        _ = w32.SetFocus(window.gl_hwnd);
+    }
 
     // Every path that moves focus between tabs or panes ends up here, so
     // this is the one place that catches all of them. It is idempotent,

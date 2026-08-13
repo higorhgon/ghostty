@@ -192,11 +192,16 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE p, PWSTR c, int s) {
     if (!g_bar) { Log("FATAL: ghostty_tabbar_create returned NULL"); return 2; }
     Log("tabbar created, height=%d", ghostty_tabbar_height(g_bar));
 
-    ghostty_tabbar_add_profile(g_bar, 1, L"Command Prompt");
-    ghostty_tabbar_add_profile(g_bar, 2, L"Windows PowerShell");
-    ghostty_tabbar_add_profile(g_bar, 3, L"PowerShell 7");
-    ghostty_tabbar_add_profile(g_bar, 4, L"Ubuntu (WSL)");
-    ghostty_tabbar_add_profile(g_bar, 5, L"Git Bash");
+    /* Real paths so the menu shows the shells' own icons. */
+    ghostty_tabbar_add_profile(g_bar, 1, L"Command Prompt",
+                               L"C:\Windows\System32\cmd.exe");
+    ghostty_tabbar_add_profile(g_bar, 2, L"Windows PowerShell",
+                               L"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+    ghostty_tabbar_add_profile(g_bar, 3, L"PowerShell 7", NULL);
+    ghostty_tabbar_add_profile(g_bar, 4, L"Ubuntu (WSL)",
+                               L"C:\Windows\System32\wsl.exe");
+    ghostty_tabbar_add_profile(g_bar, 5, L"Git Bash",
+                               L"C:\Program Files\Git\bin\bash.exe");
     Log("profiles registered");
 
     g_tabs[g_tab_count++] = ghostty_tabbar_add_tab(g_bar, L"C:\\WINDOWS\\system32\\cmd.exe");

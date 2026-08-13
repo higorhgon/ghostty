@@ -91,6 +91,7 @@ pub extern "ghostty_tabbar" fn ghostty_tabbar_add_profile(
     bar: *TabBar,
     profile: ProfileId,
     name: [*:0]const u16,
+    icon_path: ?[*:0]const u16,
 ) callconv(.c) void;
 
 pub extern "ghostty_tabbar" fn ghostty_tabbar_clear_profiles(bar: *TabBar) callconv(.c) void;
@@ -116,6 +117,11 @@ pub const Profile = struct {
     /// The command to run, index zero being the executable. Empty means
     /// "whatever the config says", which is what the plain "+" uses.
     argv: []const []const u8,
+    /// A file whose shell icon represents this entry in the menu. Usually
+    /// the shell's executable; for a WSL distribution it is the Start Menu
+    /// shortcut, which is the only thing on disk carrying the distro logo.
+    /// Empty for no icon.
+    icon: []const u8 = "",
 };
 
 // Shell discovery uses Win32 directly rather than std: SearchPathW is
@@ -175,7 +181,14 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
     var next_id: ProfileId = 1;
     for (candidates) |c| {
         if (!exists(c.argv[0], c.absolute)) continue;
-        try list.append(alloc, try makeProfile(alloc, next_id, c.name, c.argv));
+        // SHGetFileInfo wants a real path; a bare "cmd.exe" yields the
+        // generic unknown-file icon.
+        var icon_buf: [512]u8 = undefined;
+        const icon = if (c.absolute)
+            c.argv[0]
+        else
+            (resolvePath(c.argv[0], &icon_buf) orelse c.argv[0]);
+        try list.append(alloc, try makeProfile(alloc, next_id, c.name, c.argv, icon));
         next_id += 1;
     }
 
@@ -196,6 +209,7 @@ fn makeProfile(
     id: ProfileId,
     name: []const u8,
     argv: []const []const u8,
+    icon: []const u8,
 ) !Profile {
     const owned_argv = try alloc.alloc([]const u8, argv.len);
     var filled: usize = 0;
@@ -212,7 +226,24 @@ fn makeProfile(
         .id = id,
         .name = try alloc.dupe(u8, name),
         .argv = owned_argv,
+        .icon = try alloc.dupe(u8, icon),
     };
+}
+
+/// Resolves a bare executable name to its full path via the standard
+/// search path, writing UTF-8 into `buf`. Null if it isn't found or
+/// doesn't fit.
+fn resolvePath(name: []const u8, buf: []u8) ?[]const u8 {
+    var wname: [512:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wname[0..511], name) catch return null;
+    wname[n] = 0;
+
+    var out: [512:0]u16 = undefined;
+    const len = SearchPathW(null, wname[0..n :0], null, out.len, &out, null);
+    if (len == 0 or len >= out.len) return null;
+
+    const written = std.unicode.utf16LeToUtf8(buf, out[0..len]) catch return null;
+    return buf[0..written];
 }
 
 fn exists(path: []const u8, absolute: bool) bool {
@@ -345,16 +376,55 @@ fn appendWslProfiles(
         // --cd ~ lands in the distro's home directory. Without it WSL
         // inherits our Windows working directory and drops the user in
         // /mnt/c/..., which is not where anyone wants to start.
+        // The Start Menu shortcut is where the distro logo lives; the
+        // registry has no icon of its own and wsl.exe would give every
+        // distribution the same one.
+        var icon_buf: [1024]u8 = undefined;
+        const icon = shortcutPath(lxss, guid[0..guid_len :0], &icon_buf) orelse blk: {
+            var exe_buf: [512]u8 = undefined;
+            break :blk if (resolvePath("wsl.exe", &exe_buf)) |p|
+                (std.fmt.bufPrint(&icon_buf, "{s}", .{p}) catch "")
+            else
+                "";
+        };
+
         const argv = [_][]const u8{ "wsl.exe", "-d", name, "--cd", "~" };
-        try list.append(alloc, try makeProfile(alloc, next_id.*, name, &argv));
+        try list.append(alloc, try makeProfile(alloc, next_id.*, name, &argv, icon));
         next_id.* += 1;
     }
+}
+
+/// Reads a distribution's `ShortcutPath` -- the .lnk WSL drops in the
+/// Start Menu, which is the only file on disk carrying the distro's own
+/// logo. Null when the key is absent, which is the case for distros
+/// installed before WSL started writing shortcuts.
+fn shortcutPath(lxss: HKEY, guid: [:0]const u16, buf: []u8) ?[]const u8 {
+    var wbuf: [512:0]u16 = undefined;
+    var cb: u32 = @sizeOf(@TypeOf(wbuf));
+    if (RegGetValueW(
+        lxss,
+        guid,
+        std.unicode.utf8ToUtf16LeStringLiteral("ShortcutPath"),
+        rrf_rt_reg_sz,
+        null,
+        &wbuf,
+        &cb,
+    ) != error_success) return null;
+    if (cb < 2 * @sizeOf(u16)) return null;
+
+    const utf16 = wbuf[0 .. cb / @sizeOf(u16) - 1];
+    const n = std.unicode.utf16LeToUtf8(buf, utf16) catch return null;
+    if (GetFileAttributesW(wbuf[0..utf16.len :0]) == invalid_file_attributes) {
+        return null;
+    }
+    return buf[0..n];
 }
 
 fn freeProfile(alloc: std.mem.Allocator, p: Profile) void {
     for (p.argv) |a| alloc.free(a);
     alloc.free(p.argv);
     alloc.free(p.name);
+    alloc.free(p.icon);
 }
 
 pub fn freeProfiles(alloc: std.mem.Allocator, profiles: []Profile) void {

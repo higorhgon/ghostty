@@ -79,13 +79,32 @@ failing to be added, and sends you debugging the wrong thing entirely.
 
 **XAML Island popups are clipped to the island's HWND.** The island here is
 only as tall as the tab strip, so a XAML `MenuFlyout` for the shell picker
-opens completely invisible. That is why the picker is a Win32
-`TrackPopupMenu` instead: a separate top-level window escapes those bounds.
-The tabs themselves remain a real `TabView`.
+opens completely invisible. The picker therefore gets a *second* island, in
+a top-level window of its own, which escapes those bounds.
 
-Fixing that properly would mean the island owning the whole window and the
-terminal rendering into a `SwapChainPanel` — the full Windows Terminal
-architecture, and a port of Ghostty's renderer from OpenGL to Direct3D.
+Three things that costs, none of them obvious and none of them
+reported as an error:
+
+- `AttachToWindow` leaves the new island hidden. It comes back as a bare
+  `WS_CHILD` with no `WS_VISIBLE`, so the window renders as an empty frame
+  with whatever is behind it showing through. `SWP_SHOWWINDOW` fixes it.
+- A `Brush` belongs to the tree it was first used in. Handing the strip's
+  brushes to the menu leaves the menu unpainted; every brush it draws with
+  has to be created in its own tree.
+- Each island only sees the keyboard input handed to it, so the menu's
+  island needs its own turn in `ghostty_tabbar_pretranslate`.
+
+**Never take focus from a draw path.** `reflow` both lays out and draws, so
+it runs every frame, and it used to call `SetFocus` on the terminal
+unconditionally. That yanked focus back ~60 times a second, which nothing
+noticed until the profile menu — a window of ours on the same thread —
+was deactivated the instant it appeared. It now only reclaims focus when
+its own window is already the active one.
+
+Making the tab strip's island cover the whole window instead, and
+rendering the terminal into a `SwapChainPanel`, would sidestep the
+clipping entirely. That is the full Windows Terminal architecture, and it
+needs Ghostty's renderer ported from OpenGL to Direct3D.
 
 **Overriding `TabViewItemHeaderBackground*` does nothing.** The documented
 way to recolour tabs was measured as having no effect through four scopes:

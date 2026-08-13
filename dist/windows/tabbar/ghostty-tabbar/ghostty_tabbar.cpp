@@ -19,6 +19,11 @@
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Media.Imaging.h>
+#include <winrt/Windows.System.h>
+#include <shellapi.h>
+#include <dwmapi.h>
+#include <robuffer.h>
 
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.XamlTypeInfo.h>
@@ -136,6 +141,10 @@ private:
     WUX::Hosting::WindowsXamlManager manager_{nullptr};
 };
 
+// Defined further down, alongside the menu itself. Declared here so the
+// bar can hold a pointer to the open one.
+struct ProfileMenu;
+
 } // namespace
 
 struct GhosttyTabBar {
@@ -177,6 +186,19 @@ struct GhosttyTabBar {
     /// GetMessageTime of the moment the profile menu last closed, so a
     /// click on the chevron that closed it cannot immediately reopen it.
     LONG menu_closed_at = 0;
+    /// The open profile menu, or null. Owned by the menu itself, which
+    /// clears this as it closes.
+    ProfileMenu* menu = nullptr;
+
+    /// Menu chrome. Kept as plain colours, not brushes: the menu lives in
+    /// a second XAML island with its own XamlRoot, and a Brush belongs to
+    /// the tree it was first used in. Handing the strip's brushes to the
+    /// menu left its background unpainted -- the window came up showing
+    /// the terminal straight through it. Fresh brushes are built per menu.
+    winrt::Windows::UI::Color menu_bg{255, 32, 32, 32};
+    winrt::Windows::UI::Color menu_border{255, 48, 48, 48};
+    winrt::Windows::UI::Color menu_hover{255, 45, 45, 45};
+    winrt::Windows::UI::Color menu_text{255, 255, 255, 255};
 
     void Notify(GhosttyTabSelectedFn fn, GhosttyTabId id) {
         if (fn) fn(cb.ctx, id);
@@ -241,6 +263,42 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
               <SolidColorBrush x:Key="GhosttyTabSelected" Color="#FF202020"/>
               <SolidColorBrush x:Key="GhosttyTabUnselected" Color="#FF141414"/>
               <SolidColorBrush x:Key="GhosttyTabHover" Color="#FF2D2D2D"/>
+              <SolidColorBrush x:Key="GhosttyMenuBackground" Color="#FF202020"/>
+              <SolidColorBrush x:Key="GhosttyMenuBorder" Color="#FF303030"/>
+
+              <!-- One row of the shell picker. Left-aligned content and a
+                   themed hover fill, which the stock Button style gives
+                   neither of. -->
+              <Style x:Key="GhosttyMenuItemStyle" TargetType="Button">
+                <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="Foreground" Value="{ThemeResource TabViewItemHeaderForeground}"/>
+                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Root" Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}" Padding="{TemplateBinding Padding}">
+                        <VisualStateManager.VisualStateGroups>
+                          <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal"/>
+                            <VisualState x:Name="PointerOver">
+                              <VisualState.Setters>
+                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabHover}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Pressed">
+                              <VisualState.Setters>
+                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabHover}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Disabled"/>
+                          </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                        <ContentPresenter x:Name="ContentPresenter" HorizontalAlignment="Stretch" VerticalAlignment="Center" Content="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"/>
+                      </Border>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>
 
               <!-- A copy of WinUI's TabViewCloseButtonStyle. The stock
                    template reaches it by name, but that Style is defined in
@@ -581,8 +639,12 @@ GhosttyTabId IdOf(MUX::Controls::TabViewItem const& item) {
 
 // Profiles live outside the XAML tree: they can be registered before the
 // UI exists, and the menu is built fresh each time it opens.
-std::unordered_map<GhosttyTabBar*, std::vector<std::pair<GhosttyProfileId, std::wstring>>>
-    g_profiles;
+struct Profile {
+    GhosttyProfileId id;
+    std::wstring name;
+    std::wstring icon_path;
+};
+std::unordered_map<GhosttyTabBar*, std::vector<Profile>> g_profiles;
 
 // Caption button metrics, matching the system title bar at 96 DPI.
 constexpr double kCaptionButtonWidth = 46.0;
@@ -690,29 +752,258 @@ WUX::Controls::Button MakeCaptionButton(
     return btn;
 }
 
-// The shell picker is a Win32 popup menu rather than a XAML MenuFlyout.
+// The shell picker.
 //
-// XAML Island popups are clipped to the island's HWND, and this island is
-// only as tall as the tab strip -- a MenuFlyout here opens but is entirely
-// invisible. A Win32 menu is its own top-level window, so it escapes those
-// bounds. The tabs themselves remain a real WinUI TabView; only this menu
-// is native.
+// This is a real Fluent menu: a WinUI list in its own XAML island, in its
+// own top-level window. It has to be its own window because island popups
+// are clipped to the island's HWND, and the strip's island is only as tall
+// as the strip -- a MenuFlyout hung off the chevron opens correctly and is
+// entirely invisible. That clipping is why this used to be a Win32
+// TrackPopupMenu, which looks like Windows 95 next to the rest of the
+// title bar.
+//
+// The window is modeless. A modal loop of our own would starve the XAML
+// dispatcher that this very menu needs to lay out and animate, so instead
+// it is shown, activated, and left to the host's message loop; it closes
+// itself when an item is picked, when Escape is pressed, or when it loses
+// activation.
+struct ProfileMenu {
+    GhosttyTabBar* bar = nullptr;
+    HWND hwnd = nullptr;
+    WUX::Hosting::DesktopWindowXamlSource source{nullptr};
+    com_ptr<IDesktopWindowXamlSourceNative2> native;
+    // Guards against re-entering Close from inside WM_DESTROY.
+    bool closing = false;
+    /// Set once the window has actually taken activation. Until then a
+    /// WM_ACTIVATE(WA_INACTIVE) is part of the show sequence, not the user
+    /// dismissing anything -- closing on it made the menu vanish the
+    /// instant it appeared.
+    bool activated = false;
+};
+
+constexpr wchar_t kMenuClassName[] = L"GhosttyProfileMenu";
+
+// Posted to the menu window to make it appear.
+//
+// Showing it inline from the chevron's Click handler does not survive:
+// the menu takes activation, the handler returns, and XAML then finishes
+// processing the very pointer release that ran it -- restoring focus to
+// the strip's island, which activates the main window and deactivates the
+// menu instantly. Posting defers the show until that is all over.
+constexpr UINT WM_GHOSTTY_SHOW_MENU = WM_APP + 1;
+
+// Menu metrics at 96 DPI, matching a Windows 11 context menu.
+constexpr int kMenuItemHeight = 32;
+constexpr int kMenuIconSize = 16;
+constexpr int kMenuPadding = 4;
+constexpr int kMenuWidth = 220;
+constexpr int kMenuCornerRadius = 8;
+
+std::unordered_map<HWND, ProfileMenu*> g_menus;
+
+void CloseProfileMenu(ProfileMenu* menu);
+
+/// Turns a file's shell icon into something XAML can draw.
+///
+/// SHGetFileInfo gives an HICON; WinUI wants pixels. The colour bitmap
+/// inside the icon is already 32-bit BGRA, which is exactly the layout a
+/// WriteableBitmap wants, so this is a straight copy -- except that icon
+/// bitmaps carry straight alpha and XAML expects it premultiplied, hence
+/// the scaling of the colour channels.
+WUX::Media::Imaging::WriteableBitmap LoadShellIcon(std::wstring const& path) {
+    if (path.empty()) return nullptr;
+
+    SHFILEINFOW info{};
+    if (!::SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info),
+                          SHGFI_ICON | SHGFI_SMALLICON)) {
+        return nullptr;
+    }
+    if (!info.hIcon) return nullptr;
+
+    ICONINFO ii{};
+    if (!::GetIconInfo(info.hIcon, &ii)) {
+        ::DestroyIcon(info.hIcon);
+        return nullptr;
+    }
+
+    BITMAP bm{};
+    ::GetObjectW(ii.hbmColor, sizeof(bm), &bm);
+    const int w = bm.bmWidth, h = bm.bmHeight;
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    // Negative height: top-down rows, so no flip afterwards.
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    HDC dc = ::GetDC(nullptr);
+    const bool ok = ::GetDIBits(dc, ii.hbmColor, 0, h, pixels.data(), &bi,
+                                DIB_RGB_COLORS) != 0;
+    ::ReleaseDC(nullptr, dc);
+    if (ii.hbmColor) ::DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) ::DeleteObject(ii.hbmMask);
+    ::DestroyIcon(info.hIcon);
+    if (!ok) return nullptr;
+
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        const uint32_t a = pixels[i + 3];
+        pixels[i + 0] = static_cast<uint8_t>(pixels[i + 0] * a / 255);
+        pixels[i + 1] = static_cast<uint8_t>(pixels[i + 1] * a / 255);
+        pixels[i + 2] = static_cast<uint8_t>(pixels[i + 2] * a / 255);
+    }
+
+    WUX::Media::Imaging::WriteableBitmap bmp{w, h};
+    auto buffer = bmp.PixelBuffer();
+    auto access = buffer.as<::Windows::Storage::Streams::IBufferByteAccess>();
+    uint8_t* dst = nullptr;
+    if (FAILED(access->Buffer(&dst)) || !dst) return nullptr;
+    memcpy(dst, pixels.data(), pixels.size());
+    bmp.Invalidate();
+    return bmp;
+}
+
+/// Builds one row: icon, then label, filling the menu's width.
+///
+/// A Border with its own brushes and hand-rolled hover, rather than a
+/// Button wearing a Style out of the shared dictionary. Everything the
+/// menu draws with has to be created here, in the menu's own tree -- see
+/// the note on GhosttyTabBar::menu_bg.
+WUX::FrameworkElement MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
+                                   ProfileMenu* menu) {
+    WUX::Controls::Grid row;
+    WUX::Controls::ColumnDefinition icon_col;
+    icon_col.Width(WUX::GridLengthHelper::FromValueAndType(
+        kMenuIconSize + 12, WUX::GridUnitType::Pixel));
+    WUX::Controls::ColumnDefinition text_col;
+    text_col.Width(WUX::GridLengthHelper::FromValueAndType(
+        1, WUX::GridUnitType::Star));
+    row.ColumnDefinitions().Append(icon_col);
+    row.ColumnDefinitions().Append(text_col);
+
+    if (auto bmp = LoadShellIcon(p.icon_path)) {
+        WUX::Controls::Image image;
+        image.Source(bmp);
+        image.Width(kMenuIconSize);
+        image.Height(kMenuIconSize);
+        image.HorizontalAlignment(WUX::HorizontalAlignment::Left);
+        image.VerticalAlignment(WUX::VerticalAlignment::Center);
+        row.Children().Append(image);
+    }
+
+    WUX::Controls::TextBlock label;
+    label.Text(p.name);
+    label.FontSize(14);
+    label.VerticalAlignment(WUX::VerticalAlignment::Center);
+    label.TextTrimming(WUX::TextTrimming::CharacterEllipsis);
+    label.Foreground(WUX::Media::SolidColorBrush(bar->menu_text));
+    WUX::Controls::Grid::SetColumn(label, 1);
+    row.Children().Append(label);
+
+    WUX::Controls::Border item;
+    item.Child(row);
+    item.Height(kMenuItemHeight);
+    item.Padding(WUX::ThicknessHelper::FromLengths(10, 0, 10, 0));
+    item.CornerRadius(WUX::CornerRadiusHelper::FromUniformRadius(4));
+    item.Background(WUX::Media::SolidColorBrush(
+        winrt::Windows::UI::Color{0, 0, 0, 0}));
+
+    const auto hover = bar->menu_hover;
+    item.PointerEntered([item, hover](auto&&, auto&&) {
+        item.Background(WUX::Media::SolidColorBrush(hover));
+    });
+    item.PointerExited([item](auto&&, auto&&) {
+        item.Background(WUX::Media::SolidColorBrush(
+            winrt::Windows::UI::Color{0, 0, 0, 0}));
+    });
+
+    const auto id = p.id;
+    item.Tapped([bar, menu, id](auto&&, auto&&) {
+        CloseProfileMenu(menu);
+        if (bar->cb.on_new_tab) bar->cb.on_new_tab(bar->cb.ctx, id);
+    });
+    return item;
+}
+
+void CloseProfileMenu(ProfileMenu* menu) {
+    if (!menu || menu->closing) return;
+    menu->closing = true;
+
+    menu->bar->menu_closed_at = ::GetMessageTime();
+    menu->bar->menu = nullptr;
+
+    if (menu->source) {
+        try {
+            menu->source.Close();
+        } catch (...) {
+        }
+    }
+    if (menu->hwnd) {
+        g_menus.erase(menu->hwnd);
+        ::DestroyWindow(menu->hwnd);
+    }
+    delete menu;
+}
+
+LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    auto it = g_menus.find(hwnd);
+    ProfileMenu* menu = it == g_menus.end() ? nullptr : it->second;
+
+    switch (msg) {
+        case WM_GHOSTTY_SHOW_MENU:
+            if (!menu) return 0;
+            ::ShowWindow(hwnd, SW_SHOW);
+            ::SetForegroundWindow(hwnd);
+            ::SetFocus(hwnd);
+            return 0;
+
+        case WM_ACTIVATE:
+            if (!menu) break;
+            if (LOWORD(wparam) != WA_INACTIVE) {
+                menu->activated = true;
+                return 0;
+            }
+            // Anything that takes activation away dismisses the menu, which
+            // is how clicking the terminal, another window, or the chevron
+            // closes it -- but only once it has been activated at all.
+            if (menu->activated) {
+                CloseProfileMenu(menu);
+                return 0;
+            }
+            break;
+
+        case WM_SIZE:
+            if (menu && menu->source) {
+                if (auto n = menu->source.try_as<IDesktopWindowXamlSourceNative>()) {
+                    HWND island = nullptr;
+                    if (SUCCEEDED(n->get_WindowHandle(&island)) && island) {
+                        ::SetWindowPos(island, nullptr, 0, 0, LOWORD(lparam),
+                                       HIWORD(lparam), SWP_NOZORDER);
+                    }
+                }
+            }
+            return 0;
+    }
+    return ::DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
 void ShowProfileMenu(GhosttyTabBar* bar) {
     auto const& profiles = g_profiles[bar];
     if (profiles.empty()) return;
 
-    // Clicking the chevron while its menu is open must only close it.
-    //
-    // It does not, on its own. The press dismisses the menu, and the
-    // button still sees the click and asks for a new one, so the menu
-    // blinks shut and reopens. Taking the button out of hit testing for
-    // the duration was not enough -- the press that dismisses a
-    // TrackPopupMenu is delivered after the modal loop has already
-    // returned, by which point the button is live again.
-    //
-    // So: refuse to reopen within a moment of closing. GetMessageTime is
-    // the right clock here because it reports when the *input* happened,
-    // not when we got round to handling it.
+    // Clicking the chevron while the menu is open must only close it. The
+    // click first takes activation away, which closes the menu, and only
+    // then reaches the button -- which would ask for a new one. Refusing to
+    // reopen within a moment of closing is what makes the pair behave as a
+    // toggle. GetMessageTime reports when the input happened rather than
+    // when we got round to it, which is what makes the window meaningful.
+    if (bar->menu) {
+        CloseProfileMenu(bar->menu);
+        return;
+    }
     if (bar->menu_closed_at != 0) {
         const LONG dt = ::GetMessageTime() - bar->menu_closed_at;
         if (dt >= 0 && dt < kMenuReopenGuardMs) {
@@ -721,70 +1012,34 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         }
     }
 
-    HMENU menu = ::CreatePopupMenu();
-    if (!menu) return;
-
-    // Light both halves for as long as the menu is up. Picking a profile
-    // opens a new tab, so the "+" is as much a part of this action as the
-    // chevron; leaving it dark makes the menu look unrelated to it.
-    //
-    // IsHitTestVisible goes off alongside the colour so the click that
-    // dismisses the menu cannot re-enter Click and reopen what it just
-    // closed. The colours match because the footer button template paints
-    // PointerOver with the same brush used here -- switching hit testing
-    // off does not leave PointerOver, it just freezes it, so relying on
-    // that alone was not enough.
-    //
-    // TrackPopupMenu below is modal and returns before this scope ends, so
-    // both are guaranteed to be restored.
-    //
-    // Restores the transparent background explicitly rather than calling
-    // ClearValue: clearing the local value hands the button back to the
-    // default style, which paints the filled box this deliberately avoids.
-    struct Lit {
-        GhosttyTabBar* bar;
-        ~Lit() {
-            WUX::Media::SolidColorBrush clear{
-                winrt::Windows::UI::Color{0, 0, 0, 0}};
-            if (bar->plus) {
-                bar->plus.Background(clear);
-                bar->plus.IsHitTestVisible(true);
-            }
-            if (bar->chevron) {
-                bar->chevron.Background(clear);
-                bar->chevron.IsHitTestVisible(true);
-            }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        // CS_DROPSHADOW is what gives the menu the same soft shadow the
+        // system's own menus have.
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = MenuWndProc;
+        wc.hInstance = ::GetModuleHandleW(nullptr);
+        wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kMenuClassName;
+        if (!::RegisterClassExW(&wc)) {
+            Log("menu: RegisterClassExW failed err=%lu", ::GetLastError());
+            return;
         }
-    } lit{bar};
-    if (bar->b_hover) {
-        if (bar->plus) {
-            bar->plus.Background(bar->b_hover);
-            bar->plus.IsHitTestVisible(false);
-        }
-        if (bar->chevron) {
-            bar->chevron.Background(bar->b_hover);
-            bar->chevron.IsHitTestVisible(false);
-        }
+        registered = true;
     }
 
-    // Menu command ids are 1-based indices into `profiles`; 0 means the
-    // user dismissed the menu.
-    for (size_t i = 0; i < profiles.size(); ++i) {
-        ::AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(i + 1),
-                      profiles[i].second.c_str());
-    }
-
-    // Drop the menu below the split button, left-aligned with the "+"
-    // rather than with the chevron -- the menu belongs to the whole
-    // control, which is where Windows Terminal hangs it from too.
+    // Anchor under the "+" so the menu belongs to the whole split button,
+    // which is where Windows Terminal hangs it from.
     POINT pt{0, 0};
     auto anchor = bar->plus ? bar->plus : bar->chevron;
     if (anchor && bar->island_hwnd) {
         try {
             auto transform = anchor.TransformToVisual(nullptr);
             auto origin = transform.TransformPoint(
-                winrt::Windows::Foundation::Point{0.0f,
-                    static_cast<float>(anchor.ActualHeight())});
+                winrt::Windows::Foundation::Point{
+                    0.0f, static_cast<float>(anchor.ActualHeight())});
             pt.x = static_cast<LONG>(origin.X);
             pt.y = static_cast<LONG>(origin.Y);
         } catch (...) {
@@ -794,28 +1049,82 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         ::GetCursorPos(&pt);
     }
 
-    // The SetForegroundWindow / WM_NULL pair is the documented idiom for
-    // TrackPopupMenu and is not optional. Without the first call a menu
-    // whose owner is not foreground does not take the click that dismisses
-    // it -- the click falls through to the window underneath, which is why
-    // dismissing this menu by clicking the terminal started a text
-    // selection there. The trailing WM_NULL is the matching half: it
-    // unsticks the menu so the *next* click is delivered normally.
-    ::SetForegroundWindow(bar->parent_hwnd);
+    const int height = static_cast<int>(profiles.size()) * kMenuItemHeight +
+                       kMenuPadding * 2;
 
-    // TPM_RETURNCMD makes this synchronous: it returns the chosen id
-    // instead of posting WM_COMMAND, so no message routing is needed.
-    const int chosen = ::TrackPopupMenu(
-        menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-        pt.x, pt.y, 0, bar->parent_hwnd, nullptr);
-    ::DestroyMenu(menu);
-    bar->menu_closed_at = ::GetMessageTime();
-    ::PostMessageW(bar->parent_hwnd, WM_NULL, 0, 0);
+    auto* menu = new ProfileMenu{};
+    menu->bar = bar;
 
-    if (chosen > 0 && static_cast<size_t>(chosen) <= profiles.size()) {
-        const auto profile = profiles[chosen - 1].first;
-        if (bar->cb.on_new_tab) bar->cb.on_new_tab(bar->cb.ctx, profile);
+    // WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt-Tab.
+    menu->hwnd = ::CreateWindowExW(
+        WS_EX_TOOLWINDOW, kMenuClassName, L"", WS_POPUP, pt.x, pt.y,
+        kMenuWidth, height, bar->parent_hwnd, nullptr,
+        ::GetModuleHandleW(nullptr), nullptr);
+    if (!menu->hwnd) {
+        Log("menu: CreateWindowExW failed err=%lu", ::GetLastError());
+        delete menu;
+        return;
     }
+    g_menus[menu->hwnd] = menu;
+
+    // Rounded corners. Windows 11 only; the call simply fails on 10, which
+    // leaves square corners and nothing else broken.
+    const DWORD corner = 2;  // DWMWCP_ROUND
+    ::DwmSetWindowAttribute(menu->hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
+                            &corner, sizeof(corner));
+
+    try {
+        menu->source = WUX::Hosting::DesktopWindowXamlSource();
+        auto native = menu->source.as<IDesktopWindowXamlSourceNative>();
+        check_hresult(native->AttachToWindow(menu->hwnd));
+        HWND island = nullptr;
+        check_hresult(native->get_WindowHandle(&island));
+        // AttachToWindow leaves the island hidden -- it comes back as a
+        // bare WS_CHILD with no WS_VISIBLE, so the window rendered as an
+        // empty frame with the terminal showing straight through it.
+        ::SetWindowPos(island, nullptr, 0, 0, kMenuWidth, height,
+                       SWP_NOZORDER | SWP_SHOWWINDOW);
+        menu->native = menu->source.try_as<IDesktopWindowXamlSourceNative2>();
+
+        WUX::Controls::StackPanel list;
+        list.Orientation(WUX::Controls::Orientation::Vertical);
+        for (auto const& p : profiles) {
+            list.Children().Append(MakeMenuItem(bar, p, menu));
+        }
+
+        WUX::Controls::Border root;
+        root.Child(list);
+        root.Padding(WUX::ThicknessHelper::FromUniformLength(kMenuPadding));
+        root.CornerRadius(
+            WUX::CornerRadiusHelper::FromUniformRadius(kMenuCornerRadius));
+        root.BorderThickness(WUX::ThicknessHelper::FromUniformLength(1));
+        root.RequestedTheme(bar->root ? bar->root.RequestedTheme()
+                                      : WUX::ElementTheme::Default);
+        root.Background(WUX::Media::SolidColorBrush(bar->menu_bg));
+        root.BorderBrush(WUX::Media::SolidColorBrush(bar->menu_border));
+
+        // Escape closes, like any menu.
+        root.KeyDown([menu](auto&&, WUX::Input::KeyRoutedEventArgs const& e) {
+            if (e.Key() == winrt::Windows::System::VirtualKey::Escape) {
+                CloseProfileMenu(menu);
+            }
+        });
+
+        menu->source.Content(root);
+
+    } catch (hresult_error const& e) {
+        Log("menu: island failed 0x%08X: %ls", (unsigned)e.code(),
+            e.message().c_str());
+        CloseProfileMenu(menu);
+        return;
+    }
+
+    bar->menu = menu;
+    // Deferred: see WM_GHOSTTY_SHOW_MENU. Activation is what makes
+    // WM_ACTIVATE(WA_INACTIVE) fire when the user clicks anywhere else,
+    // which is the whole dismissal mechanism -- so it has to happen after
+    // the click that opened the menu is completely done with.
+    ::PostMessageW(menu->hwnd, WM_GHOSTTY_SHOW_MENU, 0, 0);
 }
 
 } // namespace
@@ -1099,7 +1408,22 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_resize(
 
 GHOSTTY_TABBAR_API int32_t ghostty_tabbar_pretranslate(
     GhosttyTabBar* bar, void* msg) {
-    if (!bar || !bar->native || !msg) return 0;
+    if (!bar || !msg) return 0;
+
+    // The open profile menu gets first refusal. It is a second island in a
+    // window of its own, and an island only sees keyboard input that is
+    // handed to it here -- without this, Escape and arrow keys never reach
+    // the menu.
+    if (bar->menu && bar->menu->native) {
+        BOOL handled = FALSE;
+        if (SUCCEEDED(bar->menu->native->PreTranslateMessage(
+                static_cast<MSG*>(msg), &handled)) &&
+            handled) {
+            return 1;
+        }
+    }
+
+    if (!bar->native) return 0;
     BOOL handled = FALSE;
     if (SUCCEEDED(bar->native->PreTranslateMessage(static_cast<MSG*>(msg), &handled)))
         return handled ? 1 : 0;
@@ -1171,9 +1495,11 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_selected(
 }
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
-    GhosttyTabBar* bar, GhosttyProfileId profile, const wchar_t* name) {
+    GhosttyTabBar* bar, GhosttyProfileId profile, const wchar_t* name,
+    const wchar_t* icon_path) {
     if (!bar) return;
-    g_profiles[bar].emplace_back(profile, name ? name : L"");
+    g_profiles[bar].push_back(Profile{profile, name ? name : L"",
+                                      icon_path ? icon_path : L""});
 }
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar) {
@@ -1253,6 +1579,18 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
         if (bar->b_selected) bar->b_selected.Color(content);
         if (bar->b_unselected) bar->b_unselected.Color(unselected);
         if (bar->b_hover) bar->b_hover.Color(hover);
+        // A Windows 11 menu sits slightly above its window's background
+        // rather than matching it, with a hairline border a step lighter
+        // again.
+        const double border_f = dark ? 1.6 : 0.85;
+        const double hover_f = dark ? 1.35 : 0.94;
+        bar->menu_bg = hover;
+        bar->menu_border = Rgb(Scale(hover.R, border_f), Scale(hover.G, border_f),
+                               Scale(hover.B, border_f));
+        bar->menu_hover = Rgb(Scale(hover.R, hover_f), Scale(hover.G, hover_f),
+                              Scale(hover.B, hover_f));
+        bar->menu_text = dark ? winrt::Windows::UI::Color{255, 255, 255, 255}
+                              : winrt::Windows::UI::Color{255, 0, 0, 0};
 
         Log("set_theme: content=%02X%02X%02X strip=%02X%02X%02X",
             content.R, content.G, content.B, strip.R, strip.G, strip.B);

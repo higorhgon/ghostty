@@ -26,7 +26,7 @@ cl /nologo /std:c++17 /EHsc /LD /MD /utf-8 ^
    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_UNICODE /DUNICODE ^
    /I "%PROJ%" ^
    ghostty_tabbar.cpp ^
-   /link user32.lib gdi32.lib windowsapp.lib ^
+   /link user32.lib gdi32.lib shell32.lib dwmapi.lib windowsapp.lib ^
    /IMPLIB:lib\ghostty_tabbar.lib ^
    /OUT:ghostty_tabbar.dll
 if errorlevel 1 exit /b 1
