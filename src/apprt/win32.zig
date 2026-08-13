@@ -271,6 +271,18 @@ const w32 = struct {
     pub const VK_INSERT: u32 = 0x2D;
     pub const VK_DELETE: u32 = 0x2E;
     pub const VK_F1: u32 = 0x70;
+    // OEM keys are positional; the names below are their US layout meaning.
+    pub const VK_OEM_1: u32 = 0xBA;
+    pub const VK_OEM_PLUS: u32 = 0xBB;
+    pub const VK_OEM_COMMA: u32 = 0xBC;
+    pub const VK_OEM_MINUS: u32 = 0xBD;
+    pub const VK_OEM_PERIOD: u32 = 0xBE;
+    pub const VK_OEM_2: u32 = 0xBF;
+    pub const VK_OEM_3: u32 = 0xC0;
+    pub const VK_OEM_4: u32 = 0xDB;
+    pub const VK_OEM_5: u32 = 0xDC;
+    pub const VK_OEM_6: u32 = 0xDD;
+    pub const VK_OEM_7: u32 = 0xDE;
     pub const VK_E: u32 = 0x45;
     pub const VK_O: u32 = 0x4F;
     pub const VK_T: u32 = 0x54;
@@ -696,6 +708,11 @@ pub const Window = struct {
     /// Shells offered in the new-tab dropdown.
     profiles: []tabbar.Profile = &.{},
 
+    /// Whether the OS gives this window keyboard focus. A pane is only
+    /// really focused when this is true, which is what stops background
+    /// windows from blinking their cursors.
+    has_focus: bool = false,
+
     /// True while the tab strip owns the title bar, which is only the case
     /// when the native strip is up. The GDI fallback keeps the system
     /// title bar, because it has no caption buttons of its own.
@@ -756,6 +773,31 @@ pub const Window = struct {
         return tab.focusedPane();
     }
 };
+
+/// Tells every surface in `window` whether it currently has focus.
+///
+/// Exactly one surface can be focused: the focused pane of the active tab,
+/// and then only while the window itself holds OS focus. Everything else is
+/// unfocused. Without this the core never learns a surface lost focus, so
+/// every pane in every tab keeps blinking its cursor -- including whole
+/// windows sitting in the background.
+///
+/// Idempotent: each surface remembers its last reported state, so this is
+/// safe to call on any event that might have moved focus.
+fn syncFocus(window: *Window) void {
+    const focused = if (window.has_focus) window.focusedSurface() else null;
+    for (window.tabs.items) |tab| {
+        for (tab.panes.items) |surf| {
+            const want = surf == focused;
+            if (surf.focused == want) continue;
+            surf.focused = want;
+            if (!surf.core_ready) continue;
+            surf.core_surface.focusCallback(want) catch |err| {
+                log.warn("focusCallback failed err={}", .{err});
+            };
+        }
+    }
+}
 
 /// One entry in a window's tab strip. Holds 1 or 2 panes (CoreSurfaces);
 /// with 2 panes, `split` says whether they're arranged side-by-side
@@ -1297,6 +1339,11 @@ fn reflow(window: *Window) void {
     const tab = window.activeTabPtr() orelse return;
     _ = w32.SetFocus(window.gl_hwnd);
 
+    // Every path that moves focus between tabs or panes ends up here, so
+    // this is the one place that catches all of them. It is idempotent,
+    // so the layout-only callers (a plain resize) cost nothing.
+    syncFocus(window);
+
     if (tab.focusedPane()) |focused| {
         if (focused.title_len > 0) {
             var zbuf: [513:0]u16 = undefined;
@@ -1573,6 +1620,9 @@ pub const Surface = struct {
     /// child window, in that window's client coordinates. Updated by
     /// `reflow`; used for input hit-testing/routing and `getSize`.
     last_rect: w32.RECT,
+    /// Last focus state handed to the core, so syncFocus can skip
+    /// surfaces that haven't changed.
+    focused: bool = false,
 
     pub fn deinit(self: *Surface) void {
         _ = self;
@@ -1708,10 +1758,15 @@ fn currentMods() input.Mods {
     };
 }
 
-/// Maps non-printable virtual key codes to Ghostty's layout-independent
-/// Key enum. This intentionally excludes keys that already generate a
-/// WM_CHAR (backspace/tab/enter/escape/space/letters/digits), which are
-/// handled via handleChar instead to avoid double delivery.
+/// Maps virtual key codes to Ghostty's layout-independent Key enum.
+///
+/// This covers the control keys and the printable keys alike, because
+/// Ghostty's key encoder needs the physical key to produce the right
+/// bytes. Relying on WM_CHAR for these is what made backspace send BS
+/// (0x08) instead of DEL (0x7F) -- shells read 0x08 as ^H, which several
+/// bind to "delete word", so backspace ate whole words. Ctrl+key was
+/// broken the same way: WM_CHAR hands us the already-folded control
+/// codepoint, which the encoder then has no way to reason about.
 fn vkToKey(vk: u32) ?input.Key {
     return switch (vk) {
         w32.VK_LEFT => .arrow_left,
@@ -1724,11 +1779,42 @@ fn vkToKey(vk: u32) ?input.Key {
         w32.VK_NEXT => .page_down,
         w32.VK_INSERT => .insert,
         w32.VK_DELETE => .delete,
+        w32.VK_BACK => .backspace,
+        w32.VK_TAB => .tab,
+        w32.VK_RETURN => .enter,
+        w32.VK_ESCAPE => .escape,
+        w32.VK_SPACE => .space,
+
+        // Letters and digits. Win32 reuses the ASCII values for these, and
+        // both enums are contiguous, so the offset carries across.
+        'A'...'Z' => @enumFromInt(@as(c_int, @intFromEnum(input.Key.key_a)) + @as(c_int, @intCast(vk - 'A'))),
+        '0'...'9' => @enumFromInt(@as(c_int, @intFromEnum(input.Key.digit_0)) + @as(c_int, @intCast(vk - '0'))),
+
+        // OEM keys are positional, so these are the US layout's meanings.
+        // A layout-correct mapping needs the scancode, but these only
+        // matter for ctrl/alt chords, where the physical key is what
+        // shells key off anyway.
+        w32.VK_OEM_1 => .semicolon,
+        w32.VK_OEM_PLUS => .equal,
+        w32.VK_OEM_COMMA => .comma,
+        w32.VK_OEM_MINUS => .minus,
+        w32.VK_OEM_PERIOD => .period,
+        w32.VK_OEM_2 => .slash,
+        w32.VK_OEM_3 => .backquote,
+        w32.VK_OEM_4 => .bracket_left,
+        w32.VK_OEM_5 => .backslash,
+        w32.VK_OEM_6 => .bracket_right,
+        w32.VK_OEM_7 => .quote,
+
         w32.VK_F1...(w32.VK_F1 + 23) => @enumFromInt(@as(c_int, @intFromEnum(input.Key.f1)) + @as(c_int, @intCast(vk - w32.VK_F1))),
         else => null,
     };
 }
 
+/// Text input. WM_CHAR is only good for text: Windows has already folded
+/// the modifiers into the codepoint by this point, so a control chord
+/// arrives as a bare control code with no way to recover which key
+/// produced it. Those are handled in handleKey instead, and skipped here.
 fn handleChar(surf: *Surface, wparam: w32.WPARAM) void {
     if (!surf.core_ready) return;
 
@@ -1737,39 +1823,62 @@ fn handleChar(surf: *Surface, wparam: w32.WPARAM) void {
     // skeleton.
     if (cu >= 0xD800 and cu <= 0xDFFF) return;
 
+    // C0 controls and DEL. handleKey already delivered these with the
+    // physical key intact; letting them through here would both duplicate
+    // the event and feed the encoder a pre-folded codepoint.
+    if (cu < 0x20 or cu == 0x7F) return;
+
+    // Alt chords produce WM_SYSCHAR, not WM_CHAR, but a ctrl chord that
+    // maps to a printable codepoint (ctrl+shift+2 and friends) still lands
+    // here. The key event has already gone out.
+    const mods = currentMods();
+    if (mods.ctrl or mods.alt) return;
+
     var utf8_buf: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(cu, &utf8_buf) catch return;
 
-    const key: input.Key = if (cu < 128)
-        (input.Key.fromASCII(@intCast(cu)) orelse .unidentified)
-    else
-        .unidentified;
-
     const event: input.KeyEvent = .{
         .action = .press,
-        .key = key,
-        .mods = currentMods(),
+        .key = .unidentified,
+        .mods = mods,
         .utf8 = utf8_buf[0..len],
+        .unshifted_codepoint = cu,
     };
     _ = surf.core_surface.keyCallback(event) catch |err| {
         log.warn("keyCallback failed err={}", .{err});
     };
 }
 
-fn handleKey(surf: *Surface, wparam: w32.WPARAM, action: input.Action) void {
-    if (!surf.core_ready) return;
+/// True if this key was delivered to the terminal and WM_CHAR should not
+/// also fire for it.
+fn handleKey(surf: *Surface, wparam: w32.WPARAM, action: input.Action) bool {
+    if (!surf.core_ready) return false;
 
     const vk: u32 = @intCast(wparam);
-    const key = vkToKey(vk) orelse return;
+    const key = vkToKey(vk) orelse return false;
+    const mods = currentMods();
+
+    // Printable keys with no ctrl/alt are left to WM_CHAR, which is the
+    // only thing that knows the user's layout and any dead-key
+    // composition. Everything else -- control keys, and any chord -- is
+    // encoded by Ghostty from the physical key.
+    const printable = switch (key) {
+        .backspace, .tab, .enter, .escape => false,
+        else => true,
+    };
+    if (printable and !mods.ctrl and !mods.alt) return false;
+
     const event: input.KeyEvent = .{
         .action = action,
         .key = key,
-        .mods = currentMods(),
+        .mods = mods,
         .utf8 = "",
     };
     _ = surf.core_surface.keyCallback(event) catch |err| {
         log.warn("keyCallback failed err={}", .{err});
+        return false;
     };
+    return true;
 }
 
 fn mouseButton(
@@ -2058,13 +2167,8 @@ fn glWndProc(
         },
 
         w32.WM_SETFOCUS, w32.WM_KILLFOCUS => {
-            if (window.focusedSurface()) |surf| {
-                if (surf.core_ready) {
-                    surf.core_surface.focusCallback(msg == w32.WM_SETFOCUS) catch |err| {
-                        log.warn("focusCallback failed err={}", .{err});
-                    };
-                }
-            }
+            window.has_focus = msg == w32.WM_SETFOCUS;
+            syncFocus(window);
             return 0;
         },
 
@@ -2076,14 +2180,18 @@ fn glWndProc(
         },
 
         w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => {
-            if (!handleTabShortcut(window, wparam)) {
-                if (window.focusedSurface()) |surf| handleKey(surf, wparam, .press);
+            if (handleTabShortcut(window, wparam)) return 0;
+            if (window.focusedSurface()) |surf| {
+                // Swallowing the key when it was handled is what keeps
+                // DefWindowProc from also translating it into a WM_CHAR,
+                // which would deliver the same keystroke twice.
+                if (handleKey(surf, wparam, .press)) return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
         w32.WM_KEYUP, w32.WM_SYSKEYUP => {
-            if (window.focusedSurface()) |surf| handleKey(surf, wparam, .release);
+            if (window.focusedSurface()) |surf| _ = handleKey(surf, wparam, .release);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
@@ -2109,7 +2217,14 @@ fn glWndProc(
             if (window.activeTabPtr()) |tab| {
                 const x: i16 = @bitCast(w32.LOWORD(lparam));
                 const y: i16 = @bitCast(w32.HIWORD(lparam));
-                if (tab.paneAt(x, y)) |idx| tab.focused = idx;
+                if (tab.paneAt(x, y)) |idx| {
+                    // Clicking into a pane focuses it. This path does not
+                    // reflow, so it has to sync focus itself.
+                    if (tab.focused != idx) {
+                        tab.focused = idx;
+                        syncFocus(window);
+                    }
+                }
                 if (tab.focusedPane()) |surf| mouseButton(surf, .press, .left);
             }
             return 0;
