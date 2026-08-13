@@ -302,32 +302,6 @@ const w32 = struct {
     pub extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: usize) callconv(.winapi) ?HANDLE;
     pub extern "kernel32" fn GlobalLock(hMem: HANDLE) callconv(.winapi) ?*anyopaque;
     pub extern "kernel32" fn GlobalUnlock(hMem: HANDLE) callconv(.winapi) BOOL;
-    pub extern "kernel32" fn GetConsoleWindow() callconv(.winapi) ?HWND;
-    pub extern "kernel32" fn FreeConsole() callconv(.winapi) BOOL;
-    pub extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?*anyopaque;
-    pub extern "kernel32" fn GetConsoleMode(
-        hConsoleHandle: *anyopaque,
-        lpMode: *u32,
-    ) callconv(.winapi) BOOL;
-    pub extern "kernel32" fn SetStdHandle(
-        nStdHandle: u32,
-        hHandle: ?*anyopaque,
-    ) callconv(.winapi) BOOL;
-    pub extern "kernel32" fn CreateFileW(
-        lpFileName: [*:0]const u16,
-        dwDesiredAccess: u32,
-        dwShareMode: u32,
-        lpSecurityAttributes: ?*anyopaque,
-        dwCreationDisposition: u32,
-        dwFlagsAndAttributes: u32,
-        hTemplateFile: ?*anyopaque,
-    ) callconv(.winapi) ?*anyopaque;
-    pub const STD_OUTPUT_HANDLE: u32 = @bitCast(@as(i32, -11));
-    pub const STD_ERROR_HANDLE: u32 = @bitCast(@as(i32, -12));
-    pub const GENERIC_WRITE: u32 = 0x4000_0000;
-    pub const FILE_SHARE_READ: u32 = 0x0000_0001;
-    pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    pub const OPEN_EXISTING: u32 = 3;
 
     // DWM (Desktop Window Manager) attributes, used to make the native
     // titlebar match the terminal's theme instead of clashing with it.
@@ -495,65 +469,43 @@ pub const App = @This();
 /// app mailbox, which we service in our own message loop.
 pub const must_draw_from_app_thread = true;
 
-/// Gets rid of the console this process was given at startup.
+/// Entry point for the GUI subsystem, which is what keeps Windows from
+/// giving this process a console at all.
 ///
-/// MSVC builds link as a console-subsystem executable, because the GUI
-/// subsystem's CRT startup wants a `wWinMain` entry point and Zig's std
-/// start code exports a C `main` instead whenever the root module has one
-/// -- which it always does, main.zig being shared across every platform.
-/// See GhosttyExe.zig. So Windows hands the process a console, and the
-/// console comes with a window: that is the terminal users see flash up
-/// before Ghostty's own window, showing Ghostty's startup log.
+/// MSVC's GUI-subsystem CRT startup (`wWinMainCRTStartup`) calls
+/// `wWinMain`. Zig's std start code does not provide one: with libc linked
+/// and a `main` in the root module -- which main.zig always has, being
+/// shared across every platform -- it exports a C `main` and stops there.
+/// So the two halves never met, and the build stayed on the console
+/// subsystem. This is the bridge.
 ///
-/// Detached rather than hidden. Hiding GetConsoleWindow() only works when
-/// the console is hosted by conhost in this process's own session. On
-/// Windows 11 the console host is whatever "Default terminal application"
-/// names -- Windows Terminal, out of process -- and then that HWND is not
-/// the window on screen, so hiding it does nothing at all. Detaching kills
-/// the console itself, whoever is hosting it.
-///
-/// A redirected stderr is left alone. That is how the logs get read when
-/// running the exe unpackaged, and a redirected stderr is a file or a
-/// pipe, not the console this is trying to be rid of.
-fn dropConsole() void {
-    const stderr = w32.GetStdHandle(w32.STD_ERROR_HANDLE) orelse {
-        _ = w32.FreeConsole();
-        return;
-    };
+/// The CRT has already parsed the command line into `__argc`/`__argv` by
+/// the time this runs, whatever the subsystem, so the arguments are simply
+/// forwarded on.
+const gui_entry = struct {
+    extern fn main(argc: c_int, argv: [*][*:0]u8) c_int;
+    extern var __argc: c_int;
+    extern var __argv: [*][*:0]u8;
 
-    // GetConsoleMode succeeds only for a real console handle, which is
-    // exactly the case worth detaching from.
-    var mode: u32 = 0;
-    if (w32.GetConsoleMode(stderr, &mode) == 0) return;
+    fn wWinMain(
+        hInstance: ?*anyopaque,
+        hPrevInstance: ?*anyopaque,
+        lpCmdLine: ?[*:0]const u16,
+        nCmdShow: c_int,
+    ) callconv(.winapi) c_int {
+        _ = hInstance;
+        _ = hPrevInstance;
+        _ = lpCmdLine;
+        _ = nCmdShow;
+        return main(__argc, __argv);
+    }
+};
 
-    _ = w32.FreeConsole();
-
-    // Detaching invalidates the standard handles, and Ghostty logs plenty
-    // during startup. Those writes then fail, and a failed log write takes
-    // the process down -- the window never appeared at all. Pointing the
-    // handles at NUL keeps every later write succeeding and going nowhere.
-    const nul = w32.CreateFileW(
-        std.unicode.utf8ToUtf16LeStringLiteral("NUL"),
-        w32.GENERIC_WRITE,
-        w32.FILE_SHARE_READ | w32.FILE_SHARE_WRITE,
-        null,
-        w32.OPEN_EXISTING,
-        0,
-        null,
-    ) orelse return;
-    _ = w32.SetStdHandle(w32.STD_OUTPUT_HANDLE, nul);
-    _ = w32.SetStdHandle(w32.STD_ERROR_HANDLE, nul);
+comptime {
+    if (builtin.abi == .msvc) {
+        @export(&gui_entry.wWinMain, .{ .name = "wWinMain" });
+    }
 }
-
-fn crtDropConsole() callconv(.c) void {
-    dropConsole();
-}
-
-/// Runs `crtDropConsole` from the CRT's initializer table, before `main`.
-/// `.CRT$XCU` is where the MSVC runtime collects C++ static constructors,
-/// and it walks that section during startup -- which is the earliest this
-/// process gets to run code, and so the earliest the console can go away.
-export const ghostty_drop_console_init: *const fn () callconv(.c) void linksection(".CRT$XCU") = &crtDropConsole;
 
 core_app: *CoreApp,
 config: Config,
@@ -569,10 +521,6 @@ pub fn init(
     opts: struct {},
 ) !void {
     _ = opts;
-
-    // Belt and braces: the CRT initializer has already detached long
-    // before this runs. This catches a console attached after startup.
-    dropConsole();
 
     const hinstance = w32.GetModuleHandleW(null) orelse return error.Unexpected;
 

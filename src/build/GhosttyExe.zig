@@ -42,18 +42,22 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     // OS-specific
     switch (cfg.target.result.os.tag) {
         .windows => {
-            // GUI (no console window) subsystem. Note this only actually
-            // takes effect on the GNU/MinGW ABI: MinGW's CRT startup code
-            // calls the user's `main` regardless of subsystem, but MSVC's
-            // GUI-subsystem CRT startup (exe_winmain.obj) requires a
-            // `WinMain`/`wWinMain` entry point instead, which Zig's std
-            // start code won't export as long as root also has a `main`
-            // (which it always does here, since main.zig is shared across
-            // all platforms). Until that's bridged with a proper
-            // `wWinMain` shim, MSVC builds keep the console subsystem so
-            // they link and run -- a console window will appear alongside
-            // the app window as a known, cosmetic-only limitation.
-            if (cfg.target.result.abi != .msvc) {
+            // GUI subsystem: without it Windows allocates a console for
+            // the process, and the console's host window -- conhost, or
+            // Windows Terminal on Windows 11 -- flashes up showing
+            // Ghostty's startup log before Ghostty's own window appears.
+            //
+            // On the GNU/MinGW ABI this is all it takes, because MinGW's
+            // CRT startup calls the user's `main` whatever the subsystem.
+            // MSVC's GUI-subsystem startup wants `wWinMain` instead, and
+            // Zig's std start code exports a C `main` whenever the root
+            // module has one -- which it always does, main.zig being
+            // shared across every platform. The win32 apprt supplies the
+            // `wWinMain` shim that bridges the two, so the subsystem can
+            // only be switched when that apprt is in the build.
+            if (cfg.target.result.abi != .msvc or
+                cfg.app_runtime == .win32)
+            {
                 exe.subsystem = .Windows;
             }
             exe.root_module.addWin32ResourceFile(.{
