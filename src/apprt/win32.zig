@@ -366,6 +366,8 @@ const w32 = struct {
     pub extern "user32" fn DrawTextW(HDC, [*]const u16, c_int, *RECT, UINT) callconv(.winapi) c_int;
     pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
     pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+    pub extern "user32" fn MapVirtualKeyW(uCode: u32, uMapType: u32) callconv(.winapi) u32;
+    pub const MAPVK_VK_TO_CHAR: u32 = 2;
     pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
     pub extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
     pub extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, UINT) callconv(.winapi) BOOL;
@@ -2100,12 +2102,30 @@ fn handleKey(surf: *Surface, wparam: w32.WPARAM, action: input.Action) bool {
         .key = key,
         .mods = mods,
         .utf8 = "",
+        .unshifted_codepoint = unshiftedCodepoint(vk),
     };
     _ = surf.core_surface.keyCallback(event) catch |err| {
         log.warn("keyCallback failed err={}", .{err});
         return false;
     };
     return true;
+}
+
+/// The character this key produces with no modifiers held.
+///
+/// Keybindings are matched on this, not only on the physical key, so
+/// leaving it zero means a chord like ctrl+shift+v never resolves to
+/// paste_from_clipboard -- the binding simply does not match and the key
+/// vanishes. MapVirtualKey answers for the user's actual layout rather
+/// than assuming US.
+fn unshiftedCodepoint(vk: u32) u21 {
+    const ch = w32.MapVirtualKeyW(vk, w32.MAPVK_VK_TO_CHAR) & 0xFFFF;
+    if (ch == 0) return 0;
+    // Dead keys come back with the high bit set and no usable character.
+    if (ch & 0x8000 != 0) return 0;
+    // MapVirtualKey reports letters uppercase; unshifted means lowercase.
+    if (ch < 128) return std.ascii.toLower(@intCast(ch));
+    return @intCast(ch);
 }
 
 fn mouseButton(
