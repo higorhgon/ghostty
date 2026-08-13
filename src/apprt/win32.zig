@@ -772,6 +772,12 @@ pub const Window = struct {
     /// windows from blinking their cursors.
     has_focus: bool = false,
 
+    /// Set once the window has been shown and has been given the chance to
+    /// settle at its final size. Until then `reflow` lays panes out but
+    /// does not start them, because the size it is laying them out at is
+    /// not yet the size they will keep. See `Surface.pending`.
+    settled: bool = false,
+
     /// True while the tab strip owns the title bar, which is only the case
     /// when the native strip is up. The GDI fallback keeps the system
     /// title bar, because it has no caption buttons of its own.
@@ -1248,6 +1254,16 @@ fn newWindow(self: *App) !*Window {
     _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
     _ = w32.UpdateWindow(hwnd);
     _ = w32.SetFocus(gl_hwnd);
+
+    // The window is on screen and has been through everything that resizes
+    // it on the way there, so panes may now be started at the size they
+    // will keep. Drain what is queued first: the geometry a shell-launched
+    // packaged build is restored to arrives as a posted resize, and taking
+    // it now is the difference between starting the shell at the right size
+    // and starting it at the size the window merely opened with.
+    pumpOnce(self);
+    window.settled = true;
+    reflow(window);
     // Only meaningful on the GDI fallback: with the native strip there is
     // no system title bar left to theme.
     if (!window.customFrame()) applyTitlebarTheme(hwnd, &self.config);
@@ -1255,9 +1271,12 @@ fn newWindow(self: *App) !*Window {
     return window;
 }
 
+/// Allocates a pane, but does not start it: the CoreSurface (and with it
+/// the pty and the shell) is created later by `startPane`, once `reflow`
+/// has given the pane the rect it will actually keep. See `Surface.Pending`
+/// for why that has to wait.
 fn newPane(
     self: *App,
-    window: *Window,
     tab: *Tab,
     context: apprt.surface.NewSurfaceContext,
     /// Overrides the configured command for this surface only. Used by the
@@ -1271,34 +1290,49 @@ fn newPane(
         .tab = tab,
         .core_surface = undefined,
         .core_ready = false,
+        .pending = .{ .context = context, .argv = argv },
         .title_buf = undefined,
         .title_len = 0,
         .cursor_pos = .{ .x = 0, .y = 0 },
         .last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     };
 
-    // Give the surface its real size *before* the core starts the shell.
+    return surf;
+}
+
+/// Starts a pane's core at whatever size `last_rect` currently says, which
+/// is the size the pty is created with. Only `reflow` calls this, so that
+/// size is always one it just computed. Does nothing for a pane that is
+/// already running, or for one whose start already failed.
+fn startPane(self: *App, surf: *Surface) !void {
+    const pending = surf.pending orelse return;
+    const window = surf.tab.window;
+    const alloc = self.core_app.alloc;
+
+    // Consume the pending start *before* bringing the core up, not after.
     //
-    // getSize reads last_rect, and reflow is what fills that in -- which
-    // happens after this returns. So the pty was created at the wrong size
-    // and resized a moment later, often after the shell had already
-    // printed its banner and prompt. ConPTY re-wraps on resize, and that
-    // is what left the cursor a line below the prompt, or the prompt
-    // reduced to a bare ">", or the pane blank. Which of those you got
-    // depended on where the shell's output landed relative to the resize,
-    // which is why it came and went.
+    // CoreSurface.init performs actions as it goes, and this apprt answers
+    // several of them by calling reflow -- set_title does, and a tab opened
+    // from the shell dropdown always fires one, because a `direct` command
+    // titles the surface after its argv[0]. That reflow re-enters this
+    // function for a pane whose init is still in flight, and starting it a
+    // second time on top of itself gave the window two IO threads and two
+    // renderer threads over one surface. It took the process down a few
+    // seconds later, which is why it read as "picking a shell closes
+    // Ghostty" rather than as a crash at the click.
     //
-    // A split's rect is not known until the split exists, so it still
-    // takes the full area here and is corrected by the reflow that
-    // follows -- no worse than before, and it is not the case that races.
-    if (w32.GetClientRect(window.gl_hwnd, &surf.last_rect) == w32.FALSE) {
-        surf.last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-    }
+    // Clearing it here makes the token a one-shot: a reentrant reflow sees
+    // nothing pending and skips the pane, which is not yet drawable anyway.
+    surf.pending = null;
 
     try self.core_app.addSurface(surf);
     errdefer self.core_app.deleteSurface(surf);
 
-    var config = try apprt.surface.newConfig(self.core_app, &self.config, context);
+    var config = try apprt.surface.newConfig(
+        self.core_app,
+        &self.config,
+        pending.context,
+    );
     defer config.deinit();
 
     // The strings are copied into the config's arena because `argv` is
@@ -1306,7 +1340,7 @@ fn newPane(
     // not what the config's lifetime is tied to. `.direct` rather than
     // `.shell` so paths with spaces ("C:\Program Files\Git\...") survive:
     // the shell form is split on whitespace on Windows.
-    if (argv) |a| if (a.len > 0) {
+    if (pending.argv) |a| if (a.len > 0) {
         const arena = config._arena.?.allocator();
         const owned = try arena.alloc([:0]const u8, a.len);
         for (a, owned) |src, *dst| dst.* = try arena.dupeZ(u8, src);
@@ -1325,7 +1359,12 @@ fn newPane(
     );
     surf.core_ready = true;
 
-    return surf;
+    // syncFocus runs while the pane is still pending and records the state
+    // it could not deliver, so hand it over now. The core assumes it is
+    // focused until told otherwise, which is wrong for the pane that isn't.
+    surf.core_surface.focusCallback(surf.focused) catch |err| {
+        log.warn("focusCallback failed err={}", .{err});
+    };
 }
 
 fn newTab(
@@ -1346,7 +1385,6 @@ fn newTab(
     };
 
     const surf = try self.newPane(
-        window,
         tab,
         context,
         if (profile) |p| p.argv else null,
@@ -1384,7 +1422,7 @@ fn newSplit(self: *App, pane: *Surface, dir: SplitDir) !*Surface {
 
     // Splits inherit the configured command; only the dropdown picks a
     // specific shell.
-    const new_pane = try self.newPane(window, tab, .split, null);
+    const new_pane = try self.newPane(tab, .split, null);
     errdefer {
         self.core_app.deleteSurface(new_pane);
         if (new_pane.core_ready) new_pane.core_surface.deinit();
@@ -1589,11 +1627,23 @@ fn reflow(window: *Window) void {
     for (tab.panes.items, 0..) |pane, i| {
         const rect = tab.paneRect(i, client_rect);
         pane.last_rect = rect;
-        if (!pane.core_ready) continue;
 
         const w: i32 = @max(0, rect.right - rect.left);
         const h: i32 = @max(0, rect.bottom - rect.top);
         if (w == 0 or h == 0) continue;
+
+        // The pane's rect is settled as of the line above, so this is the
+        // first moment its shell can be started at a size it will keep.
+        // Any earlier and the pty is created at a guess and resized under
+        // a shell that has already started printing. See `Surface.pending`.
+        if (pane.pending != null) {
+            if (!window.settled) continue;
+            window.app.startPane(pane) catch |err| {
+                log.err("failed to start pane err={}", .{err});
+                continue;
+            };
+        }
+        if (!pane.core_ready) continue;
 
         pane.core_surface.sizeCallback(.{
             .width = @intCast(w),
@@ -1903,6 +1953,20 @@ pub const Surface = struct {
     tab: *Tab,
     core_surface: CoreSurface,
     core_ready: bool,
+    /// What `startPane` still needs in order to bring this pane up, or null
+    /// once it has.
+    ///
+    /// A pane is allocated before anyone knows how big it will be. Its rect
+    /// depends on the split layout, which is only decided after the pane is
+    /// in the tab, and on the window's size, which Windows is still free to
+    /// change: a shell-launched packaged build gets its remembered geometry
+    /// restored a frame or two after the window first becomes visible. The
+    /// pty is created at whatever size the surface reports, so starting the
+    /// shell before then means starting it at the wrong size and resizing
+    /// out from under it -- and ConPTY re-wraps its buffer on resize, which
+    /// mangles whatever the shell has already printed.
+    pending: ?Pending,
+
     /// UTF-8 title as last reported by the terminal (via the `set_title`
     /// action). Only the focused pane's title of the active tab is shown
     /// on the OS window titlebar / in the tab strip.
@@ -1916,6 +1980,12 @@ pub const Surface = struct {
     /// Last focus state handed to the core, so syncFocus can skip
     /// surfaces that haven't changed.
     focused: bool = false,
+
+    pub const Pending = struct {
+        context: apprt.surface.NewSurfaceContext,
+        /// Borrowed from the window's profile list, which outlives the pane.
+        argv: ?[]const []const u8,
+    };
 
     pub fn deinit(self: *Surface) void {
         _ = self;
