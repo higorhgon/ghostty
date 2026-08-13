@@ -1503,7 +1503,23 @@ fn reflow(window: *Window) void {
     w32.glBindFramebuffer(w32.GL_FRAMEBUFFER, 0);
     w32.glDisable(w32.GL_SCISSOR_TEST);
     w32.glViewport(0, 0, win_width, win_height);
-    w32.glClearColor(0, 0, 0, 1);
+    // Not black. This clear shows in two places: the gap between split
+    // panes, where it *is* the divider, and the whole window during
+    // startup, before any pane has produced a frame -- which read as
+    // Ghostty opening a black window before the real one. The strip's
+    // shade serves both: a divider a step darker than the terminal, and a
+    // first frame that already looks like the title bar above it.
+    //
+    // The factor matches the one the tab strip derives its own background
+    // with, so the two agree.
+    const bg = window.app.config.background;
+    const strip_factor: f32 = 0.62;
+    w32.glClearColor(
+        @as(f32, @floatFromInt(bg.r)) / 255.0 * strip_factor,
+        @as(f32, @floatFromInt(bg.g)) / 255.0 * strip_factor,
+        @as(f32, @floatFromInt(bg.b)) / 255.0 * strip_factor,
+        1,
+    );
     w32.glClear(w32.GL_COLOR_BUFFER_BIT);
 
     for (tab.panes.items, 0..) |pane, i| {
