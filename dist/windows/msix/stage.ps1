@@ -43,6 +43,25 @@ Copy-Item $dll (Join-Path $layout "bin") -Force
 Copy-Item (Join-Path $PSScriptRoot "AppxManifest.xml") $layout -Force
 Copy-Item (Join-Path $PSScriptRoot "Assets") $layout -Recurse -Force
 
+# The Assets folder carries qualified icon names -- targetsize-NN and
+# altform-unplated. Those qualifiers live in the *filename*, and nothing
+# reads them without a compiled resource index: with loose files and no
+# resources.pri, Windows just takes the one path the manifest names. The
+# visible symptom is the taskbar drawing the icon on a plate of the user's
+# accent colour, because the unplated variant is never found.
+$makepri = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter makepri.exe -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like "*\x64\*" } |
+    Sort-Object FullName -Descending | Select-Object -First 1
+if ($makepri) {
+    Write-Host "Indexing resources with $($makepri.FullName)..."
+    $cfg = Join-Path $layout "priconfig.xml"
+    & $makepri.FullName createconfig /cf $cfg /dq en-US /o | Out-Null
+    & $makepri.FullName new /pr $layout /cf $cfg /of (Join-Path $layout "resources.pri") /o | Out-Null
+    Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+} else {
+    Write-Warning "makepri.exe not found; the taskbar icon will be drawn on an accent-coloured plate."
+}
+
 Write-Host "Layout at $layout"
 if ($NoRegister) { return }
 
