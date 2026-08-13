@@ -93,6 +93,15 @@ struct XamlApp : WUX::ApplicationT<XamlApp, WUX::Markup::IXamlMetadataProvider> 
         Log("XamlApp: XamlControlsResources OK, merging");
         Resources().MergedDictionaries().Append(res);
         Log("XamlApp: merged OK");
+
+        // A XAML exception raised during layout (applying a template, say)
+        // reaches the dispatcher, not whatever C++ call kicked it off, and
+        // terminates the process with nothing written down. This is the
+        // only place it can be seen.
+        UnhandledException([](auto&&, WUX::UnhandledExceptionEventArgs const& e) {
+            Log("XAML UNHANDLED 0x%08X: %ls", (unsigned)e.Exception(),
+                e.Message().c_str());
+        });
     }
 
     WUX::Markup::IXamlType GetXamlType(WUX::Interop::TypeName const& type) {
@@ -136,11 +145,6 @@ struct GhosttyTabBar {
     WUX::Media::SolidColorBrush b_selected{nullptr};
     WUX::Media::SolidColorBrush b_unselected{nullptr};
     WUX::Media::SolidColorBrush b_hover{nullptr};
-    /// Every theme slot's copy, so recolouring reaches whichever one the
-    /// resource lookup actually resolves against.
-    std::vector<WUX::Media::SolidColorBrush> extra_brushes;
-    std::vector<WUX::Media::SolidColorBrush> extra_unselected;
-    std::vector<WUX::Media::SolidColorBrush> extra_hover;
 
     std::unordered_map<GhosttyTabId, MUX::Controls::TabViewItem> tabs;
     GhosttyTabId next_id = 1;
@@ -156,92 +160,349 @@ struct GhosttyTabBar {
 
 namespace {
 
-/// Installs the named tab brushes and keeps handles so they can be
-/// recoloured in place.
+/// Installs an implicit TabViewItem Style whose ControlTemplate paints the
+/// tabs from three brushes we own, and keeps handles so `set_theme` can
+/// recolour them in place.
 ///
-/// STATUS: the brushes are created and recoloured correctly, but WinUI
-/// 2.8's stock TabViewItem does not read them -- its background is a
-/// translucent white overlay baked into the default ControlTemplate.
-/// Overriding the documented keys was measured having no effect through
-/// four different scopes: the TabView's ResourceDictionary, the
-/// Application's, each item's own, and these merged ThemeDictionaries
-/// (both the "Default" and "Dark" slots). Rendered values stayed at
-/// 46,48,53 unselected and 103,105,108 selected in every case.
+/// A full template override rather than the documented resource keys,
+/// because overriding those keys does nothing. Setting
+/// TabViewItemHeaderBackground* was measured as having no effect through
+/// four scopes: the TabView's dictionary, the Application's, each item's
+/// own, and merged ThemeDictionaries. Rendered values stayed at 46,48,53
+/// unselected and 103,105,108 selected in every case.
 ///
-/// They are kept because the fix is a ControlTemplate override for
-/// TabViewItem, and that template will bind to exactly these brushes.
-/// Until then the tabs use WinUI's default colours.
+/// WinUI 2.8's Generic.xaml shows the shape of the problem. The stock
+/// template gives the *selected* tab's background to a separate shape,
+/// `SelectedBackgroundPath`, then paints `TabContainer` over it with
+/// `TabViewItemHeaderBackground`. That the overlay is translucent is
+/// inference rather than something read -- the keys are not defined in
+/// Generic.xaml at all, only referenced, so their values live in the
+/// compiled theme resources -- but it is the only thing that explains a
+/// selected tab rendering lighter than both the strip and the content.
+///
+/// Inside a template we own the lookup is no longer in question:
+/// `{StaticResource}` resolves against the dictionary the Style lives in,
+/// so it can only find our brushes.
+///
+/// Verified by sampling: unselected 26,29,34 against a 24,27,32 strip,
+/// selected 40,44,52 exactly matching the terminal background, hover
+/// 32,35,41. Note that hover cannot be provoked with SetCursorPos --
+/// XAML pointer state only follows synthesized relative mouse input.
+///
+/// Kept deliberately close to the stock template. Three deviations, each
+/// forced:
+///   - `x:Load` is dropped: XamlReader::Load does not support it. The
+///     deferred elements are declared Visibility="Collapsed" instead,
+///     which is the state the template starts them in anyway.
+///   - TabContainer's CornerRadius is a literal instead of a binding
+///     through `{StaticResource TopCornerRadiusFilterConverter}`: a
+///     StaticResource that is not in the parsed markup fails at Load
+///     time, and that converter lives in WinUI's compiled resources.
+///   - The reorder/drag Storyboard states are omitted. VisualStateManager
+///     ignores a state it cannot find, so this costs the drag animations
+///     and nothing else.
 bool InstallThemeOverrides(GhosttyTabBar* bar) {
+    // Split into chunks and joined at runtime only because MSVC caps a
+    // single string literal at 16380 bytes and this template is larger.
+    // The split points are arbitrary; keep them on element boundaries so
+    // the pieces stay readable.
+    //
     // Placeholder colours; set_theme recolours these brushes in place.
-    static constexpr wchar_t kXaml[] =
-        LR"(<ResourceDictionary
+    static constexpr wchar_t kXaml1[] =
+        LR"XAML(<ResourceDictionary
               xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-              <ResourceDictionary.ThemeDictionaries>
-                <!-- "Default" is the dark slot by convention, but an
-                     element with an explicit RequestedTheme may look up
-                     "Dark" by name, so both are provided. -->
-                <ResourceDictionary x:Key="Default">
-                  <SolidColorBrush x:Key="GhosttyTabSelected" Color="#FF202020"/>
-                  <SolidColorBrush x:Key="GhosttyTabUnselected" Color="#FF141414"/>
-                  <SolidColorBrush x:Key="GhosttyTabHover" Color="#FF2D2D2D"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelected" ResourceKey="GhosttyTabSelected"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPointerOver" ResourceKey="GhosttyTabSelected"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPressed" ResourceKey="GhosttyTabSelected"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackground" ResourceKey="GhosttyTabUnselected"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundPointerOver" ResourceKey="GhosttyTabHover"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundPressed" ResourceKey="GhosttyTabHover"/>
-                </ResourceDictionary>
-                <ResourceDictionary x:Key="Dark">
-                  <SolidColorBrush x:Key="GhosttyTabSelectedDark" Color="#FF202020"/>
-                  <SolidColorBrush x:Key="GhosttyTabUnselectedDark" Color="#FF141414"/>
-                  <SolidColorBrush x:Key="GhosttyTabHoverDark" Color="#FF2D2D2D"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelected" ResourceKey="GhosttyTabSelectedDark"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPointerOver" ResourceKey="GhosttyTabSelectedDark"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundSelectedPressed" ResourceKey="GhosttyTabSelectedDark"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackground" ResourceKey="GhosttyTabUnselectedDark"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundPointerOver" ResourceKey="GhosttyTabHoverDark"/>
-                  <StaticResource x:Key="TabViewItemHeaderBackgroundPressed" ResourceKey="GhosttyTabHoverDark"/>
-                </ResourceDictionary>
-              </ResourceDictionary.ThemeDictionaries>
-            </ResourceDictionary>)";
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+              xmlns:muxc="using:Microsoft.UI.Xaml.Controls">
+              <SolidColorBrush x:Key="GhosttyTabSelected" Color="#FF202020"/>
+              <SolidColorBrush x:Key="GhosttyTabUnselected" Color="#FF141414"/>
+              <SolidColorBrush x:Key="GhosttyTabHover" Color="#FF2D2D2D"/>
+
+              <!-- A copy of WinUI's TabViewCloseButtonStyle. The stock
+                   template reaches it by name, but that Style is defined in
+                   WinUI's own Generic.xaml and is not reachable from a
+                   dictionary of ours: looking it up throws 0x802B000A
+                   "Cannot find a Resource with the Name/Key
+                   TabViewCloseButtonStyle" when the template is applied,
+                   which kills the process rather than the tab. The brush
+                   and size keys below do resolve, because those live in the
+                   compiled theme resources that XamlControlsResources
+                   merges into Application.Resources.
+                   UseSystemFocusVisuals is dropped for the same reason as
+                   the converter: a StaticResource outside the parsed markup
+                   fails at Load time. -->
+              <Style x:Key="GhosttyTabCloseButtonStyle" TargetType="Button">
+                <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                <Setter Property="VerticalContentAlignment" Value="Center"/>
+                <Setter Property="FontFamily" Value="{ThemeResource SymbolThemeFontFamily}"/>
+                <Setter Property="FontSize" Value="{ThemeResource TabViewItemHeaderCloseFontSize}"/>
+                <Setter Property="Width" Value="{ThemeResource TabViewItemHeaderCloseButtonWidth}"/>
+                <Setter Property="Height" Value="{ThemeResource TabViewItemHeaderCloseButtonHeight}"/>
+                <Setter Property="Background" Value="{ThemeResource TabViewItemHeaderCloseButtonBackground}"/>
+                <Setter Property="Foreground" Value="{ThemeResource TabViewItemHeaderCloseButtonForeground}"/>
+                <Setter Property="BorderBrush" Value="{ThemeResource TabViewItemHeaderCloseButtonBorderBrush}"/>
+                <Setter Property="BorderThickness" Value="{ThemeResource TabViewItemHeaderCloseButtonBorderThickness}"/>
+                <Setter Property="FocusVisualMargin" Value="-3"/>
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                      <ContentPresenter x:Name="ContentPresenter" AutomationProperties.AccessibilityView="Raw" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" ContentTemplate="{TemplateBinding ContentTemplate}" Content="{TemplateBinding Content}" CornerRadius="{ThemeResource ControlCornerRadius}" ContentTransitions="{TemplateBinding ContentTransitions}" HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}">
+                        <VisualStateManager.VisualStateGroups>
+                          <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal"/>
+                            <VisualState x:Name="PointerOver">
+                              <VisualState.Setters>
+                                <Setter Target="ContentPresenter.Background" Value="{ThemeResource TabViewItemHeaderCloseButtonBackgroundPointerOver}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderCloseButtonForegroundPointerOver}"/>
+                                <Setter Target="ContentPresenter.BorderBrush" Value="{ThemeResource TabViewItemHeaderCloseButtonBorderBrushPointerOver}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Pressed">
+                              <VisualState.Setters>
+                                <Setter Target="ContentPresenter.Background" Value="{ThemeResource TabViewItemHeaderCloseButtonBackgroundPressed}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderCloseButtonForegroundPressed}"/>
+                                <Setter Target="ContentPresenter.BorderBrush" Value="{ThemeResource TabViewItemHeaderCloseButtonBorderBrushPressed}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                      </ContentPresenter>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>)XAML";
+
+    static constexpr wchar_t kXaml2[] =
+        LR"XAML(   <Style TargetType="muxc:TabViewItem">
+                <Setter Property="Background" Value="{StaticResource GhosttyTabUnselected}"/>
+                <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                <Setter Property="MinHeight" Value="{ThemeResource TabViewItemMinHeight}"/>
+                <Setter Property="BorderThickness" Value="{ThemeResource TabViewItemBorderThickness}"/>
+                <Setter Property="BorderBrush" Value="{ThemeResource TabViewItemBorderBrush}"/>
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="muxc:TabViewItem">
+                      <Grid x:Name="LayoutRoot" Padding="{TemplateBinding Padding}" UseLayoutRounding="False">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition x:Name="LeftColumn" Width="Auto"/>
+                          <ColumnDefinition Width="*"/>
+                          <ColumnDefinition x:Name="RightColumn" Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RenderTransform>
+                          <ScaleTransform x:Name="LayoutRootScale"/>
+                        </Grid.RenderTransform>
+                        <VisualStateManager.VisualStateGroups>
+                          <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal"/>
+                            <VisualState x:Name="PointerOver">
+                              <VisualState.Setters>
+                                <Setter Target="TabContainer.Background" Value="{StaticResource GhosttyTabHover}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundPointerOver}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewItemIconForegroundPointerOver}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderPointerOverCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderPointerOverCloseButtonForeground}"/>
+                                <Setter Target="TabSeparator.Opacity" Value="0"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Pressed">
+                              <VisualState.Setters>
+                                <Setter Target="TabContainer.Background" Value="{StaticResource GhosttyTabHover}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundPressed}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewItemIconForegroundPressed}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderPressedCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderPressedCloseButtonForeground}"/>
+                                <Setter Target="TabSeparator.Opacity" Value="0"/>
+                              </VisualState.Setters>
+                            </VisualState>)XAML";
+
+    static constexpr wchar_t kXaml3[] =
+        LR"XAML(   <VisualState x:Name="Selected">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
+                                <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="TabContainer.Background" Value="Transparent"/>
+                                <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
+                                <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundSelected}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewItemIconForegroundSelected}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonForeground}"/>
+                                <Setter Target="LayoutRoot.Background" Value="Transparent"/>
+                                <Setter Target="ContentPresenter.FontWeight" Value="SemiBold"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="PointerOverSelected">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
+                                <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="TabContainer.Background" Value="Transparent"/>
+                                <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
+                                <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundSelected}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewItemIconForegroundSelected}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonForeground}"/>
+                                <Setter Target="LayoutRoot.Background" Value="Transparent"/>
+                                <Setter Target="ContentPresenter.FontWeight" Value="SemiBold"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="PressedSelected">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
+                                <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="TabContainer.Background" Value="Transparent"/>
+                                <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
+                                <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundSelected}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewItemIconForegroundSelected}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderSelectedCloseButtonForeground}"/>
+                                <Setter Target="LayoutRoot.Background" Value="Transparent"/>
+                                <Setter Target="ContentPresenter.FontWeight" Value="SemiBold"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>)XAML";
+
+    static constexpr wchar_t kXaml4[] =
+        LR"XAML(   <VisualStateGroup x:Name="DisabledStates">
+                            <VisualState x:Name="Enabled"/>
+                            <VisualState x:Name="Disabled">
+                              <VisualState.Setters>
+                                <Setter Target="TabContainer.Background" Value="{ThemeResource TabViewItemHeaderBackgroundDisabled}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TabViewItemHeaderForegroundDisabled}"/>
+                                <Setter Target="IconControl.Foreground" Value="{ThemeResource TabViewButtonForegroundDisabled}"/>
+                                <Setter Target="CloseButton.Background" Value="{ThemeResource TabViewItemHeaderDisabledCloseButtonBackground}"/>
+                                <Setter Target="CloseButton.Foreground" Value="{ThemeResource TabViewItemHeaderDisabledCloseButtonForeground}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                          <VisualStateGroup x:Name="IconStates">
+                            <VisualState x:Name="Icon"/>
+                            <VisualState x:Name="NoIcon">
+                              <VisualState.Setters>
+                                <Setter Target="IconBox.Visibility" Value="Collapsed"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                          <VisualStateGroup x:Name="TabWidthModes">
+                            <VisualState x:Name="StandardWidth"/>
+                            <VisualState x:Name="Compact">
+                              <VisualState.Setters>
+                                <Setter Target="IconBox.Margin" Value="0,0,0,0"/>
+                                <Setter Target="ContentPresenter.Visibility" Value="Collapsed"/>
+                                <Setter Target="IconColumn.Width" Value="{ThemeResource TabViewItemHeaderIconSize}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                          <VisualStateGroup x:Name="CloseIconStates">
+                            <VisualState x:Name="CloseButtonVisible"/>
+                            <VisualState x:Name="CloseButtonCollapsed">
+                              <VisualState.Setters>
+                                <Setter Target="CloseButton.Visibility" Value="Collapsed"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                          <VisualStateGroup>
+                            <VisualState x:Name="ForegroundNotSet"/>
+                            <VisualState x:Name="ForegroundSet">
+                              <VisualState.Setters>
+                                <Setter Target="IconControl.Foreground" Value="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Foreground}"/>
+                                <Setter Target="ContentPresenter.Foreground" Value="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Foreground}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                          <VisualStateGroup>
+                            <VisualState x:Name="NormalBottomBorderLine"/>
+                            <VisualState x:Name="LeftOfSelectedTab">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Margin" Value="0,0,2,0"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="RightOfSelectedTab">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Margin" Value="2,0,0,0"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="NoBottomBorderLine">
+                              <VisualState.Setters>
+                                <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                          </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>)XAML";
+
+    static constexpr wchar_t kXaml5[] =
+        LR"XAML(   <Border x:Name="BottomBorderLine" BorderBrush="{ThemeResource TabViewBorderBrush}" BorderThickness="1" Height="1" Grid.ColumnSpan="3" VerticalAlignment="Bottom"/>
+                        <!-- The two arcs fill the notch where the selected tab meets the strip, so they take the selected colour, not the border colour the stock template uses. -->
+                        <Path x:Name="LeftRadiusRenderArc" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Visibility="Collapsed" Margin="-4,0,0,0" Height="4" Width="4" Data="M4 0C4 1.19469 3.47624 2.26706 2.64582 3H0C1.65685 3 3 1.65685 3 0H4Z"/>
+                        <Path x:Name="RightRadiusRenderArc" Grid.Column="2" Visibility="Collapsed" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Margin="0,0,-4,0" Height="4" Width="4" Data="M0 0C0 1.19469 0.523755 2.26706 1.35418 3H4C2.34315 3 1 1.65685 1 0H0Z"/>
+                        <!-- Wrapped in a Canvas to prevent an infinite loop in calculating its width. -->
+                        <Canvas>
+                          <Path x:Name="SelectedBackgroundPath" Grid.ColumnSpan="3" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Margin="-4,0,-4,0" Visibility="Collapsed" Data="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TabViewTemplateSettings.TabGeometry}"/>
+                        </Canvas>
+                        <Border x:Name="TabSeparator" HorizontalAlignment="Right" Width="1" Grid.Column="1" BorderBrush="{ThemeResource TabViewItemSeparator}" BorderThickness="1" Margin="{ThemeResource TabViewItemSeparatorMargin}"/>
+                        <Grid x:Name="TabContainer" Grid.Column="1" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Control.IsTemplateFocusTarget="True" Padding="{ThemeResource TabViewItemHeaderPadding}" CornerRadius="4,4,0,0" FocusVisualMargin="{TemplateBinding FocusVisualMargin}">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition x:Name="IconColumn" Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <Viewbox x:Name="IconBox" MaxWidth="{ThemeResource TabViewItemHeaderIconSize}" MaxHeight="{ThemeResource TabViewItemHeaderIconSize}" Margin="{ThemeResource TabViewItemHeaderIconMargin}">
+                            <ContentControl x:Name="IconControl" Content="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TabViewTemplateSettings.IconElement}" IsTabStop="False" Foreground="{ThemeResource TabViewItemIconForeground}" HighContrastAdjustment="None"/>
+                          </Viewbox>
+                          <!-- Content is deliberately empty and filled in code-behind: template-binding it to Header makes an empty header implicitly bind to TabViewItem.Content. -->
+                          <ContentPresenter x:Name="ContentPresenter" Grid.Column="1" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" Content="" ContentTemplate="{TemplateBinding HeaderTemplate}" ContentTransitions="{TemplateBinding ContentTransitions}" FontWeight="{TemplateBinding FontWeight}" FontSize="{ThemeResource TabViewItemHeaderFontSize}" Foreground="{ThemeResource TabViewItemHeaderForeground}" OpticalMarginAlignment="TrimSideBearings" HighContrastAdjustment="None"/>
+                          <Button x:Name="CloseButton" Grid.Column="2" Margin="{ThemeResource TabViewItemHeaderCloseMargin}" Content="&#xE711;" IsTextScaleFactorEnabled="False" IsTabStop="False" Style="{StaticResource GhosttyTabCloseButtonStyle}" HighContrastAdjustment="None"/>
+                        </Grid>
+                      </Grid>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>
+            </ResourceDictionary>)XAML";
 
     auto app = WUX::Application::Current();
     if (!app) return false;
 
-    auto obj = WUX::Markup::XamlReader::Load(kXaml);
-    auto dict = obj.try_as<WUX::ResourceDictionary>();
+    const std::wstring xaml =
+        std::wstring{kXaml1} + kXaml2 + kXaml3 + kXaml4 + kXaml5;
+
+    WUX::ResourceDictionary dict{nullptr};
+    try {
+        dict = WUX::Markup::XamlReader::Load(winrt::hstring{xaml})
+                   .try_as<WUX::ResourceDictionary>();
+    } catch (hresult_error const& e) {
+        // A parse failure is not fatal: the strip still works, it just
+        // wears WinUI's default tab colours.
+        Log("theme: XamlReader failed 0x%08X: %ls", (unsigned)e.code(),
+            e.message().c_str());
+        return false;
+    }
     if (!dict) {
         Log("theme: XamlReader did not yield a ResourceDictionary");
         return false;
     }
     app.Resources().MergedDictionaries().Append(dict);
 
-    // Reach through the theme dictionary to keep the brush instances.
-    // Collect the brushes from every theme slot so recolouring hits
-    // whichever one the lookup actually settles on.
-    auto themes = dict.ThemeDictionaries();
-    for (auto const& slot : {L"Default", L"Dark"}) {
-        auto sub = themes.TryLookup(winrt::box_value(slot))
-                       .try_as<WUX::ResourceDictionary>();
-        if (!sub) continue;
-        const bool dark_slot = (std::wstring_view{slot} == L"Dark");
-        auto grab = [&](wchar_t const* base) {
-            std::wstring key{base};
-            if (dark_slot) key += L"Dark";
-            return sub.TryLookup(winrt::box_value(key))
-                .try_as<WUX::Media::SolidColorBrush>();
-        };
-        if (auto b = grab(L"GhosttyTabSelected")) bar->extra_brushes.push_back(b);
-        if (auto b = grab(L"GhosttyTabUnselected")) bar->extra_unselected.push_back(b);
-        if (auto b = grab(L"GhosttyTabHover")) bar->extra_hover.push_back(b);
-    }
-    if (!bar->extra_brushes.empty()) bar->b_selected = bar->extra_brushes.front();
-    if (!bar->extra_unselected.empty()) bar->b_unselected = bar->extra_unselected.front();
-    if (!bar->extra_hover.empty()) bar->b_hover = bar->extra_hover.front();
+    auto grab = [&](wchar_t const* key) {
+        return dict.TryLookup(winrt::box_value(key))
+            .try_as<WUX::Media::SolidColorBrush>();
+    };
+    bar->b_selected = grab(L"GhosttyTabSelected");
+    bar->b_unselected = grab(L"GhosttyTabUnselected");
+    bar->b_hover = grab(L"GhosttyTabHover");
 
-    Log("theme: overrides installed (selected=%d unselected=%d hover=%d)",
-        bar->b_selected ? 1 : 0, bar->b_unselected ? 1 : 0, bar->b_hover ? 1 : 0);
+    Log("theme: template installed (selected=%d unselected=%d hover=%d)",
+        bar->b_selected ? 1 : 0, bar->b_unselected ? 1 : 0,
+        bar->b_hover ? 1 : 0);
     return bar->b_selected != nullptr;
 }
 
@@ -732,11 +993,21 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
         // to derive the selected tab from it, and its default overlay
         // darkens -- which inverts the whole thing and is what this used
         // to look like.
+        //
+        // An unselected tab sits just off the strip rather than exactly on
+        // it, which is what gives the tabs an edge when none is selected.
+        // Windows Terminal's own numbers are 24,24,37 for the strip against
+        // 26,26,39 for an unselected tab; this reproduces that ~2-unit lift
+        // rather than the colour, since the colour follows the theme.
         const double strip_factor = dark ? 0.62 : 1.12;
+        const double unselected_factor = dark ? 0.66 : 1.09;
         const double hover_factor = dark ? 0.80 : 1.06;
         const auto content = Rgb(r, g, b);
         const auto strip = Rgb(Scale(r, strip_factor), Scale(g, strip_factor),
                                Scale(b, strip_factor));
+        const auto unselected =
+            Rgb(Scale(r, unselected_factor), Scale(g, unselected_factor),
+                Scale(b, unselected_factor));
         const auto hover = Rgb(Scale(r, hover_factor), Scale(g, hover_factor),
                                Scale(b, hover_factor));
 
@@ -744,9 +1015,9 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
 
         // Recolour in place: the brushes are already bound into applied
         // templates, so replacing the objects would change nothing.
-        for (auto& b : bar->extra_brushes) b.Color(content);
-        for (auto& b : bar->extra_unselected) b.Color(strip);
-        for (auto& b : bar->extra_hover) b.Color(hover);
+        if (bar->b_selected) bar->b_selected.Color(content);
+        if (bar->b_unselected) bar->b_unselected.Color(unselected);
+        if (bar->b_hover) bar->b_hover.Color(hover);
 
         Log("set_theme: content=%02X%02X%02X strip=%02X%02X%02X",
             content.R, content.G, content.B, strip.R, strip.G, strip.B);

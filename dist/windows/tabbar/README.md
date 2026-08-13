@@ -87,6 +87,48 @@ Fixing that properly would mean the island owning the whole window and the
 terminal rendering into a `SwapChainPanel` — the full Windows Terminal
 architecture, and a port of Ghostty's renderer from OpenGL to Direct3D.
 
+**Overriding `TabViewItemHeaderBackground*` does nothing.** The documented
+way to recolour tabs was measured as having no effect through four scopes:
+the `TabView`'s dictionary, the `Application`'s, each item's own, and
+merged `ThemeDictionaries`. The tab colours come from a full
+`TabViewItem` `ControlTemplate` override instead, which is why one is
+carried here. In WinUI's stock template the *selected* tab is painted by a
+separate shape (`SelectedBackgroundPath`) with `TabContainer` drawn over
+it — so the selected tab picked up a translucent overlay and rendered
+lighter than both the strip and the terminal content.
+
+Note those keys are never *defined* in WinUI's `Generic.xaml`, only
+referenced; their values live in compiled theme resources. `Generic.xaml`
+is still the place to read the templates themselves, at
+`packages/Microsoft.UI.Xaml.2.8.6/lib/uap10.0/Microsoft.UI.Xaml/Themes/`.
+
+**`XamlReader::Load` is not the XAML compiler.** Three things a copied
+template will contain that it rejects:
+
+- `x:Load` — unsupported; use `Visibility="Collapsed"`.
+- Any `{StaticResource}` whose key is not inside the markup being parsed,
+  which fails at *load* time. WinUI's `TopCornerRadiusFilterConverter` and
+  `TabViewCloseButtonStyle` are both in this category — the close button
+  style has to be copied in wholesale.
+- `{ThemeResource}` keys resolve late, so those are fine, but a missing
+  one throws when the template is *applied*, not when it is parsed.
+
+**MSVC caps a string literal at 16380 bytes.** A real control template is
+larger than that, so it has to be split into several literals and joined at
+runtime; concatenating adjacent literals does not raise the cap.
+
+**A XAML exception during layout kills the process silently.** It surfaces
+on the dispatcher, not in whatever call triggered it, so a `try/catch`
+around `TabItems().Append()` never sees it. Subscribing to
+`Application::UnhandledException` is the only way to read it — it is what
+turned a bare process exit into `0x802B000A: Cannot find a Resource with
+the Name/Key TabViewCloseButtonStyle [Line: 181 Position: 140]`.
+
+**Hover states cannot be provoked with `SetCursorPos`.** XAML pointer
+state follows synthesized *relative* mouse input (`mouse_event` with
+`MOUSEEVENTF_MOVE`); warping the cursor leaves the control in `Normal` and
+makes a perfectly good `PointerOver` state look broken.
+
 ## Routes considered
 
 Both were built and compared side by side before choosing.
