@@ -811,6 +811,10 @@ pub const Tab = struct {
     /// This tab's identity in the native strip, or 0 when running on the
     /// GDI fallback.
     bar_id: tabbar.TabId = 0,
+    /// Name of the dropdown profile this tab was opened from, shown when
+    /// the shell's own title is not worth showing. Borrowed from
+    /// `window.profiles`, which outlives every tab in the window.
+    profile_name: ?[]const u8 = null,
 
     fn focusedPane(self: *Tab) ?*Surface {
         if (self.focused >= self.panes.items.len) return null;
@@ -900,10 +904,10 @@ const bar_callbacks = struct {
         const win = window(ctx) orelse return;
         // The plain "+" sends profile_default, which matches nothing and
         // so leaves the configured command alone.
-        const argv: ?[]const []const u8 = for (win.profiles) |p| {
-            if (p.id == profile) break p.argv;
+        const picked: ?*const tabbar.Profile = for (win.profiles) |*p| {
+            if (p.id == profile) break p;
         } else null;
-        _ = win.app.newTab(win, .tab, argv) catch |err| {
+        _ = win.app.newTab(win, .tab, picked) catch |err| {
             log.warn("failed to create tab err={}", .{err});
         };
     }
@@ -996,18 +1000,62 @@ fn applyTabBarTheme(window: *Window) void {
     tabbar.ghostty_tabbar_set_theme(bar, bg.r, bg.g, bg.b, if (luminance < 128) 1 else 0);
 }
 
+/// True if a shell-reported title is just the path of the executable
+/// running in it.
+///
+/// cmd.exe and powershell.exe both set their title to their own full path
+/// and never update it, so honouring it fills the strip with
+/// "C:\WINDOWS\system32\cmd.exe". Windows Terminal shows the profile name
+/// for exactly these and the reported title for everything else -- WSL
+/// shells and nushell report their working directory, which is worth
+/// showing. Rather than special-casing those two shells, this rejects any
+/// title that looks like a Windows executable path, which is the property
+/// that actually makes a title useless.
+fn titleIsExePath(title: []const u8) bool {
+    if (!std.mem.endsWith(u8, title, ".exe")) return false;
+    // A drive letter or a UNC prefix; anything else is a shell that
+    // happens to be showing a bare program name, which is fine to show.
+    if (std.mem.startsWith(u8, title, "\\\\")) return true;
+    return title.len >= 3 and title[1] == ':' and title[2] == '\\';
+}
+
+/// Finds a detected profile whose executable matches `exe_path`, so a tab
+/// that was not opened from the dropdown -- the window's first tab, or one
+/// from the plain "+" -- still gets a readable name instead of a path.
+fn profileNameForExe(window: *Window, exe_path: []const u8) ?[]const u8 {
+    const base = std.fs.path.basename(exe_path);
+    if (base.len == 0) return null;
+    for (window.profiles) |p| {
+        if (p.argv.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(std.fs.path.basename(p.argv[0]), base)) {
+            return p.name;
+        }
+    }
+    return null;
+}
+
 /// Pushes a tab's current title into the native strip.
 fn syncTabTitle(tab: *Tab) void {
     const window = tab.window;
     const bar = window.tab_bar orelse return;
     if (tab.bar_id == 0) return;
 
-    const surf = tab.focusedPane();
-    var buf: [513:0]u16 = undefined;
-    const n = if (surf) |s|
-        (std.unicode.utf8ToUtf16Le(buf[0..512], s.title_buf[0..s.title_len]) catch 0)
+    const reported: []const u8 = if (tab.focusedPane()) |s|
+        s.title_buf[0..s.title_len]
     else
-        0;
+        "";
+
+    // Falling back to the profile name is what makes a Command Prompt tab
+    // read "Command Prompt" instead of the path to cmd.exe.
+    const title = if (reported.len == 0 or titleIsExePath(reported))
+        (tab.profile_name orelse
+            profileNameForExe(window, reported) orelse
+            "Ghostty")
+    else
+        reported;
+
+    var buf: [513:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(buf[0..512], title) catch 0;
     if (n == 0) {
         const fallback = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
         tabbar.ghostty_tabbar_set_title(bar, tab.bar_id, fallback);
@@ -1158,16 +1206,25 @@ fn newTab(
     self: *App,
     window: *Window,
     context: apprt.surface.NewSurfaceContext,
-    /// The command for the new tab, or null to use the configured one.
-    /// Set when the tab came from a profile in the new-tab dropdown.
-    argv: ?[]const []const u8,
+    /// The profile this tab was opened from, or null to use the
+    /// configured command. Supplies both the command and the name the
+    /// strip falls back to.
+    profile: ?*const tabbar.Profile,
 ) !*Surface {
     const alloc = self.core_app.alloc;
     const tab = try alloc.create(Tab);
     errdefer alloc.destroy(tab);
-    tab.* = .{ .window = window };
+    tab.* = .{
+        .window = window,
+        .profile_name = if (profile) |p| p.name else null,
+    };
 
-    const surf = try self.newPane(window, tab, context, argv);
+    const surf = try self.newPane(
+        window,
+        tab,
+        context,
+        if (profile) |p| p.argv else null,
+    );
     errdefer {
         self.core_app.deleteSurface(surf);
         if (surf.core_ready) surf.core_surface.deinit();

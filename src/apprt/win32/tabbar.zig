@@ -161,6 +161,7 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
         .{ .name = "Command Prompt", .argv = &.{"cmd.exe"} },
         .{ .name = "Windows PowerShell", .argv = &.{"powershell.exe"} },
         .{ .name = "PowerShell 7", .argv = &.{"pwsh.exe"} },
+        .{ .name = "Nushell", .argv = &.{"nu.exe"} },
         .{
             .name = "Git Bash",
             // --login -i is what makes this an interactive login shell, so

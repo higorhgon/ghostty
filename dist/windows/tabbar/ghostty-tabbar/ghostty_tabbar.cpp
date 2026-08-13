@@ -287,6 +287,43 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                 </Setter>
               </Style>)XAML";
 
+    // The "+" / chevron split button. Its own template so hover uses our
+    // themed brush instead of WinUI's default translucent overlay. That
+    // overlay is also why lighting the pair from code did not match:
+    // whichever half the pointer sat on stacked the overlay on top of the
+    // brush and came out lighter. Here "lit" is the same brush as
+    // "hovered", so the two halves cannot disagree.
+    static constexpr wchar_t kXamlFooter[] =
+        LR"XAML(   <Style x:Key="GhosttyFooterButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="Foreground" Value="{ThemeResource TabViewItemHeaderForeground}"/>
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Root" Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}">
+                        <VisualStateManager.VisualStateGroups>
+                          <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal"/>
+                            <VisualState x:Name="PointerOver">
+                              <VisualState.Setters>
+                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabHover}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Pressed">
+                              <VisualState.Setters>
+                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabHover}"/>
+                              </VisualState.Setters>
+                            </VisualState>
+                            <VisualState x:Name="Disabled"/>
+                          </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                        <ContentPresenter x:Name="ContentPresenter" HorizontalAlignment="Center" VerticalAlignment="Center" Content="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"/>
+                      </Border>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>)XAML";
+
     static constexpr wchar_t kXaml2[] =
         LR"XAML(   <Style TargetType="muxc:TabViewItem">
                 <Setter Property="Background" Value="{StaticResource GhosttyTabUnselected}"/>
@@ -489,7 +526,7 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
     if (!app) return false;
 
     const std::wstring xaml =
-        std::wstring{kXaml1} + kXaml2 + kXaml3 + kXaml4 + kXaml5;
+        std::wstring{kXaml1} + kXamlFooter + kXaml2 + kXaml3 + kXaml4 + kXaml5;
 
     WUX::ResourceDictionary dict{nullptr};
     try {
@@ -662,8 +699,16 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
     // opens a new tab, so the "+" is as much a part of this action as the
     // chevron; leaving it dark makes the menu look unrelated to it.
     //
+    // IsHitTestVisible goes off alongside the colour so the click that
+    // dismisses the menu cannot re-enter Click and reopen what it just
+    // closed. The colours match because the footer button template paints
+    // PointerOver with the same brush used here -- switching hit testing
+    // off does not leave PointerOver, it just freezes it, so relying on
+    // that alone was not enough.
+    //
     // TrackPopupMenu below is modal and returns before this scope ends, so
-    // the highlight is guaranteed to come back off.
+    // both are guaranteed to be restored.
+    //
     // Restores the transparent background explicitly rather than calling
     // ClearValue: clearing the local value hands the button back to the
     // default style, which paints the filled box this deliberately avoids.
@@ -672,13 +717,25 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         ~Lit() {
             WUX::Media::SolidColorBrush clear{
                 winrt::Windows::UI::Color{0, 0, 0, 0}};
-            if (bar->plus) bar->plus.Background(clear);
-            if (bar->chevron) bar->chevron.Background(clear);
+            if (bar->plus) {
+                bar->plus.Background(clear);
+                bar->plus.IsHitTestVisible(true);
+            }
+            if (bar->chevron) {
+                bar->chevron.Background(clear);
+                bar->chevron.IsHitTestVisible(true);
+            }
         }
     } lit{bar};
     if (bar->b_hover) {
-        if (bar->plus) bar->plus.Background(bar->b_hover);
-        if (bar->chevron) bar->chevron.Background(bar->b_hover);
+        if (bar->plus) {
+            bar->plus.Background(bar->b_hover);
+            bar->plus.IsHitTestVisible(false);
+        }
+        if (bar->chevron) {
+            bar->chevron.Background(bar->b_hover);
+            bar->chevron.IsHitTestVisible(false);
+        }
     }
 
     // Menu command ids are 1-based indices into `profiles`; 0 means the
@@ -688,14 +745,17 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
                       profiles[i].second.c_str());
     }
 
-    // Drop the menu directly under the chevron button.
+    // Drop the menu below the split button, left-aligned with the "+"
+    // rather than with the chevron -- the menu belongs to the whole
+    // control, which is where Windows Terminal hangs it from too.
     POINT pt{0, 0};
-    if (bar->chevron && bar->island_hwnd) {
+    auto anchor = bar->plus ? bar->plus : bar->chevron;
+    if (anchor && bar->island_hwnd) {
         try {
-            auto transform = bar->chevron.TransformToVisual(nullptr);
+            auto transform = anchor.TransformToVisual(nullptr);
             auto origin = transform.TransformPoint(
                 winrt::Windows::Foundation::Point{0.0f,
-                    static_cast<float>(bar->chevron.ActualHeight())});
+                    static_cast<float>(anchor.ActualHeight())});
             pt.x = static_cast<LONG>(origin.X);
             pt.y = static_cast<LONG>(origin.Y);
         } catch (...) {
@@ -705,12 +765,22 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         ::GetCursorPos(&pt);
     }
 
+    // The SetForegroundWindow / WM_NULL pair is the documented idiom for
+    // TrackPopupMenu and is not optional. Without the first call a menu
+    // whose owner is not foreground does not take the click that dismisses
+    // it -- the click falls through to the window underneath, which is why
+    // dismissing this menu by clicking the terminal started a text
+    // selection there. The trailing WM_NULL is the matching half: it
+    // unsticks the menu so the *next* click is delivered normally.
+    ::SetForegroundWindow(bar->parent_hwnd);
+
     // TPM_RETURNCMD makes this synchronous: it returns the chosen id
     // instead of posting WM_COMMAND, so no message routing is needed.
     const int chosen = ::TrackPopupMenu(
         menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
         pt.x, pt.y, 0, bar->parent_hwnd, nullptr);
     ::DestroyMenu(menu);
+    ::PostMessageW(bar->parent_hwnd, WM_NULL, 0, 0);
 
     if (chosen > 0 && static_cast<size_t>(chosen) <= profiles.size()) {
         const auto profile = profiles[chosen - 1].first;
@@ -820,11 +890,17 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
             b.MinHeight(0);
             b.Padding(WUX::ThicknessHelper::FromUniformLength(0));
             b.CornerRadius(radius);
-            // Flat: the default button chrome draws a filled box that
-            // reads as out of place in a title bar.
-            b.Background(WUX::Media::SolidColorBrush(
-                winrt::Windows::UI::Color{0, 0, 0, 0}));
             b.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
+            // Flat, and hovering in our own colours rather than WinUI's
+            // translucent overlay. Looked up rather than assigned from a
+            // handle because the dictionary is merged at Application level.
+            if (auto app = WUX::Application::Current()) {
+                auto style = app.Resources()
+                                 .Lookup(winrt::box_value(
+                                     L"GhosttyFooterButtonStyle"))
+                                 .try_as<WUX::Style>();
+                if (style) b.Style(style);
+            }
             return b;
         };
 
