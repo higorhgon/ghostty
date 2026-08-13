@@ -445,6 +445,40 @@ pub const App = @This();
 /// app mailbox, which we service in our own message loop.
 pub const must_draw_from_app_thread = true;
 
+/// Hides the console window this process was given at startup.
+///
+/// MSVC builds link as a console-subsystem executable, because the GUI
+/// subsystem's CRT startup wants a `wWinMain` entry point and Zig's std
+/// start code exports a C `main` instead whenever the root module has one
+/// -- which it always does, main.zig being shared across every platform.
+/// See GhosttyExe.zig.
+///
+/// So Windows hands the process a console, and a console comes with a
+/// visible window: a terminal flashing up before Ghostty's own window is
+/// exactly what that is. Hiding it is the fix, and *when* is the whole
+/// point -- doing it once the app was up left the console on screen for
+/// as long as startup took, which is long enough to look like Ghostty
+/// opens some other terminal first.
+///
+/// The console is only hidden, never freed: freeing it would also throw
+/// away a redirected stderr, which is how the logs are read when running
+/// the exe unpackaged.
+fn hideConsole() void {
+    if (w32.GetConsoleWindow()) |console_hwnd| {
+        _ = w32.ShowWindow(console_hwnd, w32.SW_HIDE);
+    }
+}
+
+fn crtHideConsole() callconv(.c) void {
+    hideConsole();
+}
+
+/// Runs `crtHideConsole` from the CRT's initializer table, before `main`.
+/// `.CRT$XCU` is where the MSVC runtime collects C++ static constructors,
+/// and it walks that section during startup -- which is the earliest this
+/// process gets to run code, and so the earliest the console can go away.
+export const ghostty_hide_console_init: *const fn () callconv(.c) void linksection(".CRT$XCU") = &crtHideConsole;
+
 core_app: *CoreApp,
 config: Config,
 hinstance: w32.HINSTANCE,
@@ -460,15 +494,10 @@ pub fn init(
 ) !void {
     _ = opts;
 
-    // If we were launched with an attached console (always true for MSVC
-    // builds today, since they use the console subsystem so the linker
-    // doesn't require a WinMain entry point -- see GhosttyExe.zig), hide
-    // it. This gives a native-looking GUI app experience without needing
-    // to bridge Zig's std.start WinMain dispatch, which would require
-    // touching the shared cross-platform entrypoint in main.zig.
-    if (w32.GetConsoleWindow()) |console_hwnd| {
-        _ = w32.ShowWindow(console_hwnd, w32.SW_HIDE);
-    }
+    // Belt and braces: the CRT initializer below has already hidden the
+    // console long before this runs. This catches the case where the
+    // console was attached after startup.
+    hideConsole();
 
     const hinstance = w32.GetModuleHandleW(null) orelse return error.Unexpected;
 

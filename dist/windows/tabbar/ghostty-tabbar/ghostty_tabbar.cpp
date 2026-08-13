@@ -80,6 +80,11 @@ constexpr double kFooterButtonWidth = 32;
 constexpr double kFooterButtonBottomGap = 5;
 constexpr double kFooterCornerRadius = 4;
 
+// How long after the profile menu closes a click on the chevron is
+// ignored. Long enough to swallow the press that did the closing, short
+// enough that a deliberate second click still opens the menu.
+constexpr LONG kMenuReopenGuardMs = 250;
+
 // Application + metadata provider.
 //
 // The ordering inside the constructor is load-bearing and was the single
@@ -168,6 +173,10 @@ struct GhosttyTabBar {
     // Guards against feedback loops: when Ghostty drives the selection we
     // must not report it back as if the user had clicked.
     bool suppress_selection = false;
+
+    /// GetMessageTime of the moment the profile menu last closed, so a
+    /// click on the chevron that closed it cannot immediately reopen it.
+    LONG menu_closed_at = 0;
 
     void Notify(GhosttyTabSelectedFn fn, GhosttyTabId id) {
         if (fn) fn(cb.ctx, id);
@@ -692,6 +701,26 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
     auto const& profiles = g_profiles[bar];
     if (profiles.empty()) return;
 
+    // Clicking the chevron while its menu is open must only close it.
+    //
+    // It does not, on its own. The press dismisses the menu, and the
+    // button still sees the click and asks for a new one, so the menu
+    // blinks shut and reopens. Taking the button out of hit testing for
+    // the duration was not enough -- the press that dismisses a
+    // TrackPopupMenu is delivered after the modal loop has already
+    // returned, by which point the button is live again.
+    //
+    // So: refuse to reopen within a moment of closing. GetMessageTime is
+    // the right clock here because it reports when the *input* happened,
+    // not when we got round to handling it.
+    if (bar->menu_closed_at != 0) {
+        const LONG dt = ::GetMessageTime() - bar->menu_closed_at;
+        if (dt >= 0 && dt < kMenuReopenGuardMs) {
+            bar->menu_closed_at = 0;
+            return;
+        }
+    }
+
     HMENU menu = ::CreatePopupMenu();
     if (!menu) return;
 
@@ -780,6 +809,7 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
         pt.x, pt.y, 0, bar->parent_hwnd, nullptr);
     ::DestroyMenu(menu);
+    bar->menu_closed_at = ::GetMessageTime();
     ::PostMessageW(bar->parent_hwnd, WM_NULL, 0, 0);
 
     if (chosen > 0 && static_cast<size_t>(chosen) <= profiles.size()) {
