@@ -3781,6 +3781,31 @@ else
 /// Available since: 1.1.0
 @"gtk-custom-css": RepeatablePath = .{},
 
+/// The shell that new terminals open with, named as it appears in the tab
+/// strip's new-tab dropdown: `Command Prompt`, `Windows PowerShell`,
+/// `PowerShell 7`, `Nushell`, `Git Bash`, or any WSL distribution by its
+/// own name. Matching ignores case, and the executable's name works too,
+/// so `pwsh` and `pwsh.exe` both select `PowerShell 7`.
+///
+/// This is the shell the first window opens with, and the one the "+"
+/// button, the new-tab binding and a new split use. Picking an entry from
+/// the dropdown still opens that entry, whatever this is set to.
+///
+/// When unset (the default), a new tab or split instead follows the shell
+/// of the one it was opened from, and the first window falls back to
+/// `command`.
+///
+/// Prefer this over `command` when naming one of the detected shells:
+/// their arguments come with them, which spelling out a command line does
+/// not give you -- `Git Bash` carries the `--login -i` that makes it an
+/// interactive login shell, and a WSL distribution carries its `-d` flag.
+/// A name that matches nothing is ignored, falling back as if unset.
+///
+/// This is only supported on Windows.
+///
+/// Available since: 1.3.0
+@"windows-default-shell": ?[:0]const u8 = null,
+
 /// If `true` (default), applications running in the terminal can show desktop
 /// notifications using certain escape sequences such as OSC 9 or OSC 777.
 @"desktop-notifications": bool = true,

@@ -647,7 +647,11 @@ pub fn performAction(
         .new_tab => {
             switch (target) {
                 .app => _ = try self.newWindow(),
-                .surface => |core| _ = try self.newTab(core.rt_surface.tab.window, .tab, null),
+                .surface => |core| _ = try self.newTab(
+                    core.rt_surface.tab.window,
+                    .tab,
+                    newTabProfile(self, core.rt_surface.tab.window),
+                ),
             }
             return true;
         },
@@ -888,10 +892,12 @@ pub const Tab = struct {
     /// This tab's identity in the native strip, or 0 when running on the
     /// GDI fallback.
     bar_id: tabbar.TabId = 0,
-    /// Name of the dropdown profile this tab was opened from, shown when
-    /// the shell's own title is not worth showing. Borrowed from
-    /// `window.profiles`, which outlives every tab in the window.
-    profile_name: ?[]const u8 = null,
+    /// The shell this tab was opened with, or null when it just ran what
+    /// the config says. Names the tab when the shell's own title is not
+    /// worth showing, and is what a new tab inherits when
+    /// `windows-default-shell` is unset. Borrowed from `window.profiles`,
+    /// which outlives every tab in the window.
+    profile: ?*const tabbar.Profile = null,
 
     fn focusedPane(self: *Tab) ?*Surface {
         if (self.focused >= self.panes.items.len) return null;
@@ -979,11 +985,11 @@ const bar_callbacks = struct {
 
     fn onNewTab(ctx: ?*anyopaque, profile: tabbar.ProfileId) callconv(.c) void {
         const win = window(ctx) orelse return;
-        // The plain "+" sends profile_default, which matches nothing and
-        // so leaves the configured command alone.
+        // The plain "+" sends profile_default, which matches nothing, and
+        // then it is newTabProfile's business what a tab opens with.
         const picked: ?*const tabbar.Profile = for (win.profiles) |*p| {
             if (p.id == profile) break p;
-        } else null;
+        } else newTabProfile(win.app, win);
         _ = win.app.newTab(win, .tab, picked) catch |err| {
             log.warn("failed to create tab err={}", .{err});
         };
@@ -1019,9 +1025,22 @@ const bar_callbacks = struct {
     }
 };
 
+/// Finds the shells this machine has, which is what the new-tab dropdown
+/// offers and what `windows-default-shell` names.
+///
+/// Kept out of initTabBar because the list is not the strip's: detection is
+/// plain Win32 and registry work, and `windows-default-shell` has to keep
+/// working on the GDI fallback, where no strip exists to have a dropdown.
+fn detectProfiles(self: *App, window: *Window) void {
+    window.profiles = tabbar.detectProfiles(self.core_app.alloc) catch |err| blk: {
+        log.warn("shell detection failed err={}", .{err});
+        break :blk &.{};
+    };
+}
+
 /// Brings up the native tab strip for `window`, leaving `tab_bar` null if
 /// it can't be created (see the field's doc comment).
-fn initTabBar(self: *App, window: *Window) void {
+fn initTabBar(window: *Window) void {
     const bar = tabbar.ghostty_tabbar_create(@ptrCast(window.hwnd), .{
         .ctx = window,
         .on_selected = bar_callbacks.onSelected,
@@ -1040,10 +1059,6 @@ fn initTabBar(self: *App, window: *Window) void {
     };
     window.tab_bar = bar;
 
-    window.profiles = tabbar.detectProfiles(self.core_app.alloc) catch |err| blk: {
-        log.warn("shell detection failed err={}", .{err});
-        break :blk &.{};
-    };
     for (window.profiles) |p| {
         var buf: [256:0]u16 = undefined;
         const n = std.unicode.utf8ToUtf16Le(buf[0..255], p.name) catch continue;
@@ -1133,9 +1148,10 @@ fn syncTabTitle(tab: *Tab) void {
     // Falling back to the profile name is what makes a Command Prompt tab
     // read "Command Prompt" instead of the path to cmd.exe.
     const title = if (reported.len == 0 or titleIsExePath(reported))
-        (tab.profile_name orelse
-            profileNameForExe(window, reported) orelse
-            "Ghostty")
+        (if (tab.profile) |p|
+            p.name
+        else
+            profileNameForExe(window, reported) orelse "Ghostty")
     else
         reported;
 
@@ -1178,9 +1194,14 @@ fn newWindow(self: *App) !*Window {
     ) orelse return error.Unexpected;
     window.hwnd = hwnd;
 
+    // Before the strip, which fills its dropdown from this, and before the
+    // first tab, which may be opened into one of these by
+    // `windows-default-shell`.
+    self.detectProfiles(window);
+
     // Before the first tab exists, so the strip is ready to receive it and
     // so the frame style is settled before the window is shown.
-    self.initTabBar(window);
+    initTabBar(window);
 
     var client_rect: w32.RECT = undefined;
     _ = w32.GetClientRect(hwnd, &client_rect);
@@ -1220,7 +1241,7 @@ fn newWindow(self: *App) !*Window {
     window.hglrc = hglrc;
     if (w32.wglMakeCurrent(hdc, hglrc) == w32.FALSE) return error.Unexpected;
 
-    _ = try self.newTab(window, .window, null);
+    _ = try self.newTab(window, .window, newTabProfile(self, window));
 
     // Show off-screen first, let the strip compose, then bring the window
     // to where it belongs.
@@ -1367,6 +1388,54 @@ fn startPane(self: *App, surf: *Surface) !void {
     };
 }
 
+/// The shell a new terminal opens with when the user did not name one --
+/// the "+" button, the new-tab binding, a split, and the first window.
+///
+/// `windows-default-shell` wins when it is set: the whole point of naming a
+/// shell is that Ghostty opens it, and a tab opened from the dropdown is
+/// the way to ask for something else. With nothing configured the new tab
+/// follows whatever is in focus, so splitting or duplicating a PowerShell
+/// tab does not drop the user back into cmd.
+///
+/// Null means "leave the configured command alone", which is what a fresh
+/// install gets.
+fn newTabProfile(self: *App, window: *Window) ?*const tabbar.Profile {
+    if (configuredProfile(self, window)) |p| return p;
+    const tab = window.activeTabPtr() orelse return null;
+    return tab.profile;
+}
+
+/// Resolves `windows-default-shell` against the shells actually found on
+/// this machine. Null when unset, or when it names one that isn't here --
+/// a config that cannot be honoured should not stop a window from opening.
+fn configuredProfile(self: *App, window: *Window) ?*const tabbar.Profile {
+    const want = self.config.@"windows-default-shell" orelse return null;
+    if (want.len == 0) return null;
+
+    for (window.profiles) |*p| {
+        if (std.ascii.eqlIgnoreCase(p.name, want)) return p;
+    }
+
+    // Fall back to the executable, so `pwsh` and `pwsh.exe` reach
+    // "PowerShell 7" without the user having to know the display name.
+    for (window.profiles) |*p| {
+        if (p.argv.len == 0) continue;
+        const exe = fileName(p.argv[0]);
+        if (std.ascii.eqlIgnoreCase(exe, want)) return p;
+        if (exe.len > 4 and std.ascii.eqlIgnoreCase(exe[exe.len - 4 ..], ".exe") and
+            std.ascii.eqlIgnoreCase(exe[0 .. exe.len - 4], want))
+        {
+            return p;
+        }
+    }
+
+    log.warn(
+        "windows-default-shell={s} matches no shell found on this machine, ignoring",
+        .{want},
+    );
+    return null;
+}
+
 /// Gives a tab the icon of the shell it is running, which is how Windows
 /// Terminal makes a row of tabs readable at a glance. Best-effort: a tab
 /// whose shell we cannot put a face to simply shows none, and the strip
@@ -1436,7 +1505,7 @@ fn newTab(
     errdefer alloc.destroy(tab);
     tab.* = .{
         .window = window,
-        .profile_name = if (profile) |p| p.name else null,
+        .profile = profile,
     };
 
     const surf = try self.newPane(
@@ -1478,9 +1547,14 @@ fn newSplit(self: *App, pane: *Surface, dir: SplitDir) !*Surface {
     const window = tab.window;
     const alloc = self.core_app.alloc;
 
-    // Splits inherit the configured command; only the dropdown picks a
-    // specific shell.
-    const new_pane = try self.newPane(tab, .split, null);
+    // A split opens the same shell a new tab would, which with nothing
+    // configured means the one it is splitting away from.
+    const split_profile = newTabProfile(self, window);
+    const new_pane = try self.newPane(
+        tab,
+        .split,
+        if (split_profile) |p| p.argv else null,
+    );
     errdefer {
         self.core_app.deleteSurface(new_pane);
         if (new_pane.core_ready) new_pane.core_surface.deinit();
@@ -2384,7 +2458,11 @@ fn handleTabShortcut(window: *Window, wparam: w32.WPARAM) bool {
 
     switch (vk) {
         w32.VK_T => {
-            _ = window.app.newTab(window, .tab, null) catch |err| {
+            _ = window.app.newTab(
+                window,
+                .tab,
+                newTabProfile(window.app, window),
+            ) catch |err| {
                 log.warn("failed to create tab err={}", .{err});
             };
             return true;
@@ -2569,7 +2647,11 @@ fn frameWndProc(
                 .none => {},
                 .tab => |index| switchTab(window, index),
                 .close => |index| closeTabAt(window, index),
-                .add => _ = window.app.newTab(window, .tab, null) catch |err| {
+                .add => _ = window.app.newTab(
+                    window,
+                    .tab,
+                    newTabProfile(window.app, window),
+                ) catch |err| {
                     log.warn("failed to create tab err={}", .{err});
                 },
             }
