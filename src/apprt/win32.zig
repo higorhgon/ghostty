@@ -421,6 +421,29 @@ const w32 = struct {
     pub const GL_SCISSOR_TEST: u32 = 0x0C11;
     pub const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 
+    // Fixed-function entry points, used only to dim unfocused panes. They
+    // are available because the context comes from wglCreateContext, which
+    // is a compatibility context -- the alternative would be compiling a
+    // shader and managing a VAO just to draw one rectangle.
+    pub const GL_BLEND: u32 = 0x0BE2;
+    pub const GL_DEPTH_TEST: u32 = 0x0B71;
+    pub const GL_TEXTURE_2D: u32 = 0x0DE1;
+    pub const GL_SRC_ALPHA: u32 = 0x0302;
+    pub const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
+    pub const GL_QUADS: u32 = 0x0007;
+    pub const GL_PROJECTION: u32 = 0x1701;
+    pub const GL_MODELVIEW: u32 = 0x1700;
+    pub extern "opengl32" fn glBlendFunc(sfactor: u32, dfactor: u32) callconv(.winapi) void;
+    pub extern "opengl32" fn glBegin(mode: u32) callconv(.winapi) void;
+    pub extern "opengl32" fn glEnd() callconv(.winapi) void;
+    pub extern "opengl32" fn glVertex2f(x: f32, y: f32) callconv(.winapi) void;
+    pub extern "opengl32" fn glColor4f(r: f32, g: f32, b: f32, a: f32) callconv(.winapi) void;
+    pub extern "opengl32" fn glMatrixMode(mode: u32) callconv(.winapi) void;
+    pub extern "opengl32" fn glPushMatrix() callconv(.winapi) void;
+    pub extern "opengl32" fn glPopMatrix() callconv(.winapi) void;
+    pub extern "opengl32" fn glLoadIdentity() callconv(.winapi) void;
+    pub extern "opengl32" fn glOrtho(l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) callconv(.winapi) void;
+
     pub inline fn LOWORD(l: anytype) u16 {
         return @truncate(@as(usize, @bitCast(@as(isize, @intCast(l)))) & 0xFFFF);
     }
@@ -1499,7 +1522,90 @@ fn reflow(window: *Window) void {
     }
     w32.glDisable(w32.GL_SCISSOR_TEST);
 
+    dimUnfocusedPanes(window, tab, win_width, win_height);
+
     _ = w32.SwapBuffers(window.hdc);
+}
+
+/// Darkens every pane of a split except the focused one.
+///
+/// This is the apprt's job, not the renderer's: macOS and GTK both draw
+/// the dim in their UI layer (a SwiftUI view, a GTK overlay) rather than
+/// asking the renderer for it, so there is nothing to inherit here.
+///
+/// Drawn after every pane has presented and before the buffer swap, as one
+/// translucent quad per unfocused pane in window coordinates. Fixed
+/// function rather than a shader: the context is a compatibility one, and
+/// the alternative is compiling a program and managing a VAO to draw a
+/// rectangle.
+fn dimUnfocusedPanes(
+    window: *Window,
+    tab: *Tab,
+    win_width: i32,
+    win_height: i32,
+) void {
+    // Nothing to distinguish when there is only one pane.
+    if (tab.panes.items.len < 2) return;
+
+    const opacity = window.app.config.@"unfocused-split-opacity";
+    if (opacity >= 1.0) return;
+    const alpha: f32 = @floatCast(1.0 - opacity);
+
+    // The renderer leaves its own program bound. Immediate mode ignores
+    // it only if nothing is bound, so it has to go -- glUseProgram is a
+    // GL 2.0 entry point and opengl32.dll only exports GL 1.1, hence the
+    // lookup.
+    const use_program: *const fn (u32) callconv(.winapi) void = @ptrCast(
+        w32.wglGetProcAddress("glUseProgram") orelse return,
+    );
+    use_program(0);
+
+    w32.glViewport(0, 0, win_width, win_height);
+    w32.glMatrixMode(w32.GL_PROJECTION);
+    w32.glPushMatrix();
+    w32.glLoadIdentity();
+    // Y grows downward, matching the RECTs below.
+    w32.glOrtho(0, @floatFromInt(win_width), @floatFromInt(win_height), 0, -1, 1);
+    w32.glMatrixMode(w32.GL_MODELVIEW);
+    w32.glPushMatrix();
+    w32.glLoadIdentity();
+
+    w32.glDisable(w32.GL_DEPTH_TEST);
+    w32.glDisable(w32.GL_TEXTURE_2D);
+    w32.glEnable(w32.GL_BLEND);
+    w32.glBlendFunc(w32.GL_SRC_ALPHA, w32.GL_ONE_MINUS_SRC_ALPHA);
+
+    // Black unless the user named a fill colour. Compositing the
+    // *background* colour over a pane already painted in it is a no-op,
+    // which is what "dim" must not be.
+    const fill = window.app.config.@"unfocused-split-fill";
+    w32.glColor4f(
+        if (fill) |f| @as(f32, @floatFromInt(f.r)) / 255.0 else 0,
+        if (fill) |f| @as(f32, @floatFromInt(f.g)) / 255.0 else 0,
+        if (fill) |f| @as(f32, @floatFromInt(f.b)) / 255.0 else 0,
+        alpha,
+    );
+
+    w32.glBegin(w32.GL_QUADS);
+    for (tab.panes.items, 0..) |pane, i| {
+        if (i == tab.focused) continue;
+        const r = pane.last_rect;
+        const l: f32 = @floatFromInt(r.left);
+        const t: f32 = @floatFromInt(r.top);
+        const rr: f32 = @floatFromInt(r.right);
+        const b: f32 = @floatFromInt(r.bottom);
+        w32.glVertex2f(l, t);
+        w32.glVertex2f(rr, t);
+        w32.glVertex2f(rr, b);
+        w32.glVertex2f(l, b);
+    }
+    w32.glEnd();
+
+    w32.glDisable(w32.GL_BLEND);
+    w32.glPopMatrix();
+    w32.glMatrixMode(w32.GL_PROJECTION);
+    w32.glPopMatrix();
+    w32.glMatrixMode(w32.GL_MODELVIEW);
 }
 
 fn invalidateTabBar(window: *Window) void {
