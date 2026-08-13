@@ -1277,6 +1277,24 @@ fn newPane(
         .last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     };
 
+    // Give the surface its real size *before* the core starts the shell.
+    //
+    // getSize reads last_rect, and reflow is what fills that in -- which
+    // happens after this returns. So the pty was created at the wrong size
+    // and resized a moment later, often after the shell had already
+    // printed its banner and prompt. ConPTY re-wraps on resize, and that
+    // is what left the cursor a line below the prompt, or the prompt
+    // reduced to a bare ">", or the pane blank. Which of those you got
+    // depended on where the shell's output landed relative to the resize,
+    // which is why it came and went.
+    //
+    // A split's rect is not known until the split exists, so it still
+    // takes the full area here and is corrected by the reflow that
+    // follows -- no worse than before, and it is not the case that races.
+    if (w32.GetClientRect(window.gl_hwnd, &surf.last_rect) == w32.FALSE) {
+        surf.last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    }
+
     try self.core_app.addSurface(surf);
     errdefer self.core_app.deleteSurface(surf);
 
