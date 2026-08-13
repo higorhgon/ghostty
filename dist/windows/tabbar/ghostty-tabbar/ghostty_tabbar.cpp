@@ -68,6 +68,13 @@ void Log(const char* fmt, ...) {
 // a public metric, so it's mirrored from the TabView default style.
 constexpr int32_t kTabStripHeight96 = 40;
 
+// Geometry of the buttons trailing the tabs, measured off Windows
+// Terminal's strip at 100% scaling so the chevron lines up with the "+"
+// WinUI draws inside the TabView. See where the chevron is built.
+constexpr double kFooterButtonHeight = 24;
+constexpr double kFooterButtonBottomGap = 3;
+constexpr double kChevronWidth = 26;
+
 // Application + metadata provider.
 //
 // The ordering inside the constructor is load-bearing and was the single
@@ -711,9 +718,26 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // DropDownButton renders its own chevron glyph, so it deliberately
         // gets no Content: supplying a FontIcon here stacks a second glyph
         // beside the built-in one.
+        //
+        // Geometry mirrors the "+" so the two read as one split button
+        // rather than two unrelated controls. Measured off Windows
+        // Terminal at 100% scaling: its "+" occupies a 32x24 box sitting
+        // 3px off the bottom of a 39px strip, and its chevron is the same
+        // height immediately to the right.
+        //
+        // Bottom, not Stretch: the add button is bottom-aligned inside the
+        // TabView template (it lines up with the tabs, which grow from the
+        // bottom), so a stretched chevron is both too tall and centred
+        // 4px higher than the "+" beside it.
         MUX::Controls::DropDownButton chevron;
-        chevron.Padding(WUX::ThicknessHelper::FromLengths(10, 0, 10, 0));
-        chevron.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+        chevron.Width(kChevronWidth);
+        chevron.MinWidth(0);
+        chevron.Height(kFooterButtonHeight);
+        chevron.MinHeight(0);
+        chevron.Padding(WUX::ThicknessHelper::FromUniformLength(0));
+        chevron.VerticalAlignment(WUX::VerticalAlignment::Bottom);
+        chevron.Margin(WUX::ThicknessHelper::FromLengths(0, 0, 0, kFooterButtonBottomGap));
+        chevron.CornerRadius(WUX::CornerRadiusHelper::FromUniformRadius(4));
         // Flat, like the "+" beside it -- the default button chrome draws
         // a filled box that reads as out of place in a title bar.
         chevron.Background(WUX::Media::SolidColorBrush(
@@ -724,18 +748,16 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         chevron.Click([bar](auto&&, auto&&) { ShowProfileMenu(bar); });
         bar->chevron = chevron;
 
-        // Windows Terminal separates "+" from the profile chevron with a
-        // hairline rule; without it the two read as one wide button.
-        WUX::Controls::Border separator;
-        separator.Width(1);
-        separator.Margin(WUX::ThicknessHelper::FromLengths(2, 10, 2, 10));
-        separator.Background(WUX::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{60, 255, 255, 255}));
-
+        // Deliberately no separator between "+" and the chevron. An
+        // earlier version drew a hairline rule here, on the assumption
+        // Windows Terminal had one. Sampling its strip shows it does not:
+        // at rest the two buttons are bare glyphs on the strip, and the
+        // only edge that ever appears is the rounded hover highlight on
+        // whichever half the pointer is over. A standing rule reads as a
+        // border around nothing, which is exactly how it looked.
         WUX::Controls::StackPanel footer;
         footer.Orientation(WUX::Controls::Orientation::Horizontal);
-        footer.VerticalAlignment(WUX::VerticalAlignment::Stretch);
-        footer.Children().Append(separator);
+        footer.VerticalAlignment(WUX::VerticalAlignment::Bottom);
         footer.Children().Append(chevron);
         tv.TabStripFooter(footer);
 
