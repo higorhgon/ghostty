@@ -1,0 +1,156 @@
+on:
+  # Pushing a tag is the way to cut a release:
+  #
+  #   git tag windows-v1.4.1.1 && git push origin windows-v1.4.1.1
+  #
+  # The first three numbers are the Ghostty version the build reports, and
+  # all four are the MSIX package version, which Windows compares to decide
+  # whether an install is an upgrade. The fourth may be left off (it is then
+  # 0) and exists so the same Ghostty version can be released more than once.
+  push:
+    tags:
+      - "windows-v[0-9]+.[0-9]+.[0-9]+"
+      - "windows-v[0-9]+.[0-9]+.[0-9]+.[0-9]+"
+
+  # Manual runs build the chosen branch and tag it. GitHub only offers this
+  # for workflows that exist on the default branch.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release, e.g. windows-v1.4.1.1"
+        required: true
+
+name: Release Windows
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release the MSIX
+    # Not windows-latest: the tab bar's C++/WinRT projection is generated
+    # from the Windows SDK, and this image is known to carry 10.0.22621.0,
+    # which it was developed against.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve versions
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^windows-v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$') {
+            throw "tag '$env:TAG' is not of the form windows-vX.Y.Z or windows-vX.Y.Z.N"
+          }
+          $app = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          $rev = if ($Matches[4]) { $Matches[4] } else { "0" }
+          "app=$app" >> $env:GITHUB_OUTPUT
+          "msix=$app.$rev" >> $env:GITHUB_OUTPUT
+          Write-Host "Ghostty $app, package $app.$rev"
+
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      # The version is given explicitly. Left to detect it from git, the
+      # build insists that any tag on the commit be exactly vX.Y.Z, which a
+      # windows-v tag is not.
+      - name: Build Ghostty
+        shell: pwsh
+        run: >
+          zig build
+          -Dapp-runtime=win32
+          -Dtarget=x86_64-windows-msvc
+          -Doptimize=ReleaseFast
+          -Dversion-string=${{ steps.version.outputs.app }}
+
+      - name: Fetch tab bar dependencies
+        shell: pwsh
+        run: .\dist\windows\tabbar\fetch-deps.ps1
+
+      - name: Build tab bar
+        shell: cmd
+        run: dist\windows\tabbar\ghostty-tabbar\build.bat
+
+      - name: Stage MSIX layout
+        shell: pwsh
+        run: |
+          .\dist\windows\msix\stage.ps1 -NoRegister
+          $manifest = "dist\windows\msix\layout\AppxManifest.xml"
+          $xml = Get-Content $manifest -Raw
+          $new = [regex]::Replace(
+            $xml,
+            '(<Identity\b[^>]*?\bVersion=")[^"]*(")',
+            "`${1}${{ steps.version.outputs.msix }}`${2}")
+          if ($new -eq $xml) { throw "could not set the package version in $manifest" }
+          Set-Content $manifest $new -NoNewline -Encoding utf8
+
+      # Windows will not install an MSIX unless it is signed by a
+      # certificate the machine trusts. With the WINDOWS_PFX_BASE64 and
+      # WINDOWS_PFX_PASSWORD secrets set, every release is signed by that
+      # one certificate, so users trust it once. Without them a throwaway
+      # self-signed certificate is made for this release alone, and its
+      # public half is published next to the package to be trusted by hand.
+      - name: Package and sign
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          $out = New-Item -ItemType Directory -Force release
+          $pfx = Join-Path $env:RUNNER_TEMP "GhosttyCert.pfx"
+          $cer = Join-Path $out "Ghostty.cer"
+          $msix = Join-Path $out "Ghostty-${{ steps.version.outputs.msix }}-x64.msix"
+
+          if ($env:PFX_BASE64) {
+            Write-Host "Signing with the certificate from the repository secrets."
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+            $env:GHOSTTY_PFX_PASSWORD = $env:PFX_PASSWORD
+            $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:PFX_PASSWORD)
+            [IO.File]::WriteAllBytes($cer, $cert.Export('Cert'))
+          } else {
+            Write-Host "No certificate secret: signing with a throwaway self-signed certificate."
+            $env:GHOSTTY_PFX_PASSWORD = [guid]::NewGuid().ToString()
+          }
+
+          try {
+            .\dist\windows\msix\package.ps1 -CertPath $pfx -PublicCertPath $cer -OutFile $msix
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          Ghostty ${{ steps.version.outputs.app }} for Windows, with the native WinUI tab strip.
+
+          ## Installing
+
+          1. Download ``Ghostty.cer`` and the ``.msix`` below.
+          2. Trust the certificate, once, from an elevated prompt:
+             ``certutil -addstore TrustedPeople Ghostty.cer``
+          3. Double-click the ``.msix`` and choose Install.
+
+          Windows 10 1809 or later, x64. The package is signed with a self-signed
+          certificate, which is why step 2 is needed.
+          "@
+          $notes | Set-Content notes.md -Encoding utf8
+
+          gh release create $env:TAG `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title "Ghostty for Windows ${{ steps.version.outputs.msix }}" `
+            --notes-file notes.md `
+            (Get-ChildItem release -File | ForEach-Object FullName)
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

@@ -21,6 +21,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# The .pfx password is asked for, unless GHOSTTY_PFX_PASSWORD is set --
+# which is how this runs unattended in CI. An environment variable rather
+# than a parameter, so that it never shows up in a command line.
+function Get-PfxPassword($prompt) {
+    if ($env:GHOSTTY_PFX_PASSWORD) {
+        return ConvertTo-SecureString $env:GHOSTTY_PFX_PASSWORD -AsPlainText -Force
+    }
+    return Read-Host $prompt -AsSecureString
+}
+
 $layout = Join-Path $PSScriptRoot "layout"
 
 if (-not (Test-Path (Join-Path $layout "AppxManifest.xml"))) {
@@ -30,7 +41,7 @@ if (-not (Test-Path (Join-Path $layout "AppxManifest.xml"))) {
 # --- 1. Certificate (create once, reuse on every later run) ---
 if (-not (Test-Path $CertPath)) {
     Write-Host "No signing certificate found -- generating one..."
-    $pw = Read-Host "Set a password to protect the new .pfx" -AsSecureString
+    $pw = Get-PfxPassword "Set a password to protect the new .pfx"
     $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=Ghostty" `
         -KeyUsage DigitalSignature -FriendlyName "Ghostty Terminal" `
         -CertStoreLocation "Cert:\CurrentUser\My" `
@@ -56,12 +67,14 @@ if (-not $signtool) { throw "signtool.exe not found -- install the Windows SDK" 
 if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
 Write-Host "Packing $OutFile..."
 & $makeappx.FullName pack /d $layout /p $OutFile /o
+if ($LASTEXITCODE -ne 0) { throw "makeappx failed with exit code $LASTEXITCODE" }
 
 # --- 4. Sign ---
 Write-Host "Signing..."
-$pw = Read-Host "Enter the .pfx password" -AsSecureString
+$pw = Get-PfxPassword "Enter the .pfx password"
 $plainPw = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw))
 & $signtool.FullName sign /fd SHA256 /a /f $CertPath /p $plainPw $OutFile
+if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE" }
 
 Write-Host ""
 Write-Host "Done: $OutFile"

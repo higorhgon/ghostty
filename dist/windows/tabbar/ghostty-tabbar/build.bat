@@ -4,13 +4,29 @@ setlocal
 
 set BASE=%~dp0..
 set PROJ=%BASE%\projection
-set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 
-call "%VCVARS%" >nul
+REM Already inside a developer prompt: use that toolchain as it is.
+where cl >nul 2>nul
+if not errorlevel 1 goto have_msvc
+
+REM Otherwise ask vswhere, which finds Build Tools and full Visual Studio
+REM alike, whatever the edition or year -- a CI runner has Enterprise where
+REM a development machine may only have Build Tools.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSROOT="
+if exist "%VSWHERE%" for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+if not defined VSROOT (
+  echo FATAL: no Visual Studio installation with the C++ tools was found
+  exit /b 1
+)
+
+call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (
   echo FATAL: could not initialize MSVC environment
   exit /b 1
 )
+
+:have_msvc
 
 cd /d "%~dp0"
 
