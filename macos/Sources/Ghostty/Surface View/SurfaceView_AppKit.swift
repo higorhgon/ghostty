@@ -201,9 +201,9 @@ extension Ghostty {
         /// Temporary lead surrogate that's waiting for the trail
         private var leadSurrogate: LeadSurrogate?
 
-        // True when we've consumed a left mouse-down only to move focus and
-        // should suppress the matching mouse-up from being reported.
-        private var suppressNextLeftMouseUp: Bool = false
+        // True when this click only activates the split. Don't send the mouse-down
+        // or matching mouse-up to the terminal.
+        private var suppressLeftMouseUntilRelease: Bool = false
 
         // A small delay that is introduced before a title change to avoid flickers
         private var titleChangeTimer: Timer?
@@ -451,7 +451,7 @@ extension Ghostty {
             // our mouse release event leaving the surface can properly be
             // sent to stop things like mouse selection.
             if !focused {
-                suppressNextLeftMouseUp = false
+                suppressLeftMouseUntilRelease = false
             }
 
             // Notify libghostty
@@ -568,6 +568,8 @@ extension Ghostty {
             NSCursor.setHiddenUntilMouseMoves(!visible)
         }
 
+        // MARK: - Title
+
         /// Set the title by prompting the user.
         func promptTitle() {
             // Create an alert dialog
@@ -596,18 +598,7 @@ extension Ghostty {
 
                 // Get the input text
                 let newTitle = textField.stringValue
-                if newTitle.isEmpty {
-                    // Empty means that user wants the title to be set automatically
-                    // We also need to reload the config for the "title" property to be
-                    // used again by this tab.
-                    let prevTitle = titleFromTerminal ?? "👻"
-                    titleFromTerminal = nil
-                    setTitle(prevTitle)
-                } else {
-                    // Set the title and prevent it from being changed automatically
-                    titleFromTerminal = title
-                    title = newTitle
-                }
+                self.titleOverride = newTitle.isEmpty ? nil : newTitle
             }
 
             // We prefer to run our alert in a sheet modal if we have a window.
@@ -618,6 +609,34 @@ extension Ghostty {
                 // visible. The above codepath should be taken most times but I'm just
                 // noting this as something I noticed consistently.
                 completionHandler(alert.runModal())
+            }
+        }
+
+        /// An override title for the surface set by the user or via AppleScript.
+        /// When set, this takes precedence over the title reported by pty.
+        /// This computed property is placed here for code locality.
+        var titleOverride: String? {
+            get {
+                titleFromTerminal != nil ? title : nil
+            }
+
+            set {
+                if let newValue, !newValue.isEmpty {
+                    // Set the title and prevent it from being changed automatically
+                    if titleFromTerminal == nil {
+                        // Only capture titleFromTerminal from pty, skip if it was set before by the user
+                        titleFromTerminal = title
+                    }
+                    title = newValue
+                    return
+                }
+
+                // Otherwise, set the title to be updated automatically
+                // We also need to reload the config for the "title" property to be
+                // used again by this surface, but only restore if an override was actually active.
+                guard let prevTitle = titleFromTerminal else { return }
+                titleFromTerminal = nil
+                setTitle(prevTitle)
             }
         }
 
@@ -681,7 +700,7 @@ extension Ghostty {
 
             // We always assume that we're resetting our mouse suppression
             // unless we see the specific scenario below to set it.
-            suppressNextLeftMouseUp = false
+            suppressLeftMouseUntilRelease = false
 
             // If we're already the first responder then no focus transfer is
             // happening, so the click should continue as normal.
@@ -690,13 +709,8 @@ extension Ghostty {
             }
 
             // If our window/app is already focused, then this click is only
-            // being used to transfer split focus. Consume it so it does not
-            // get forwarded to the terminal as a mouse click.
-            if NSApp.isActive && window.isKeyWindow {
-                window.makeFirstResponder(self)
-                suppressNextLeftMouseUp = true
-                return nil
-            }
+            // being used to transfer split focus.
+            suppressLeftMouseUntilRelease = NSApp.isActive && window.isKeyWindow
 
             // Make ourselves the first responder
             window.makeFirstResponder(self)
@@ -704,6 +718,10 @@ extension Ghostty {
             // We have to keep processing the event so that AppKit can properly
             // focus the window and dispatch events. If you return nil here then
             // nobody gets a windowDidBecomeKey event and so on.
+            // Let AppKit process the click so subsequent mouse events go to this split.
+            // Changing the first responder alone only updates keyboard focus.
+            // When suppressLeftMouseUntilRelease is true, mouseDown/mouseUp receive
+            // the press and release but don't forward them to the terminal.
             return event
         }
 
@@ -901,6 +919,9 @@ extension Ghostty {
         }
 
         override func mouseDown(with event: NSEvent) {
+            // A focus-only click activates the split without sending input to the terminal.
+            // mouseUp suppresses the matching release.
+            if suppressLeftMouseUntilRelease { return }
             guard let surface = self.surface else { return }
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
@@ -909,8 +930,8 @@ extension Ghostty {
         override func mouseUp(with event: NSEvent) {
             // If this mouse-up corresponds to a focus-only click transfer,
             // suppress it so we don't emit a release without a press.
-            if suppressNextLeftMouseUp {
-                suppressNextLeftMouseUp = false
+            if suppressLeftMouseUntilRelease {
+                suppressLeftMouseUntilRelease = false
                 return
             }
 
@@ -1212,7 +1233,7 @@ extension Ghostty {
                         continue
                     }
 
-                    _ = committedPreeditTextAction(action, text: text)
+                    _ = committedTextAction(action, text: text)
                 }
 
                 if shouldReplayCommittedPreeditKey(translationEvent) {
@@ -1484,11 +1505,7 @@ extension Ghostty {
             var key_ev = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
             key_ev.composing = composing
 
-            // For text, we only encode UTF8 if we don't have a single control
-            // character. Control characters are encoded by Ghostty itself.
-            // Without this, `ctrl+enter` does the wrong thing.
-            if let text, text.count > 0,
-               let codepoint = text.utf8.first, codepoint >= 0x20 {
+            if let text = text?.keyEventText {
                 return text.withCString { ptr in
                     key_ev.text = ptr
                     return ghostty_surface_key(surface, key_ev)
@@ -1512,7 +1529,7 @@ extension Ghostty {
             }
         }
 
-        private func committedPreeditTextAction(
+        private func committedTextAction(
             _ action: ghostty_input_action_e,
             text: String
         ) -> Bool {
@@ -1618,6 +1635,9 @@ extension Ghostty {
             item.setImageIfDesired(systemSymbolName: "rectangle.bottomhalf.inset.filled")
             item = menu.addItem(withTitle: "Split Up", action: #selector(splitUp(_:)), keyEquivalent: "")
             item.setImageIfDesired(systemSymbolName: "rectangle.tophalf.inset.filled")
+            menu.addItem(.separator())
+            item = menu.addItem(withTitle: "Close Split", action: #selector(closeSurface(_:)), keyEquivalent: "")
+            item.setImageIfDesired(systemSymbolName: "xmark.rectangle")
 
             menu.addItem(.separator())
             item = menu.addItem(withTitle: "Reset Terminal", action: #selector(resetTerminal(_:)), keyEquivalent: "")
@@ -1745,6 +1765,14 @@ extension Ghostty {
             ghostty_surface_split(surface, GHOSTTY_SPLIT_DIRECTION_UP)
         }
 
+        @IBAction func closeSurface(_ sender: Any?) {
+            guard let surface = self.surface else { return }
+            let action = "close_surface"
+            if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
+            }
+        }
+
         @objc func resetTerminal(_ sender: Any) {
             guard let surface = self.surface else { return }
             let action = "reset"
@@ -1787,26 +1815,36 @@ extension Ghostty {
 
             // Note the callback may be executed on a background thread as documented
             // so we need @MainActor since we're reading/writing view state.
-            UNUserNotificationCenter.current().add(request) { @MainActor error in
-                if let error = error {
-                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
-                    return
-                }
+            // We use [weak self] here because we don't want to extend the surface's
+            // lifetime when a notification is triggered right before the surface closes.
+            Task { @MainActor [weak self] in
+                do {
+                    try await UNUserNotificationCenter.current().add(request)
 
-                // We need to keep track of this notification so we can remove it
-                // under certain circumstances
-                self.notificationIdentifiers.insert(uuid)
+                    guard let focused = self?.focused else {
+                        // We remove the notification if the surface is deallocated.
+                        UNUserNotificationCenter.current()
+                            .removeDeliveredNotifications(withIdentifiers: [uuid])
+                        return
+                    }
 
-                // If we're focused then we schedule to remove the notification
-                // after a few seconds. If we gain focus we automatically remove it
-                // in focusDidChange.
-                if self.focused {
-                    Task { @MainActor [weak self] in
-                        try await Task.sleep(for: .seconds(3))
+                    // We need to keep track of this notification so we can remove it
+                    // under certain circumstances
+                    self?.notificationIdentifiers.insert(uuid)
+
+                    // If we're focused then we schedule to remove the notification
+                    // after a few seconds. If we gain focus we automatically remove it
+                    // in focusDidChange.
+                    if focused {
+                        // If the suspension is failed, we remove the notification anyway.
+                        try? await Task.sleep(for: .seconds(3))
                         self?.notificationIdentifiers.remove(uuid)
+                        // We remove the notification if the surface is deallocated while we wait.
                         UNUserNotificationCenter.current()
                             .removeDeliveredNotifications(withIdentifiers: [uuid])
                     }
+                } catch {
+                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
                 }
             }
         }
@@ -2043,7 +2081,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             x += cellSize.width * Double(range.location + range.length)
         }
         // Ghostty coordinates are in top-left (0, 0) so we have to convert to
-        // bottom-left since that is what UIKit expects
+        // bottom-left since that is what AppKit expects
         // when there's is no characters selected,
         // width should be 0 so that dictation indicator
         // can start in the right place
@@ -2064,7 +2102,6 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         // We must have an associated event
         guard NSApp.currentEvent != nil else { return }
-        guard let surfaceModel else { return }
 
         // We want the string view of the any value
         var chars = ""
@@ -2090,8 +2127,6 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
-        let hadMarkedText = hasMarkedText()
-
         // If insertText is called, our preedit must be over.
         unmarkText()
 
@@ -2103,14 +2138,11 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
-        if hadMarkedText, !chars.isEmpty {
-            // Send preedit commits as key events instead of raw text for
-            // keybind interpretation by programs.
-            _ = committedPreeditTextAction(GHOSTTY_ACTION_PRESS, text: chars)
-            return
+        // All committed text (IME, dictation, etc.) must be sent as key
+        // events so programs treat it as typed input, never as a paste.
+        if !chars.isEmpty {
+            _ = committedTextAction(GHOSTTY_ACTION_PRESS, text: chars)
         }
-
-        surfaceModel.sendText(chars)
     }
 
     /// This function needs to exist for two reasons:
@@ -2199,7 +2231,7 @@ extension Ghostty.SurfaceView: NSServicesMenuRequestor {
             // validateRequestor is called a LOT and we want to prevent unnecessary
             // performance hits because `ghostty_surface_has_selection` isn't free.
             if let sendType, sendableRequiresSelection.contains(sendType) {
-                if surface == nil || !ghostty_surface_has_selection(surface) {
+                guard let surface, ghostty_surface_has_selection(surface) else {
                     return super.validRequestor(forSendType: sendType, returnType: returnType)
                 }
             }
@@ -2227,6 +2259,7 @@ extension Ghostty.SurfaceView: NSServicesMenuRequestor {
     }
 
     func readSelection(from pboard: NSPasteboard) -> Bool {
+        guard let surface = self.surface else { return false }
         guard let str = pboard.getOpinionatedStringContents() else { return false }
 
         let len = str.utf8CString.count
@@ -2300,10 +2333,9 @@ extension Ghostty.SurfaceView {
 
         if let content {
             DispatchQueue.main.async {
-                self.insertText(
-                    content,
-                    replacementRange: NSRange(location: 0, length: 0)
-                )
+                // Dropped text is untrusted, so it goes through the same
+                // paste protection as a clipboard paste.
+                self.surfaceModel?.pasteText(content)
             }
             return true
         }

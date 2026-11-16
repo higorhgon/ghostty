@@ -23,6 +23,8 @@ const input = @import("../input.zig");
 const global = @import("../global.zig");
 const internal_os = @import("../os/main.zig");
 const tabbar = @import("win32/tabbar.zig");
+const gl = @import("opengl");
+const wgl = @import("../renderer/OpenGL.zig").wgl;
 
 const log = std.log.scoped(.win32);
 
@@ -469,13 +471,6 @@ const gl_class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyGLClass");
 /// This is the main entrypoint to the apprt for Ghostty on Windows.
 pub const App = @This();
 
-/// See gtk apprt for the rationale: since our GL context stays current
-/// on the main thread for the lifetime of the app (we never hand it off
-/// to the renderer thread), all actual GL draw calls must also happen on
-/// the main thread. The renderer thread just requests a redraw via the
-/// app mailbox, which we service in our own message loop.
-pub const must_draw_from_app_thread = true;
-
 /// Entry point for the GUI subsystem, which is what keeps Windows from
 /// giving this process a console at all.
 ///
@@ -520,6 +515,17 @@ hinstance: w32.HINSTANCE,
 main_thread_id: w32.DWORD,
 quitting: bool = false,
 
+/// The root of the GL share group. Each pane's renderer draws on its own
+/// thread, in its own context, and leaves its finished frame in a
+/// texture; each window composites those textures in its own context on
+/// the main thread. Sharing with this one context is what puts them all
+/// in one group, so that the textures cross over. It is never made
+/// current and never draws.
+gl_root: wgl.Context,
+/// Whether the main thread's GL function pointers have been loaded,
+/// which takes a current context and so waits for the first window.
+gl_loaded: bool = false,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -553,15 +559,20 @@ pub fn init(
     var config = try Config.load(core_app.alloc);
     errdefer config.deinit();
 
+    const gl_root = try wgl.Context.create(null);
+    errdefer gl_root.destroy();
+
     self.* = .{
         .core_app = core_app,
         .config = config,
         .hinstance = hinstance,
         .main_thread_id = w32.GetCurrentThreadId(),
+        .gl_root = gl_root,
     };
 }
 
 pub fn terminate(self: *App) void {
+    self.gl_root.destroy();
     self.config.deinit();
 }
 
@@ -757,6 +768,9 @@ pub const Window = struct {
     gl_hwnd: w32.HWND,
     hdc: w32.HDC,
     hglrc: w32.HGLRC,
+    /// What a pane's frame is attached to in order to be copied into the
+    /// window. Framebuffer objects are per context, hence per window.
+    read_fbo: ?gl.Framebuffer = null,
     tabs: std.ArrayListUnmanaged(*Tab) = .empty,
     active: usize = 0,
     /// What the mouse is currently hovering in the tab strip, if anything.
@@ -1225,21 +1239,20 @@ fn newWindow(self: *App) !*Window {
     const hdc = w32.GetDC(gl_hwnd) orelse return error.Unexpected;
     window.hdc = hdc;
 
-    var pfd: w32.PIXELFORMATDESCRIPTOR = .{
-        .dwFlags = w32.PFD_DRAW_TO_WINDOW | w32.PFD_SUPPORT_OPENGL | w32.PFD_DOUBLEBUFFER,
-        .iPixelType = w32.PFD_TYPE_RGBA,
-        .cColorBits = 32,
-        .cDepthBits = 24,
-        .cStencilBits = 8,
-        .iLayerType = w32.PFD_MAIN_PLANE,
-    };
-    const format = w32.ChoosePixelFormat(hdc, &pfd);
-    if (format == 0) return error.Unexpected;
-    if (w32.SetPixelFormat(hdc, format, &pfd) == w32.FALSE) return error.Unexpected;
+    // The renderers' pixel format, which sharing with them requires.
+    try wgl.setPixelFormat(@ptrCast(hdc));
 
     const hglrc = w32.wglCreateContext(hdc) orelse return error.Unexpected;
     window.hglrc = hglrc;
+    // Before the context has any objects of its own, as it must be.
+    try wgl.share(self.gl_root.hglrc, @ptrCast(hglrc));
     if (w32.wglMakeCurrent(hdc, hglrc) == w32.FALSE) return error.Unexpected;
+
+    if (!self.gl_loaded) {
+        _ = try wgl.loadGlad();
+        self.gl_loaded = true;
+    }
+    window.read_fbo = try gl.Framebuffer.create();
 
     _ = try self.newTab(window, .window, newTabProfile(self, window));
 
@@ -1327,7 +1340,6 @@ fn newPane(
 /// already running, or for one whose start already failed.
 fn startPane(self: *App, surf: *Surface) !void {
     const pending = surf.pending orelse return;
-    const window = surf.tab.window;
     const alloc = self.core_app.alloc;
 
     // Consume the pending start *before* bringing the core up, not after.
@@ -1364,11 +1376,9 @@ fn startPane(self: *App, surf: *Surface) !void {
     if (pending.argv) |a| if (a.len > 0) {
         const arena = config._arena.?.allocator();
         const owned = try arena.alloc([:0]const u8, a.len);
-        for (a, owned) |src, *dst| dst.* = try arena.dupeZ(u8, src);
+        for (a, owned) |src, *dst| dst.* = try arena.dupeSentinel(u8, src, 0);
         config.command = .{ .direct = owned };
     };
-
-    if (w32.wglMakeCurrent(window.hdc, window.hglrc) == w32.FALSE) return error.Unexpected;
 
     try CoreSurface.init(
         &surf.core_surface,
@@ -1782,25 +1792,12 @@ fn reflow(window: *Window) void {
             .height = @intCast(h),
         }) catch |err| log.warn("sizeCallback failed err={}", .{err});
 
-        // NOTE: we deliberately do NOT set glViewport/glScissor here.
-        // Each pane's drawFrame renders into its own appropriately-sized
-        // offscreen target (a separate FBO in its own (0,0)-(w,h) local
-        // coordinate space), so a window-space viewport/scissor would
-        // only corrupt that -- e.g. a scissor rect offset for the right
-        // pane has no overlap at all with the left pane's target's local
-        // coordinates, silently clipping away everything it tries to
-        // draw. The only place window position matters is *after*
-        // rendering, when the OpenGL renderer's present() blits the
-        // finished target onto the shared default framebuffer -- that's
-        // what present_offset_{x,y} is for (glBlitFramebuffer's
-        // destination rect is in absolute framebuffer pixels and ignores
-        // glViewport entirely).
-        const gl_y = win_height - rect.bottom;
-        pane.core_surface.renderer.api.present_offset_x = rect.left;
-        pane.core_surface.renderer.api.present_offset_y = gl_y;
-
-        pane.core_surface.renderer.drawFrame(true) catch |err| {
-            log.warn("drawFrame failed err={}", .{err});
+        // The pane's renderer draws on its own thread and leaves each
+        // finished frame in a texture this context shares. All that is
+        // left to do here is copy the latest one into place.
+        _ = pane.core_surface.renderer.takeFrame();
+        blitPane(window, pane, rect, win_height) catch |err| {
+            log.warn("failed to present pane err={}", .{err});
         };
     }
     w32.glDisable(w32.GL_SCISSOR_TEST);
@@ -1808,6 +1805,53 @@ fn reflow(window: *Window) void {
     dimUnfocusedPanes(window, tab, win_width, win_height);
 
     _ = w32.SwapBuffers(window.hdc);
+}
+
+/// Copy a pane's latest frame into the window's back buffer.
+///
+/// The frame is whatever size the pane was when the renderer drew it,
+/// which trails the pane's current rect by a frame or two during a
+/// resize. It is copied unscaled and anchored to the top left, where a
+/// terminal's content starts, so that a resize uncovers or crops the
+/// bottom and right edges rather than stretching the text.
+fn blitPane(
+    window: *Window,
+    pane: *Surface,
+    rect: w32.RECT,
+    win_height: i32,
+) !void {
+    const fbo = window.read_fbo orelse return;
+    const front = &pane.core_surface.renderer.api.front;
+    const frame = front.lock() orelse return;
+    defer front.unlock();
+
+    const w: i32 = @min(@as(i32, @intCast(frame.width)), rect.right - rect.left);
+    const h: i32 = @min(@as(i32, @intCast(frame.height)), rect.bottom - rect.top);
+    if (w <= 0 or h <= 0) return;
+
+    const bound = try fbo.bind(.read);
+    defer bound.unbind();
+    // Attached anew every time: the renderer reallocates the texture
+    // when the pane is resized, and an attachment made before that
+    // would go on referring to the old storage.
+    try bound.texture2D(.color0, .@"2d", frame.texture, 0);
+
+    // GL's origin is the bottom left, of the window and of the frame
+    // alike, so "top left" is the top `h` rows of each.
+    const src_y: i32 = @as(i32, @intCast(frame.height)) - h;
+    const dst_y: i32 = win_height - rect.top - h;
+    try gl.blitFramebuffer(
+        0,
+        src_y,
+        w,
+        src_y + h,
+        rect.left,
+        dst_y,
+        rect.left + w,
+        dst_y + h,
+        .{ .color_buffer_bit = true },
+        .nearest,
+    );
 }
 
 /// Darkens every pane of a split except the focused one.
@@ -2123,6 +2167,10 @@ pub const Surface = struct {
         _ = self;
     }
 
+    pub fn renderDeviceOptions(self: *const Surface) !@import("../renderer.zig").Device.Options {
+        return .{ .root = self.tab.window.app.gl_root.hglrc };
+    }
+
     pub fn core(self: *Surface) *CoreSurface {
         return &self.core_surface;
     }
@@ -2171,20 +2219,22 @@ pub const Surface = struct {
         self: *Surface,
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
-    ) !bool {
-        if (clipboard_type != .standard) return false;
+    ) !apprt.ClipboardReadResult {
+        if (clipboard_type != .standard) return .unsupported;
 
         const alloc = self.tab.window.app.core_app.alloc;
         const text = readClipboardUtf8(alloc) catch |err| {
             log.warn("failed to read clipboard err={}", .{err});
-            return false;
-        } orelse return false;
+            return .unavailable;
+        } orelse return .unavailable;
         defer alloc.free(text);
 
-        self.core_surface.completeClipboardRequest(state, text, false) catch |err| {
+        self.core_surface.completeClipboardRequest(state, .{
+            .contents = &.{.{ .mime = "text/plain", .data = text }},
+        }) catch |err| {
             log.warn("failed to complete clipboard request err={}", .{err});
         };
-        return true;
+        return .started;
     }
 
     pub fn setClipboard(
@@ -2282,8 +2332,8 @@ fn vkToKey(vk: u32) ?input.Key {
 
         // Letters and digits. Win32 reuses the ASCII values for these, and
         // both enums are contiguous, so the offset carries across.
-        'A'...'Z' => @enumFromInt(@as(c_int, @intFromEnum(input.Key.key_a)) + @as(c_int, @intCast(vk - 'A'))),
-        '0'...'9' => @enumFromInt(@as(c_int, @intFromEnum(input.Key.digit_0)) + @as(c_int, @intCast(vk - '0'))),
+        'A'...'Z' => @fromBackingInt(@intCast(@as(c_int, @backingInt(input.Key.key_a)) + @as(c_int, @intCast(vk - 'A')))),
+        '0'...'9' => @fromBackingInt(@intCast(@as(c_int, @backingInt(input.Key.digit_0)) + @as(c_int, @intCast(vk - '0')))),
 
         // OEM keys are positional, so these are the US layout's meanings.
         // A layout-correct mapping needs the scancode, but these only
@@ -2301,7 +2351,7 @@ fn vkToKey(vk: u32) ?input.Key {
         w32.VK_OEM_6 => .bracket_right,
         w32.VK_OEM_7 => .quote,
 
-        w32.VK_F1...(w32.VK_F1 + 23) => @enumFromInt(@as(c_int, @intFromEnum(input.Key.f1)) + @as(c_int, @intCast(vk - w32.VK_F1))),
+        w32.VK_F1...(w32.VK_F1 + 23) => @fromBackingInt(@intCast(@as(c_int, @backingInt(input.Key.f1)) + @as(c_int, @intCast(vk - w32.VK_F1)))),
         else => null,
     };
 }
@@ -2517,6 +2567,9 @@ fn frameWndProc(
             if (window.tab_bar) |bar| tabbar.ghostty_tabbar_destroy(bar);
             if (window.profiles.len > 0) tabbar.freeProfiles(alloc, window.profiles);
 
+            if (w32.wglMakeCurrent(window.hdc, window.hglrc) != w32.FALSE) {
+                if (window.read_fbo) |fbo| fbo.destroy();
+            }
             _ = w32.wglMakeCurrent(null, null);
             _ = w32.wglDeleteContext(window.hglrc);
             _ = w32.ReleaseDC(window.gl_hwnd, window.hdc);

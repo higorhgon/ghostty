@@ -4,6 +4,9 @@ Ghostty relies on downstream package maintainers to distribute Ghostty to
 end-users. This document provides guidance to package maintainers on how to
 package Ghostty for distribution.
 
+If you are packaging libghostty-vt, the terminal emulation library, see
+[`PACKAGING-LIBGHOSTTY.md`](PACKAGING-LIBGHOSTTY.md) instead.
+
 > [!IMPORTANT]
 >
 > This document is only accurate for the Ghostty source alongside it.
@@ -56,11 +59,16 @@ Zig releases often have breaking changes. Ghostty requires specific Zig versions
 depending on the Ghostty version in order to build. To make things easier for
 package maintainers, Ghostty always uses some _released_ version of Zig.
 
-To find the version of Zig required to build Ghostty, check the `required_zig`
-constant in `build.zig`. You don't need to know Zig to extract this information.
-This version will always be an official released version of Zig.
+To find the version of Zig required to build Ghostty, check the
+`minimum_zig_version` field in `build.zig.zon`. You don't need to know Zig
+to extract this information. This version will always be an official
+released version of Zig. The build stops with an error if your Zig doesn't
+match: the major and minor versions must be the same, and any patch
+version at least as new is accepted.
 
-For example, at the time of writing this document, Ghostty requires Zig 0.14.0.
+For example, at the time of writing this document, Ghostty requires Zig
+0.17.1. Zig 0.17.1 or any later 0.17.x works, but Zig 0.17.0, Zig 0.16 and
+Zig 0.18 do not.
 
 ## Building Ghostty
 
@@ -122,3 +130,11 @@ relevant to package maintainers:
   often necessary for system packages to specify a specific minimum Linux
   version, glibc, etc. Run `zig targets` to a get a full list of available
   targets.
+
+- `-Dinstalled-exe-path=$prefix/bin/ghostty`: The absolute path the
+  `ghostty` executable will be installed at, written into the desktop file,
+  D-Bus service and systemd user service on Linux. The build can't work this
+  out from `--prefix` itself. Without it, those files name the executable
+  alone (`ghostty`), and systemd only looks for that in standard directories
+  such as `/usr/bin` and `/usr/local/bin`. Set it for any other prefix, and
+  leave `DESTDIR` out of it.

@@ -4,6 +4,24 @@
 #include <string.h>
 #include <ghostty/vt.h>
 
+typedef struct {
+  FILE *file;
+  size_t written;
+} OutputWriter;
+
+static bool write_output(void *userdata, const uint8_t *data, size_t len) {
+  OutputWriter *output = userdata;
+  size_t offset = 0;
+  while (offset < len) {
+    size_t written = fwrite(data + offset, 1, len - offset, output->file);
+    output->written += written;
+    offset += written;
+    if (written == 0) return false;
+  }
+
+  return true;
+}
+
 int main() {
   // Create a terminal with a small grid
   GhosttyTerminal terminal;
@@ -14,8 +32,8 @@ int main() {
   // cursor movement and styling sequences.
   const char *commands[] = {
     "Line 1: Hello World!\r\n",           // Simple text on row 1
-    "Line 2: \033[1mBold\033[0m and "     // Bold text on row 2
-      "\033[4mUnderline\033[0m\r\n",
+    ("Line 2: \033[1mBold\033[0m and "     // Bold text on row 2
+     "\033[4mUnderline\033[0m\r\n"),
     "Line 3: placeholder\r\n",            // Will be overwritten below
     "\033[3;1H",                          // CUP: move cursor back to row 3, col 1
     "\033[2K",                            // EL:  erase the entire line
@@ -30,28 +48,34 @@ int main() {
                               strlen(commands[i]));
   }
 
-  // Create a plain-text formatter for the terminal
-  GhosttyFormatterTerminalOptions fmt_opts = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
-  fmt_opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
-  fmt_opts.trim = true;
-
+  //! [formatter-new]
+  // Create a formatter for the terminal and ask for plain text with
+  // trailing whitespace trimmed. A new formatter already does both, but
+  // setting them shows how options work and makes the output we want
+  // explicit.
   GhosttyFormatter formatter;
-  result = ghostty_formatter_terminal_new(NULL, &formatter, terminal, fmt_opts);
+  result = ghostty_formatter_terminal_new(NULL, &formatter, terminal);
   assert(result == GHOSTTY_SUCCESS);
 
-  // Format into an allocated buffer
-  uint8_t *buf = NULL;
-  size_t len = 0;
-  result = ghostty_formatter_format_alloc(formatter, NULL, &buf, &len);
+  GhosttyFormatterFormat emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  result = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_EMIT, &emit);
   assert(result == GHOSTTY_SUCCESS);
 
-  // Print the formatted output
-  printf("Formatted output (%zu bytes):\n", len);
-  fwrite(buf, 1, len, stdout);
-  printf("\n");
+  bool trim = true;
+  result = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_TRIM, &trim);
+  assert(result == GHOSTTY_SUCCESS);
+  //! [formatter-new]
+
+  // Stream the formatted output directly to stdout. The writer retains the
+  // exact byte count and reports destination errors through its return value.
+  OutputWriter output = {.file = stdout};
+  GhosttyWriter writer = {.write = write_output, .userdata = &output};
+  printf("Formatted output:\n");
+  result = ghostty_formatter_format(formatter, writer);
+  assert(result == GHOSTTY_SUCCESS);
+  printf("\n(%zu bytes)\n", output.written);
 
   // Clean up
-  ghostty_free(NULL, buf, len);
   ghostty_formatter_free(formatter);
   ghostty_terminal_free(terminal);
   return 0;

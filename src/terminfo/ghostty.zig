@@ -18,8 +18,8 @@ pub const ghostty: Source = .{
         // The preferred name
         "ghostty",
 
-        // Our "formal" name
-        "Ghostty",
+        // The description
+        "Ghostty terminal emulator",
     },
 
     // NOTE: These capabilities are super underdocumented and I'm not 100%
@@ -390,6 +390,15 @@ pub const ghostty: Source = .{
         .{ .name = "rs1", .value = .{ .string = "\\E]\\E\\\\\\Ec" } },
         .{ .name = "sc", .value = .{ .string = "\\E7" } },
     },
+};
+
+/// A content-derived version of the encoded terminfo source.
+pub const version = version: {
+    @setEvalBranchQuota(100_000);
+    var hashing: std.Io.Writer.Hashing(std.hash.Wyhash) =
+        .initHasher(.init(0), &.{});
+    ghostty.encode(&hashing.writer) catch unreachable;
+    break :version std.fmt.comptimePrint("{x}", .{hashing.hasher.final()});
 };
 
 test "encode" {

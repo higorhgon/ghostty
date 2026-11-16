@@ -32,8 +32,8 @@ pub const Command = struct {
     pub fn clone(self: *const Command, alloc: Allocator) Allocator.Error!Command {
         return .{
             .action = try self.action.clone(alloc),
-            .title = try alloc.dupeZ(u8, self.title),
-            .description = try alloc.dupeZ(u8, self.description),
+            .title = try alloc.dupeSentinel(u8, self.title, 0),
+            .description = try alloc.dupeSentinel(u8, self.description, 0),
         };
     }
 
@@ -98,15 +98,15 @@ pub const defaults: []const Command = defaults: {
     @setEvalBranchQuota(100_000);
 
     var count: usize = 0;
-    for (@typeInfo(Action.Key).@"enum".fields) |field| {
-        const action = @field(Action.Key, field.name);
+    for (@typeInfo(Action.Key).@"enum".field_names) |field| {
+        const action = @field(Action.Key, field);
         count += actionCommands(action).len;
     }
 
     var result: [count]Command = undefined;
     var i: usize = 0;
-    for (@typeInfo(Action.Key).@"enum".fields) |field| {
-        const action = @field(Action.Key, field.name);
+    for (@typeInfo(Action.Key).@"enum".field_names) |field| {
+        const action = @field(Action.Key, field);
         const commands = actionCommands(action);
         for (commands) |cmd| {
             result[i] = cmd;
@@ -465,6 +465,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Prompt for a new title for the current tab."),
         }},
 
+        .prompt_window_title => comptime &.{.{
+            .action = .prompt_window_title,
+            .title = "Change Window Title…",
+            .description = "Prompt for a new title for the current window.",
+        }},
+
         .new_split => comptime &.{
             .{
                 .action = .{ .new_split = .left },
@@ -595,6 +601,29 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Reload the config file."),
         }},
 
+        .set_window_theme => comptime &.{
+            .{
+                .action = .{ .set_window_theme = .config },
+                .title = i18n.N_("Switch to Configured Appearance"),
+                .description = i18n.N_("Use the application appearance from the configuration."),
+            },
+            .{
+                .action = .{ .set_window_theme = .system },
+                .title = i18n.N_("Switch to System Appearance"),
+                .description = i18n.N_("Use the system application appearance for this session."),
+            },
+            .{
+                .action = .{ .set_window_theme = .light },
+                .title = i18n.N_("Switch to Light Appearance"),
+                .description = i18n.N_("Use a light application appearance for this session."),
+            },
+            .{
+                .action = .{ .set_window_theme = .dark },
+                .title = i18n.N_("Switch to Dark Appearance"),
+                .description = i18n.N_("Use a dark application appearance for this session."),
+            },
+        },
+
         .close_surface => comptime &.{.{
             .action = .close_surface,
             .title = i18n.N_("Close Terminal"),
@@ -699,7 +728,7 @@ fn actionCommands(action: Action.Key) []const Command {
 
         .text => comptime &.{.{
             .action = .{ .text = "👻" },
-            .title = i18n.N_("Ghostty"),
+            .title = "Ghostty",
             .description = i18n.N_("Put a little Ghostty in your terminal."),
         }},
 
@@ -713,6 +742,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .set_font_size,
         .set_surface_title,
         .set_tab_title,
+        .set_window_title,
         .search,
         .scroll_to_row,
         .scroll_page_fractional,

@@ -159,8 +159,6 @@ class QuickTerminalController: BaseTerminalController {
         // applies if we can be seen.
         guard visible else { return }
 
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
-
         // Re-hide the dock if we were hiding it before.
         hiddenDock?.hide()
     }
@@ -173,8 +171,6 @@ class QuickTerminalController: BaseTerminalController {
         // windowDidResignKey will also get called after animateOut so this
         // ensures we don't run logic twice.
         guard visible else { return }
-
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: false)
 
         // We don't animate out if there is a modal sheet being shown currently.
         // This lets us show alerts without causing the window to disappear.
@@ -628,8 +624,8 @@ class QuickTerminalController: BaseTerminalController {
             // Terminal.app more easily.
             window.backgroundColor = .white.withAlphaComponent(0.001)
 
-            if !derivedConfig.backgroundBlur.isGlassStyle {
-                ghostty_set_window_background_blur(ghostty.app, Unmanaged.passUnretained(window).toOpaque())
+            if !derivedConfig.backgroundBlur.isGlassStyle, let app = ghostty.app {
+                ghostty_set_window_background_blur(app, Unmanaged.passUnretained(window).toOpaque())
             }
         } else {
             window.isOpaque = true

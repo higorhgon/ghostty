@@ -71,15 +71,30 @@ pub const Point = union(Tag) {
         @This(),
         // Padding: largest variant is Coordinate (u16 + u32 = 6 bytes).
         // Use [2]u64 (16 bytes) for future expansion.
-        [2]u64,
+        .{
+            .padding = [2]u64,
+            .field_renames = .{
+                .active = "coordinate",
+                .viewport = "coordinate",
+                .screen = "coordinate",
+                .history = "coordinate",
+            },
+        },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;
     pub const cval = c_union.cval;
 
     /// Convert a C ABI point into the native Zig tagged union.
-    pub fn fromC(pt: C) Point {
-        return switch (pt.tag) {
+    ///
+    /// Returns null if the tag is not one of the known point tags. A C
+    /// caller can store any integer in the tag, so this reads it as an
+    /// integer and checks it before switching on it. Callers in the C API
+    /// return `.invalid_value` for null.
+    pub fn fromC(pt: C) ?Point {
+        const raw: *const @typeInfo(Tag).@"enum".tag_type = @ptrCast(&pt.tag);
+        const tag = std.enums.fromInt(Tag, raw.*) orelse return null;
+        return switch (tag) {
             .active => .{ .active = pt.value.active },
             .viewport => .{ .viewport = pt.value.viewport },
             .screen => .{ .screen = pt.value.screen },

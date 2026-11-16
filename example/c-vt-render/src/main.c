@@ -43,7 +43,7 @@ int main(void) {
 
   // Select "underlined" on the second row. Render state exposes this
   // later as a row-local selected cell range.
-  GhosttyGridRef selection_start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef selection_start = {0};
   GhosttyPoint selection_start_pt = {
       .tag = GHOSTTY_POINT_TAG_ACTIVE,
       .value = { .coordinate = { .x = 0, .y = 1 } },
@@ -52,7 +52,7 @@ int main(void) {
       terminal, selection_start_pt, &selection_start);
   assert(result == GHOSTTY_SUCCESS);
 
-  GhosttyGridRef selection_end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef selection_end = {0};
   GhosttyPoint selection_end_pt = {
       .tag = GHOSTTY_POINT_TAG_ACTIVE,
       .value = { .coordinate = { .x = 9, .y = 1 } },
@@ -60,7 +60,7 @@ int main(void) {
   result = ghostty_terminal_grid_ref(terminal, selection_end_pt, &selection_end);
   assert(result == GHOSTTY_SUCCESS);
 
-  GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection selection = {0};
   selection.start = selection_start;
   selection.end = selection_end;
   result = ghostty_terminal_set(
@@ -97,7 +97,8 @@ int main(void) {
   // state. These are needed to resolve palette-indexed cell colors.
   GhosttyRenderStateColors colors =
       GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-  result = ghostty_render_state_colors_get(render_state, &colors);
+  result = ghostty_render_state_get(
+      render_state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
   assert(result == GHOSTTY_SUCCESS);
 
   printf("Background: #%02x%02x%02x\n",
@@ -107,45 +108,31 @@ int main(void) {
   //! [render-colors]
 
   //! [render-cursor]
-  // Read cursor position and visual style from the render state.
-  bool cursor_visible = false;
-  ghostty_render_state_get(
-      render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
-      &cursor_visible);
+  // Read all cursor state in one call.
+  GhosttyRenderStateCursor cursor =
+      GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
+  result = ghostty_render_state_get(
+      render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
+  assert(result == GHOSTTY_SUCCESS);
 
-  bool cursor_in_viewport = false;
-  ghostty_render_state_get(
-      render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
-      &cursor_in_viewport);
-
-  if (cursor_visible && cursor_in_viewport) {
-    uint16_t cx, cy;
-    ghostty_render_state_get(
-        render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cx);
-    ghostty_render_state_get(
-        render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy);
-
-    GhosttyRenderStateCursorVisualStyle style;
-    ghostty_render_state_get(
-        render_state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
-        &style);
-
+  if (cursor.visible && cursor.viewport_has_value) {
     const char* style_name = "unknown";
-    switch (style) {
-      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+    switch (cursor.visual_style) {
+      case GHOSTTY_CURSOR_STYLE_BAR:
         style_name = "bar";
         break;
-      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
+      case GHOSTTY_CURSOR_STYLE_BLOCK:
         style_name = "block";
         break;
-      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+      case GHOSTTY_CURSOR_STYLE_UNDERLINE:
         style_name = "underline";
         break;
-      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+      case GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW:
         style_name = "hollow";
         break;
     }
-    printf("Cursor at (%u, %u), style: %s\n", cx, cy, style_name);
+    printf("Cursor at (%u, %u), style: %s\n",
+           cursor.viewport_x, cursor.viewport_y, style_name);
   }
   //! [render-cursor]
 
@@ -165,15 +152,9 @@ int main(void) {
   result = ghostty_render_state_row_cells_new(NULL, &cells);
   assert(result == GHOSTTY_SUCCESS);
 
-  int row_index = 0;
-  while (ghostty_render_state_row_iterator_next(row_iter)) {
-    // Check per-row dirty state; a real renderer would skip clean rows.
-    bool row_dirty = false;
-    ghostty_render_state_row_get(
-        row_iter, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &row_dirty);
-
-    printf("Row %2d [%s]: ", row_index,
-           row_dirty ? "dirty" : "clean");
+  uint16_t row_y = 0;
+  while (ghostty_render_state_row_iterator_next_dirty(row_iter, &row_y)) {
+    printf("Row %2u [dirty]: ", row_y);
 
     // Query the row-local selection range. Rows without a selection return
     // GHOSTTY_NO_VALUE; selected rows return inclusive start/end columns.
@@ -206,7 +187,7 @@ int main(void) {
 
       // Read the style for this cell. Returns the default style for
       // cells that have no explicit styling.
-      GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+      GhosttyStyle style;
       ghostty_render_state_row_cells_get(
           cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
 
@@ -216,18 +197,23 @@ int main(void) {
 
       // Emit ANSI true-color escape for the foreground.
       printf("\033[38;2;%u;%u;%um", fg.r, fg.g, fg.b);
-      if (style.bold) printf("\033[1m");
-      if (style.underline) printf("\033[4m");
+      if (style.flags & GHOSTTY_STYLE_FLAG_BOLD) printf("\033[1m");
+      if (GHOSTTY_STYLE_UNDERLINE(style)) printf("\033[4m");
 
-      // Read grapheme codepoints into a buffer and print them.
-      // The buffer must be at least grapheme_len elements.
+      // Read grapheme codepoints into a buffer and print them. If the
+      // cell has more than 16 codepoints, only the first 16 are written
+      // and graphemes.len holds the full count, so print what fits.
       uint32_t codepoints[16];
-      uint32_t len = grapheme_len < 16 ? grapheme_len : 16;
+      GhosttyCodepointBuffer graphemes = {
+          .ptr = codepoints,
+          .cap = sizeof(codepoints) / sizeof(codepoints[0]),
+      };
       ghostty_render_state_row_cells_get(
           cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-          codepoints);
+          &graphemes);
 
-      for (uint32_t i = 0; i < len; i++) {
+      size_t len = graphemes.len < graphemes.cap ? graphemes.len : graphemes.cap;
+      for (size_t i = 0; i < len; i++) {
         // Simple ASCII print; a real renderer would handle UTF-8.
         if (codepoints[i] < 128)
           putchar((char)codepoints[i]);
@@ -239,22 +225,13 @@ int main(void) {
     }
 
     printf("\n");
-
-    // Clear per-row dirty flag after "rendering" it.
-    bool clean = false;
-    ghostty_render_state_row_set(
-        row_iter, GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
-
-    row_index++;
   }
   //! [render-row-iterate]
 
   //! [render-dirty-reset]
-  // After finishing the frame, reset the global dirty state so the next
-  // update can report changes accurately.
-  GhosttyRenderStateDirty clean_state = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
-  result = ghostty_render_state_set(
-      render_state, GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean_state);
+  // After successfully rendering the complete frame, clear both the global
+  // and per-row dirty state in one call.
+  result = ghostty_render_state_clean(render_state);
   assert(result == GHOSTTY_SUCCESS);
   //! [render-dirty-reset]
 
