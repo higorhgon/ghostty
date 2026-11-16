@@ -26,10 +26,11 @@ falls back to the hand-drawn GDI strip, which is not what ships.
 
 The full build, from the repo root, in order:
 
-1. `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc`
-2. `dist\windows\tabbar\ghostty-tabbar\build.bat` -- only when the tab bar
+1. `dist\windows	abbar\ghostty-tabbaruild.bat` -- only when the tab bar
    DLL sources changed or `ghostty_tabbar.dll` is missing (needs
-   `dist\windows\tabbar\fetch-deps.ps1` to have been run once).
+   `dist\windows	abbaretch-deps.ps1` to have been run once). It comes
+   first because Ghostty links against the import library it produces.
+2. `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc`
 3. `dist\windows\msix\stage.ps1` -- stages the MSIX layout and registers
    it (needs Developer Mode). Close any running packaged Ghostty first.
 

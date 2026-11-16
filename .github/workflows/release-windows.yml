@@ -59,18 +59,7 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
-      # The version is given explicitly. Left to detect it from git, the
-      # build insists that any tag on the commit be exactly vX.Y.Z, which a
-      # windows-v tag is not.
-      - name: Build Ghostty
-        shell: pwsh
-        run: >
-          zig build
-          -Dapp-runtime=win32
-          -Dtarget=x86_64-windows-msvc
-          -Doptimize=ReleaseFast
-          -Dversion-string=${{ steps.version.outputs.app }}
-
+      # The tab bar comes first: Ghostty links against its import library.
       - name: Fetch tab bar dependencies
         shell: pwsh
         run: .\dist\windows\tabbar\fetch-deps.ps1
@@ -78,6 +67,31 @@ jobs:
       - name: Build tab bar
         shell: cmd
         run: dist\windows\tabbar\ghostty-tabbar\build.bat
+
+      # The version is given explicitly. Left to detect it from git, the
+      # build insists that any tag on the commit be exactly vX.Y.Z, which a
+      # windows-v tag is not.
+      #
+      # On failure the error lines are repeated as annotations, which can
+      # be read from the run's summary page without opening the log.
+      - name: Build Ghostty
+        shell: pwsh
+        run: |
+          zig build `
+            -Dapp-runtime=win32 `
+            -Dtarget=x86_64-windows-msvc `
+            -Doptimize=ReleaseFast `
+            "-Dversion-string=${{ steps.version.outputs.app }}" `
+            --color off 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Select-String -Path build.log -Pattern 'error' -Context 0,2 |
+              Select-Object -First 15 |
+              ForEach-Object {
+                $text = (@($_.Line) + @($_.Context.PostContext)) -join ' | '
+                Write-Host "::error::$($text.Substring(0, [Math]::Min(900, $text.Length)))"
+              }
+            exit 1
+          }
 
       - name: Stage MSIX layout
         shell: pwsh
