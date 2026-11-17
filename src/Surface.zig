@@ -2193,6 +2193,18 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
+        // On Windows, asking whether a name exists that could not be a
+        // file name at all is not answered with "no": the kernel rejects
+        // it as OBJECT_NAME_INVALID, which std treats as a bug in the
+        // caller and, in a debug build, panics on. Every URL is such a
+        // name -- the colon after its scheme is enough -- and a URL is
+        // what a clicked link usually is, so clicking one took the whole
+        // process down. None of these characters can appear in a relative
+        // path, so a string that has one is simply not a path.
+        if (comptime builtin.os.tag == .windows) {
+            if (std.mem.indexOfAny(u8, path, ":*?\"<>|") != null) return null;
+        }
+
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
