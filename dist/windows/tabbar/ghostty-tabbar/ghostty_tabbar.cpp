@@ -22,6 +22,7 @@
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <winrt/Windows.System.h>
 #include <shellapi.h>
+#include <appmodel.h>
 // FSCTL_GET_REPARSE_POINT; WIN32_LEAN_AND_MEAN leaves it out of windows.h.
 #include <winioctl.h>
 #include <dwmapi.h>
@@ -2629,8 +2630,17 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_notify(
         nodes.Item(0).AppendChild(
             xml.CreateTextNode(title && *title ? title : L"Ghostty"));
         nodes.Item(1).AppendChild(xml.CreateTextNode(body ? body : L""));
-        ToastNotificationManager::CreateToastNotifier().Show(
-            ToastNotification(xml));
+        // Without a package (the setup.exe install) there is no identity to
+        // file the toast under, and the parameterless notifier throws. The
+        // ID is the one Ghostty claims at startup and the installer's Start
+        // menu shortcut carries, which is what Windows checks it against.
+        UINT32 name_len = 0;
+        const bool packaged =
+            ::GetCurrentPackageFullName(&name_len, nullptr) != APPMODEL_ERROR_NO_PACKAGE;
+        auto notifier = packaged
+            ? ToastNotificationManager::CreateToastNotifier()
+            : ToastNotificationManager::CreateToastNotifier(L"Ghostty.Terminal");
+        notifier.Show(ToastNotification(xml));
     } catch (hresult_error const& e) {
         Log("notify: FAILED 0x%08X: %ls", (unsigned)e.code(),
             e.message().c_str());

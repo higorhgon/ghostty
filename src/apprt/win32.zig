@@ -476,6 +476,13 @@ const w32 = struct {
     pub extern "user32" fn SetTimer(?HWND, usize, UINT, ?*const anyopaque) callconv(.winapi) usize;
     pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
     pub extern "user32" fn IsIconic(HWND) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn GetCurrentPackageFullName(
+        len: *u32,
+        name: ?[*]u16,
+    ) callconv(.winapi) i32;
+    pub extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(
+        id: [*:0]const u16,
+    ) callconv(.winapi) i32;
     pub extern "kernel32" fn SetConsoleCtrlHandler(
         handler: ?*const anyopaque,
         add: BOOL,
@@ -694,6 +701,19 @@ pub fn init(
     // own to take Ctrl+C for, so clear it once before any shell starts, as
     // Windows Terminal does.
     _ = w32.SetConsoleCtrlHandler(null, w32.FALSE);
+
+    // Without a package (the setup.exe install) Windows knows the process
+    // by no ID of its own: its windows would not group with the Start menu
+    // shortcut the installer pins, and its notifications would be dropped.
+    // Claim the ID that shortcut carries (dist/windows/installer/ghostty.iss).
+    // A packaged process already has one, which this must not override.
+    var name_len: u32 = 0;
+    const APPMODEL_ERROR_NO_PACKAGE = 15700;
+    if (w32.GetCurrentPackageFullName(&name_len, null) == APPMODEL_ERROR_NO_PACKAGE) {
+        _ = w32.SetCurrentProcessExplicitAppUserModelID(
+            std.unicode.utf8ToUtf16LeStringLiteral("Ghostty.Terminal"),
+        );
+    }
 
     const hinstance = w32.GetModuleHandleW(null) orelse return error.Unexpected;
 

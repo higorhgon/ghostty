@@ -147,6 +147,21 @@ jobs:
           }
           Get-ChildItem $out | Format-Table Name, Length
 
+      # The same build, installed without MSIX: a per-user setup.exe that
+      # needs no certificate, no administrator and no Developer Mode.
+      - name: Build setup.exe
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "could not install Inno Setup" }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          .\dist\windows\installer\stage.ps1
+          # /O is resolved against the script's folder, so it is made absolute.
+          $out = (Resolve-Path release).Path
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.msix }}" "/O$out" dist\windows\installer\ghostty.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem release | Format-Table Name, Length
+
       - name: Create release
         shell: pwsh
         env:
@@ -157,13 +172,22 @@ jobs:
 
           ## Installing
 
+          **Setup (recommended):** download ``Ghostty-${{ steps.version.outputs.msix }}-x64-setup.exe``
+          and run it. It installs for your user only, needs no administrator rights,
+          and updates an earlier setup install in place.
+
+          **MSIX:**
+
           1. Download ``Ghostty.cer`` and the ``.msix`` below.
           2. Trust the certificate, once, from an elevated prompt:
              ``certutil -addstore TrustedPeople Ghostty.cer``
           3. Double-click the ``.msix`` and choose Install.
 
-          Windows 10 1809 or later, x64. The package is signed with a self-signed
-          certificate, which is why step 2 is needed.
+          The package is signed with a self-signed certificate, which is why step 2
+          is needed.
+
+          Both are x64 and need Windows 10 1903 or later. The setup is not code
+          signed, so SmartScreen may ask you to confirm it the first time.
           "@
           $notes | Set-Content notes.md -Encoding utf8
 

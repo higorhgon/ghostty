@@ -20,9 +20,10 @@ A file for [guiding coding agents](https://agents.md/).
 
 This branch is a native Windows port. **Always build the native WinUI
 variant, and only that one** -- never the default `zig build`, GTK, or an
-unpackaged run as the thing to test. The WinUI tab strip only activates
-with MSIX package identity; a bare `zig-out\bin\ghostty.exe` silently
-falls back to the hand-drawn GDI strip, which is not what ships.
+unpackaged run as the thing to test. The WinUI tab strip needs either MSIX
+package identity or WinUI 2's files beside the exe (what the setup.exe
+installs); a bare `zig-out\bin\ghostty.exe` has neither and silently falls
+back to the hand-drawn GDI strip, which is not what ships.
 
 The full build, from the repo root, in order:
 
@@ -33,8 +34,19 @@ The full build, from the repo root, in order:
 2. `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast`
    -- the default is Debug, which is unusably slow under heavy output and
    which `stage.ps1` refuses to stage (pass it `-AllowDebug` to override).
+   When HEAD carries a `windows-v*` release tag, the build refuses to
+   configure unless the version is given: add `"-Dversion-string=X.Y.Z"`
+   (quoted, or PowerShell splits it at the dots).
 3. `dist\windows\msix\stage.ps1` -- stages the MSIX layout and registers
    it (needs Developer Mode). Close any running packaged Ghostty first.
+
+The setup.exe is the same build installed without MSIX, per user under
+`%LOCALAPPDATA%\Programs\Ghostty`: `dist\windows\installer\stage.ps1`
+lays out the files (WinUI 2 included), then
+`ISCC.exe /DAppVersion=X.Y.Z.N dist\windows\installer\ghostty.iss`
+(Inno Setup 6) writes it to `dist\windows\installer\output`. Its
+AppUserModelID, `Ghostty.Terminal`, is shared with `src\apprt\win32.zig`
+and the tab bar DLL's notifications; change all three together.
 
 Launch the result with
 `Start-Process 'shell:AppsFolder\<PackageFamilyName>!Ghostty'`, which
