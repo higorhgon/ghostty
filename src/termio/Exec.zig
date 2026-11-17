@@ -256,19 +256,29 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
         // thread) is what actually wakes it up; CancelIoEx is kept as a
         // best-effort fallback in case the read happens to be pending as
         // overlapped I/O for some reason.
-        if (windows.exp.kernel32.CancelSynchronousIo(
-            exec.read_thread.getHandle(),
-        ) == windows.FALSE) {
-            switch (windows.GetLastError()) {
-                .NOT_FOUND => {},
-                else => |err| log.warn("error interrupting read thread (sync) err={}", .{err}),
+        //
+        // A cancel only reaches a read that is already pending. One sent
+        // while the thread is between reads is lost, and the next read
+        // can then block for good, with the join below waiting on it. So
+        // it is repeated until the thread is gone, as Windows Terminal
+        // does (microsoft/terminal#14544); the thread also checks the
+        // quit pipe before each read.
+        const thread = exec.read_thread.getHandle();
+        const WAIT_OBJECT_0 = 0;
+        while (true) {
+            if (windows.exp.kernel32.CancelSynchronousIo(thread) == windows.FALSE) {
+                switch (windows.GetLastError()) {
+                    .NOT_FOUND => {},
+                    else => |err| log.warn("error interrupting read thread (sync) err={}", .{err}),
+                }
             }
-        }
-        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
-            switch (windows.GetLastError()) {
-                .NOT_FOUND => {},
-                else => |err| log.warn("error interrupting read thread err={}", .{err}),
+            if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+                switch (windows.GetLastError()) {
+                    .NOT_FOUND => {},
+                    else => |err| log.warn("error interrupting read thread err={}", .{err}),
+                }
             }
+            if (windows.exp.kernel32.WaitForSingleObject(thread, 10) == WAIT_OBJECT_0) break;
         }
     }
 
@@ -1839,6 +1849,17 @@ pub const ReadThread = struct {
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
             while (true) {
+                // Under steady output every read completes at once, so a
+                // cancel from threadExit may never find one pending; the
+                // quit pipe is how the thread learns to stop then.
+                var pending_quit: windows.DWORD = 0;
+                if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &pending_quit, null) != windows.FALSE and
+                    pending_quit > 0)
+                {
+                    log.info("read thread got quit signal", .{});
+                    return;
+                }
+
                 var n: windows.DWORD = 0;
                 if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
                     const err = windows.GetLastError();
