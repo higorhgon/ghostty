@@ -476,6 +476,10 @@ const w32 = struct {
     pub extern "user32" fn SetTimer(?HWND, usize, UINT, ?*const anyopaque) callconv(.winapi) usize;
     pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
     pub extern "user32" fn IsIconic(HWND) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn SetConsoleCtrlHandler(
+        handler: ?*const anyopaque,
+        add: BOOL,
+    ) callconv(.winapi) BOOL;
     pub extern "gdi32" fn CreateFontW(
         cHeight: c_int,
         cWidth: c_int,
@@ -683,6 +687,13 @@ pub fn init(
     opts: struct {},
 ) !void {
     _ = opts;
+
+    // Whether Ctrl+C is ignored is inherited, through process creation,
+    // from whoever started us, and every shell would inherit it from us in
+    // turn: Ctrl+C would then stop nothing. A GUI has no console of its
+    // own to take Ctrl+C for, so clear it once before any shell starts, as
+    // Windows Terminal does.
+    _ = w32.SetConsoleCtrlHandler(null, w32.FALSE);
 
     const hinstance = w32.GetModuleHandleW(null) orelse return error.Unexpected;
 

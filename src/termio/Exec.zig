@@ -78,6 +78,13 @@ pub fn deinit(self: *Exec) void {
 /// after termio begins because it may put the internal terminal state
 /// into a bad state.
 pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
+    // Every Windows pty is a pseudo console, and the console host behind
+    // it keeps its own grid. Growing that grid adds blank rows below; it
+    // never pulls history back down. If the terminal did, the two would
+    // disagree by those rows and the host's next absolute cursor moves
+    // would land on the wrong lines.
+    if (comptime builtin.os.tag == .windows) term.flags.resize_pull_scrollback = false;
+
     // If we have an initial pwd requested by the subprocess, then we
     // set that on the terminal now. This allows rapidly initializing
     // new surfaces to use the proper pwd.
@@ -1161,6 +1168,21 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.dropProcess();
+    }
+
+    /// Forget the process, closing the handle Windows gave us for it.
+    /// libxev's process watcher works on a duplicate it closes itself, so
+    /// this one is ours alone, and it leaked with every shell.
+    fn dropProcess(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |process| switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |pid| {
+                    _ = windows.exp.kernel32.CloseHandle(pid);
+                },
+                .flatpak => {},
+            };
+        }
         self.process = null;
     }
 
@@ -1185,7 +1207,7 @@ const Subprocess = struct {
             },
         }
 
-        self.process = null;
+        self.dropProcess();
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
