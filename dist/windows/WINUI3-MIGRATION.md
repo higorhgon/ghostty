@@ -36,7 +36,7 @@ consome por `src/apprt/win32/tabbar.zig`.
 | Peça | Tecnologia hoje |
 |---|---|
 | Faixa de abas (`TabView`), `+`, `⌄`, arrastar e reordenar | WinUI 2 numa ilha (`Windows.UI.Xaml.Hosting.DesktopWindowXamlSource`) |
-| Visual das abas | `ControlTemplate` de `TabViewItem` carregado por `XamlReader::Load`, em pedaços de menos de 16 KB |
+| Visual das abas | Modelo do próprio WinUI, com as cores postas nos `ThemeDictionaries` de cada item, como no Windows Terminal |
 | Botões de legenda (minimizar, maximizar, fechar, overview) | XAML na mesma ilha, com glifos Segoe Fluent |
 | Menu de perfis (novos shells, Configurações, Paleta) | Segunda ilha XAML numa janela de topo, pré-montada e estacionada fora da tela |
 | Ícones dos shells | `CachedShellIcon`: ícone do executável virando bitmap XAML |
@@ -196,16 +196,19 @@ README da barra, provavelmente some, porque a ponte tem `Show()`.
 - **Includes:** trocar os `winrt/Windows.UI.Xaml.*.h` pelos
   `winrt/Microsoft.UI.Xaml.*.h`, e acrescentar `Microsoft.UI.Dispatching`,
   `Microsoft.UI.Content` e `Microsoft.UI.Interop`.
-- **Modelo de `TabViewItem`:** o XAML em string é cópia do `generic.xaml`
-  do WinUI 2. Ele precisa ser refeito a partir do `generic.xaml` do WinUI 3
-  (`packages/Microsoft.WindowsAppSDK.WinUI.1.8.*/lib/native/.../Themes/`),
-  reaplicando os nossos ajustes: aba selecionada sem a sobreposição
-  translúcida, cores do tema, botão de fechar. As regras do `XamlReader`
-  continuam: sem `x:Load`, sem `{StaticResource}` de fora do trecho e
-  pedaços de menos de 16 KB por literal.
-- **Revalidar** o achado de que sobrescrever `TabViewItemHeaderBackground*`
-  não tem efeito. No WinUI 3 pode funcionar, o que eliminaria boa parte do
-  modelo copiado.
+- **Cores das abas:** já não há modelo copiado. Desde `3db6c65` as abas
+  usam o modelo do próprio WinUI e recebem as cores como no Windows
+  Terminal: chaves `TabViewItemHeaderBackground*` e `TabViewBorderBrush`
+  nos `ThemeDictionaries` de cada item (`ApplyTabColors`), seguidas da
+  releitura forçada (`RefreshTabVisual`). No WinUI 3, verificar no
+  `generic.xaml` dele
+  (`packages/Microsoft.WindowsAppSDK.WinUI.1.8.*/lib/native/.../Themes/`)
+  se os estados do `TabViewItem` leem as mesmas chaves. No WinUI 2.8,
+  `TabViewItemHeaderBackground` só é lido nos estados selecionados.
+  Verificar também se a releitura ainda precisa do truque do
+  `RequestedTheme`. Os estilos que continuam em XAML embutido (botões
+  `+`/`⌄` e itens do menu) seguem as regras do `XamlReader`: sem `x:Load`,
+  sem `{StaticResource}` de fora do trecho.
 - **Ícones:** `BitmapImage`/`SoftwareBitmapSource` existem iguais em
   `Microsoft::UI::Xaml::Media::Imaging`.
 - **Brushes por árvore:** a regra de que um `Brush` pertence à árvore onde
