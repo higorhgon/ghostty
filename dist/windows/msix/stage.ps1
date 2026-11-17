@@ -53,6 +53,16 @@ Copy-Item (Join-Path $zigOut "share") $layout -Recurse -ErrorAction SilentlyCont
 # The tab bar DLL must sit beside the exe: it is a load-time dependency.
 Copy-Item $dll (Join-Path $layout "bin") -Force
 
+# The redistributable ConPTY, which Ghostty prefers over Windows' own when
+# it is beside the exe. Optional: without it the system's conhost.exe is
+# used. dist\windows\conpty\fetch-conpty.ps1 downloads it.
+$conpty = Join-Path $root "dist\windows\conpty\bin"
+if (Test-Path (Join-Path $conpty "conpty.dll")) {
+    Copy-Item (Join-Path $conpty "*") (Join-Path $layout "bin") -Force
+} else {
+    Write-Warning "No bundled ConPTY; run dist\windows\conpty\fetch-conpty.ps1 to use OpenConsole.exe instead of the system conhost.exe."
+}
+
 Copy-Item (Join-Path $PSScriptRoot "AppxManifest.xml") $layout -Force
 Copy-Item (Join-Path $PSScriptRoot "Assets") $layout -Recurse -Force
 

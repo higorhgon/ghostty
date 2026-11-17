@@ -157,6 +157,15 @@ pub const exp = struct {
             size: COORD,
         ) callconv(.winapi) HRESULT;
         pub extern "kernel32" fn ClosePseudoConsole(hPC: HPCON) callconv(.winapi) void;
+        pub extern "kernel32" fn LoadLibraryExW(
+            lpLibFileName: [*:0]const u16,
+            hFile: ?HANDLE,
+            dwFlags: DWORD,
+        ) callconv(.winapi) ?windows.HMODULE;
+        pub extern "kernel32" fn GetProcAddress(
+            hModule: windows.HMODULE,
+            lpProcName: [*:0]const u8,
+        ) callconv(.winapi) ?*const anyopaque;
         pub extern "kernel32" fn InitializeProcThreadAttributeList(
             lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
             dwAttributeCount: DWORD,

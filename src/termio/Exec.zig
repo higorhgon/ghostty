@@ -1832,7 +1832,11 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        var buf: [1024]u8 = undefined;
+        // A read returns whatever the pipe holds, up to this much, so under
+        // heavy output a bigger buffer means fewer reads and fewer trips
+        // through processOutput's lock. 1 KiB took 128 of each for every
+        // 128 KiB the console host wrote.
+        var buf: [64 * 1024]u8 = undefined;
         while (true) {
             while (true) {
                 var n: windows.DWORD = 0;
@@ -1841,6 +1845,15 @@ pub const ReadThread = struct {
                     switch (err) {
                         // Check for a quit signal
                         .OPERATION_ABORTED => break,
+
+                        // The console host closed its end: no more output
+                        // will come, as with HUP in threadMainPosix. This
+                        // used to reach `unreachable` below, which is
+                        // undefined behaviour in a release build.
+                        .BROKEN_PIPE => {
+                            log.info("pty pipe closed, read thread exiting", .{});
+                            return;
+                        },
 
                         else => {
                             log.err("io reader error err={}", .{err});

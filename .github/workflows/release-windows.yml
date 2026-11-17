@@ -68,6 +68,12 @@ jobs:
         shell: cmd
         run: dist\windows\tabbar\ghostty-tabbar\build.bat
 
+      # Bundled beside ghostty.exe by stage.ps1, so shells run on Windows
+      # Terminal's console host instead of the system's conhost.exe.
+      - name: Fetch ConPTY
+        shell: pwsh
+        run: .\dist\windows\conpty\fetch-conpty.ps1
+
       # The version is given explicitly. Left to detect it from git, the
       # build insists that any tag on the commit be exactly vX.Y.Z, which a
       # windows-v tag is not.

@@ -331,12 +331,70 @@ const WindowsPty = struct {
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
 
+    const out_pipe_buffer_size = 128 * 1024;
+
     out_pipe: windows.HANDLE,
     in_pipe: windows.HANDLE,
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
+    conpty: Conpty,
     size: winsize,
+
+    /// The pseudoconsole entry points this PTY was created with, which
+    /// its resize and close must go to as well.
+    ///
+    /// A `conpty.dll` beside the executable wins over the one built into
+    /// Windows. It is the redistributable ConPTY (the
+    /// Microsoft.Windows.Console.ConPTY package), which runs the
+    /// `OpenConsole.exe` next to it instead of the system's conhost.exe:
+    /// the same, newer console host Windows Terminal uses, rather than
+    /// whatever this build of Windows happens to ship. Its exports take the
+    /// same arguments as kernel32's under a `Conpty` prefix.
+    const Conpty = struct {
+        create: *const fn (
+            windows.COORD,
+            windows.HANDLE,
+            windows.HANDLE,
+            windows.DWORD,
+            *windows.HPCON,
+        ) callconv(.winapi) windows.HRESULT,
+        resize: *const fn (
+            windows.HPCON,
+            windows.COORD,
+        ) callconv(.winapi) windows.HRESULT,
+        close: *const fn (windows.HPCON) callconv(.winapi) void,
+
+        const system: Conpty = .{
+            .create = &windows.exp.kernel32.CreatePseudoConsole,
+            .resize = &windows.exp.kernel32.ResizePseudoConsole,
+            .close = &windows.exp.kernel32.ClosePseudoConsole,
+        };
+
+        fn load() Conpty {
+            const k32 = windows.exp.kernel32;
+            // The application directory only: never a conpty.dll that
+            // happens to sit in the working directory or on PATH.
+            const LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
+            const module = k32.LoadLibraryExW(
+                std.unicode.utf8ToUtf16LeStringLiteral("conpty.dll"),
+                null,
+                LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+            ) orelse return system;
+            const create = k32.GetProcAddress(module, "ConptyCreatePseudoConsole");
+            const resize = k32.GetProcAddress(module, "ConptyResizePseudoConsole");
+            const close = k32.GetProcAddress(module, "ConptyClosePseudoConsole");
+            if (create == null or resize == null or close == null) {
+                log.warn("conpty.dll is missing an export, using the system ConPTY", .{});
+                return system;
+            }
+            return .{
+                .create = @ptrCast(create.?),
+                .resize = @ptrCast(resize.?),
+                .close = @ptrCast(close.?),
+            };
+        }
+    };
 
     pub const OpenError = error{Unexpected};
 
@@ -449,8 +507,12 @@ const WindowsPty = struct {
                 windows.FILE_FLAG_FIRST_PIPE_INSTANCE,
             windows.PIPE_TYPE_BYTE,
             1,
-            4096,
-            4096,
+            // Everything the shell prints comes through here. With a 4 KiB
+            // buffer the console host stalls on a full pipe every 4 KiB of
+            // output and waits for the read thread to drain it; Windows
+            // Terminal sizes its pipe at 128 KiB for the same reason.
+            out_pipe_buffer_size,
+            out_pipe_buffer_size,
             0,
             &security_attributes,
         );
@@ -491,7 +553,8 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        pty.conpty = Conpty.load();
+        const result = pty.conpty.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
@@ -509,7 +572,7 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        self.conpty.close(self.pseudo_console);
         self.* = undefined;
     }
 
@@ -524,7 +587,7 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        const result = self.conpty.resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );
