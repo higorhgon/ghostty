@@ -3,6 +3,20 @@
 //! also OS-specific features and conventions.
 
 const builtin = @import("builtin");
+const std = @import("std");
+
+/// How to spawn the threads every surface runs for its whole life: the
+/// renderer, the IO thread and the pty reader.
+///
+/// On Windows, std.Thread.spawn hands `stack_size` to NtCreateThreadEx as
+/// the stack's *commit*, and its 16 MiB default therefore commits 16 MiB
+/// per thread up front: 48 MiB of private memory for every pane, nearly
+/// all of it never touched. Committing 1 MiB instead leaves the reserve at
+/// the executable's own (16 MiB), and the stack still grows into it on
+/// demand through the guard page, so the deepest a thread can recurse is
+/// unchanged.
+pub const surface_thread_spawn_config: std.Thread.SpawnConfig =
+    if (builtin.os.tag == .windows) .{ .stack_size = 1024 * 1024 } else .{};
 
 const dbus = @import("dbus.zig");
 const desktop = @import("desktop.zig");

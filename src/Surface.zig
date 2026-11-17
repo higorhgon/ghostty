@@ -752,7 +752,7 @@ pub fn init(
 
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
-        .{},
+        internal_os.surface_thread_spawn_config,
         rendererpkg.Thread.threadMain,
         .{&self.renderer_thread},
     );
@@ -760,7 +760,7 @@ pub fn init(
 
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
-        .{},
+        internal_os.surface_thread_spawn_config,
         termio.Thread.threadMain,
         .{ &self.io_thread, &self.io },
     );
