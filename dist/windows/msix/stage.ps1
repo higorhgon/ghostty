@@ -50,6 +50,10 @@ New-Item -ItemType Directory -Force $layout | Out-Null
 Copy-Item (Join-Path $zigOut "bin") $layout -Recurse
 Copy-Item (Join-Path $zigOut "share") $layout -Recurse -ErrorAction SilentlyContinue
 
+# Debug symbols stay in zig-out: ghostty.pdb alone is about 100 MB, which
+# every install and every .msix would otherwise carry.
+Get-ChildItem (Join-Path $layout "bin") -Filter *.pdb | Remove-Item -Force
+
 # The tab bar DLL must sit beside the exe: it is a load-time dependency.
 Copy-Item $dll (Join-Path $layout "bin") -Force
 

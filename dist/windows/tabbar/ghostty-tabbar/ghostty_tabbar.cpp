@@ -2622,7 +2622,6 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_notify(
     // A packaged process has an identity for the notification platform to
     // file the toast under, so there is no AppUserModelID to pass.
     try {
-        Log("notify: title=%ls", title ? title : L"");
         using namespace winrt::Windows::UI::Notifications;
         auto xml = ToastNotificationManager::GetTemplateContent(
             ToastTemplateType::ToastText02);
@@ -2662,7 +2661,6 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_progress(
         default: break;
     }
     const HWND target = static_cast<HWND>(hwnd);
-    Log("progress: state=%d percent=%d", (int)state, (int)percent);
     taskbar->SetProgressState(target, flag);
     if (flag == TBPF_NORMAL || flag == TBPF_ERROR || flag == TBPF_PAUSED) {
         const int value = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
