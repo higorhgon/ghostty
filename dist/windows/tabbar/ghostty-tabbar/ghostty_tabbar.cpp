@@ -280,8 +280,14 @@ namespace {
 /// 32,35,41. Note that hover cannot be provoked with SetCursorPos --
 /// XAML pointer state only follows synthesized relative mouse input.
 ///
-/// Kept deliberately close to the stock template. Three deviations, each
+/// Kept deliberately close to the stock template. Four deviations, each
 /// forced:
+///   - The selected tab's background is a Border, not the stock
+///     `SelectedBackgroundPath`, whose Data is bound to the item's
+///     TabGeometry: with no x:Load to create it only while selected, the
+///     Path always exists, and dragging a tab to reorder it re-applied the
+///     template while the old Path still held that Geometry, which XAML
+///     answers by killing the process.
 ///   - `x:Load` is dropped: XamlReader::Load does not support it. The
 ///     deferred elements are declared Visibility="Collapsed" instead,
 ///     which is the state the template starts them in anyway.
@@ -494,8 +500,8 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                                 <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
                                 <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
                                 <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="SelectedBackground.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackground.Background" Value="{StaticResource GhosttyTabSelected}"/>
                                 <Setter Target="TabContainer.Background" Value="Transparent"/>
                                 <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
                                 <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
@@ -512,8 +518,8 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                                 <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
                                 <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
                                 <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="SelectedBackground.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackground.Background" Value="{StaticResource GhosttyTabSelected}"/>
                                 <Setter Target="TabContainer.Background" Value="Transparent"/>
                                 <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
                                 <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
@@ -530,8 +536,8 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                                 <Setter Target="BottomBorderLine.Visibility" Value="Collapsed"/>
                                 <Setter Target="LeftRadiusRenderArc.Visibility" Value="Visible"/>
                                 <Setter Target="RightRadiusRenderArc.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Visibility" Value="Visible"/>
-                                <Setter Target="SelectedBackgroundPath.Fill" Value="{StaticResource GhosttyTabSelected}"/>
+                                <Setter Target="SelectedBackground.Visibility" Value="Visible"/>
+                                <Setter Target="SelectedBackground.Background" Value="{StaticResource GhosttyTabSelected}"/>
                                 <Setter Target="TabContainer.Background" Value="Transparent"/>
                                 <Setter Target="TabContainer.Margin" Value="{ThemeResource TabViewSelectedItemHeaderMargin}"/>
                                 <Setter Target="TabContainer.Padding" Value="{ThemeResource TabViewSelectedItemHeaderPadding}"/>
@@ -618,10 +624,8 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                         <!-- The two arcs fill the notch where the selected tab meets the strip, so they take the selected colour, not the border colour the stock template uses. -->
                         <Path x:Name="LeftRadiusRenderArc" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Visibility="Collapsed" Margin="-4,0,0,0" Height="4" Width="4" Data="M4 0C4 1.19469 3.47624 2.26706 2.64582 3H0C1.65685 3 3 1.65685 3 0H4Z"/>
                         <Path x:Name="RightRadiusRenderArc" Grid.Column="2" Visibility="Collapsed" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Margin="0,0,-4,0" Height="4" Width="4" Data="M0 0C0 1.19469 0.523755 2.26706 1.35418 3H4C2.34315 3 1 1.65685 1 0H0Z"/>
-                        <!-- Wrapped in a Canvas to prevent an infinite loop in calculating its width. -->
-                        <Canvas>
-                          <Path x:Name="SelectedBackgroundPath" Grid.ColumnSpan="3" Fill="{StaticResource GhosttyTabSelected}" VerticalAlignment="Bottom" Margin="-4,0,-4,0" Visibility="Collapsed" Data="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=TabViewTemplateSettings.TabGeometry}"/>
-                        </Canvas>
+                        <!-- The stock template's SelectedBackgroundPath binds Path.Data to TabViewTemplateSettings.TabGeometry and is created only when selected (x:Load). Without x:Load the Path always exists, and reordering a tab re-applies the template while the old Path still holds that one Geometry; XAML kills the process when it is assigned to the new one ("Failed to assign to property Path.Data"). A Border with the TabContainer's corners draws the same rounded-top shape and shares nothing. -->
+                        <Border x:Name="SelectedBackground" Grid.ColumnSpan="3" Background="{StaticResource GhosttyTabSelected}" CornerRadius="4,4,0,0" Visibility="Collapsed"/>
                         <Border x:Name="TabSeparator" HorizontalAlignment="Right" Width="1" Grid.Column="1" BorderBrush="{ThemeResource TabViewItemSeparator}" BorderThickness="1" Margin="{ThemeResource TabViewItemSeparatorMargin}"/>
                         <Grid x:Name="TabContainer" Grid.Column="1" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Control.IsTemplateFocusTarget="True" Padding="{ThemeResource TabViewItemHeaderPadding}" CornerRadius="4,4,0,0" FocusVisualMargin="{TemplateBinding FocusVisualMargin}">
                           <Grid.ColumnDefinitions>
