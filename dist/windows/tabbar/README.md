@@ -106,25 +106,51 @@ rendering the terminal into a `SwapChainPanel`, would sidestep the
 clipping entirely. That is the full Windows Terminal architecture, and it
 needs Ghostty's renderer ported from OpenGL to Direct3D.
 
-**Overriding `TabViewItemHeaderBackground*` does nothing.** The documented
-way to recolour tabs was measured as having no effect through four scopes:
-the `TabView`'s dictionary, the `Application`'s, each item's own, and
-merged `ThemeDictionaries`. The tab colours come from a full
-`TabViewItem` `ControlTemplate` override instead, which is why one is
-carried here. In WinUI's stock template the *selected* tab is painted by a
-separate shape (`SelectedBackgroundPath`) with `TabContainer` drawn over
-it — so the selected tab picked up a translucent overlay and rendered
-lighter than both the strip and the terminal content.
+**Tabs are coloured through resource keys, the way Windows Terminal does
+it, and WinUI's own `TabViewItem` template is kept.** Each item gets the
+keys in its own `Resources().ThemeDictionaries()`, one dictionary per theme
+(Light and Dark; high contrast is left to the system), and then has to be
+told to look again (`RefreshTabVisual`: flip `RequestedTheme` Light, Dark,
+back, and flip the visual state between Normal and Selected). Without that
+refresh a template that already resolved a `ThemeResource` keeps the old
+value, which is why an earlier attempt measured these keys as having no
+effect and a copy of the whole template was carried instead.
 
-Note those keys are never *defined* in WinUI's `Generic.xaml`, only
+That copy had to drop `x:Load`, which `XamlReader` cannot parse, and so
+kept alive elements the stock template creates only while a tab is
+selected. One of them, `SelectedBackgroundPath`, binds `Path.Data` to the
+item's `TabGeometry`, and dragging a tab to reorder it re-applies the
+template while the old Path still holds that geometry: XAML killed the
+process ("Failed to assign to property `Path.Data`"). The copy also lost
+the drag animations.
+
+Two keys do not mean what their names say:
+
+- `TabViewItemHeaderBackground` is read only in the *selected* states, to
+  paint `TabContainer` over `SelectedBackgroundPath`. It takes the selected
+  colour, as in Windows Terminal; the resting colour is the item's
+  `Background`. Left at WinUI's translucent default it is what made a
+  selected tab render lighter than both the strip and the content.
+- `TabViewBorderBrush`, set on the item, fills the two arcs where a
+  selected tab flares into the content, so it also takes the selected
+  colour.
+
+Measured with Catppuccin Mocha (terminal 30,30,46): unselected 19,19,30,
+hovered 24,24,36, selected 30,30,46, and after switching the config to
+Dracula while running, selected 40,42,54, the new terminal colour.
+
+Those keys are never *defined* in WinUI's `Generic.xaml`, only
 referenced; their values live in compiled theme resources. `Generic.xaml`
-is still the place to read the templates themselves, at
+is still the place to read which key each state uses, at
 `packages/Microsoft.UI.Xaml.2.8.6/lib/uap10.0/Microsoft.UI.Xaml/Themes/`.
 
-**`XamlReader::Load` is not the XAML compiler.** Three things a copied
-template will contain that it rejects:
+**`XamlReader::Load` is not the XAML compiler.** It still parses the
+button and menu styles carried here, and anything copied from WinUI's
+templates into them meets three limits:
 
-- `x:Load` — unsupported; use `Visibility="Collapsed"`.
+- `x:Load` — unsupported. Replacing it with `Visibility="Collapsed"` keeps
+  the element alive, which is not the same thing: see the tab template
+  above for what that cost.
 - Any `{StaticResource}` whose key is not inside the markup being parsed,
   which fails at *load* time. WinUI's `TopCornerRadiusFilterConverter` and
   `TabViewCloseButtonStyle` are both in this category — the close button
@@ -132,9 +158,10 @@ template will contain that it rejects:
 - `{ThemeResource}` keys resolve late, so those are fine, but a missing
   one throws when the template is *applied*, not when it is parsed.
 
-**MSVC caps a string literal at 16380 bytes.** A real control template is
-larger than that, so it has to be split into several literals and joined at
-runtime; concatenating adjacent literals does not raise the cap.
+**MSVC caps a string literal at 16380 bytes.** A full control template is
+larger than that, so markup of that size has to be split into several
+literals and joined at runtime; concatenating adjacent literals does not
+raise the cap.
 
 **A XAML exception during layout kills the process silently.** It surfaces
 on the dispatcher, not in whatever call triggered it, so a `try/catch`
