@@ -1704,6 +1704,12 @@ pub const Window = struct {
     /// windows from blinking their cursors.
     has_focus: bool = false,
 
+    /// The title last given to SetWindowTextW, so that reflow, which runs
+    /// on every frame, only sets it when it changes. Each set notifies the
+    /// shell, the taskbar and any window manager watching title changes.
+    shown_title: [512]u16 = undefined,
+    shown_title_len: usize = std.math.maxInt(usize),
+
     /// Set once the window has been shown and has been given the chance to
     /// settle at its final size. Until then `reflow` lays panes out but
     /// does not start them, because the size it is laying them out at is
@@ -3699,7 +3705,13 @@ fn reflow(window: *Window) void {
             zbuf[wn] = 0;
             // Still worth setting with a custom frame: it is what the task
             // bar and Alt-Tab show, even though no title bar displays it.
-            _ = w32.SetWindowTextW(window.hwnd, zbuf[0..wn :0]);
+            if (wn != window.shown_title_len or
+                !std.mem.eql(u16, zbuf[0..wn], window.shown_title[0..wn]))
+            {
+                _ = w32.SetWindowTextW(window.hwnd, zbuf[0..wn :0]);
+                @memcpy(window.shown_title[0..wn], zbuf[0..wn]);
+                window.shown_title_len = wn;
+            }
         }
     }
     syncTabTitle(tab);

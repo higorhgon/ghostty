@@ -2315,7 +2315,17 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_title(
     auto it = bar->tabs.find(tab);
     if (it == bar->tabs.end()) return;
     try {
-        it->second.Header(winrt::box_value(hstring{title ? title : L""}));
+        // Ghostty calls this on every frame it draws. A new Header, even
+        // an equal one, makes the item rebuild its header content and the
+        // island lay out and render again, so an unchanged title is left
+        // alone.
+        hstring next{title ? title : L""};
+        auto current = it->second.Header().try_as<winrt::Windows::Foundation::IPropertyValue>();
+        if (current && current.Type() == winrt::Windows::Foundation::PropertyType::String &&
+            current.GetString() == next) {
+            return;
+        }
+        it->second.Header(winrt::box_value(next));
     } catch (...) {
     }
 }
