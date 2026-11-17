@@ -22,6 +22,8 @@ const input = @import("../input.zig");
 const global = @import("../global.zig");
 const internal_os = @import("../os/main.zig");
 const tabbar = @import("win32/tabbar.zig");
+const handoff = @import("win32/handoff.zig");
+const termio = @import("../termio.zig");
 const file_load = @import("../config/file_load.zig");
 const gl = @import("opengl");
 const wgl = @import("../renderer/OpenGL.zig").wgl;
@@ -482,6 +484,7 @@ const w32 = struct {
     pub extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) BOOL;
     pub extern "user32" fn FlashWindowEx(*const FLASHWINFO) callconv(.winapi) BOOL;
     pub extern "user32" fn SetTimer(?HWND, usize, UINT, ?*const anyopaque) callconv(.winapi) usize;
+    pub extern "user32" fn KillTimer(?HWND, usize) callconv(.winapi) BOOL;
     pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
     pub extern "user32" fn IsIconic(HWND) callconv(.winapi) BOOL;
     pub extern "kernel32" fn GetCurrentPackageFullName(
@@ -694,6 +697,18 @@ quick_window: ?*Window = null,
 /// window being created should open its first tab with.
 restore_profile: ?[]const u8 = null,
 
+/// Started by COM to take a console session as the default terminal
+/// (handoff.zig): no window of its own until the session arrives.
+embedding: bool = false,
+/// The thread timer that ends an embedding process no session ever came to.
+embedding_timer: usize = 0,
+/// Handed-off sessions on their way to a window: queued inside the COM
+/// call, opened from the message loop (`wm_handoff`).
+handoffs: std.ArrayListUnmanaged(termio.Exec.WindowsHandoff) = .empty,
+/// The session the pane being created takes instead of starting a shell;
+/// `newPane` consumes it.
+pending_handoff: ?termio.Exec.WindowsHandoff = null,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -769,6 +784,7 @@ pub fn init(
         .hinstance = hinstance,
         .main_thread_id = w32.GetCurrentThreadId(),
         .gl_root = gl_root,
+        .embedding = handoff.isEmbedding(),
     };
 
     self.watchConfig();
@@ -967,6 +983,10 @@ fn reloadConfig(self: *App, soft: bool) !void {
     // only the surfaces heard about it above.
     for (self.windows.items) |window| {
         applyTabBarTheme(window);
+        // `window-decoration` and `window-show-tab-bar` may have changed:
+        // a reload of the file wins over a toggle, as on Linux.
+        if (!soft) window.decorated = self.config.@"window-decoration" != .none;
+        refreshFrame(window);
         if (!window.customFrame()) applyTitlebarTheme(window.hwnd, &self.config);
         for (window.overview_labels.items) |label| {
             _ = w32.InvalidateRect(label, null, w32.TRUE);
@@ -1116,6 +1136,43 @@ fn saveSession(self: *App, window: *Window) void {
     }
 }
 
+/// Thread message: `handoffs` has sessions waiting for a window.
+const wm_handoff: w32.UINT = w32.WM_APP + 12;
+
+/// handoff.zig's callback, inside the COM call. Only queues: opening a
+/// window pumps messages, and the console host is still waiting for the
+/// call to return.
+fn onHandoff(ctx: *anyopaque, session: termio.Exec.WindowsHandoff) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.handoffs.append(self.core_app.alloc, session) catch {
+        log.err("out of memory queueing a console handoff", .{});
+        var dropped = session;
+        dropped.pty.deinit();
+        _ = internal_os.windows.exp.kernel32.CloseHandle(session.client);
+        return;
+    };
+    _ = w32.PostThreadMessageW(self.main_thread_id, wm_handoff, 0, 0);
+}
+
+/// One window per handed-off session, its only tab attached to it.
+fn openHandoffs(self: *App) void {
+    while (self.handoffs.items.len > 0) {
+        const session = self.handoffs.orderedRemove(0);
+        self.pending_handoff = session;
+        _ = self.newWindow(null) catch |err| {
+            log.err("failed to open a window for a console handoff err={}", .{err});
+        };
+        // Not taken by a pane: nothing else will close it.
+        if (self.pending_handoff) |left| {
+            self.pending_handoff = null;
+            var dropped = left;
+            dropped.pty.deinit();
+            _ = internal_os.windows.exp.kernel32.CloseHandle(left.client);
+        }
+    }
+    // The first window is up: the process now ends with its last window.
+}
+
 /// Opens the first window, with the tabs the last session ended with if
 /// the config asks for that.
 fn openInitialWindow(self: *App) !void {
@@ -1165,29 +1222,61 @@ fn profileByName(window: *Window, name: []const u8) ?*const tabbar.Profile {
 
 /// The profile a new window's first tab opens with.
 fn firstTabProfile(self: *App, window: *Window) ?*const tabbar.Profile {
+    // A handed-off session runs whatever program was started, not a shell
+    // of ours: no profile to name the tab after or to open new tabs with.
+    if (self.pending_handoff != null) return null;
     if (self.restore_profile) |name| return profileByName(window, name);
     return newTabProfile(self, window);
 }
 
 pub fn run(self: *App) !void {
-    self.registerHotkeys();
+    if (self.embedding) {
+        // Started by COM for a console handoff: the window is the
+        // session's, opened when it arrives. A process it never reaches
+        // (the caller gave up) must not linger with nothing on screen.
+        handoff.register(self, onHandoff) catch |err| {
+            log.err("could not serve the console handoff err={}", .{err});
+            return err;
+        };
+        self.embedding_timer = w32.SetTimer(null, 0, 30_000, null);
+    } else {
+        self.registerHotkeys();
 
-    // Open our first window with one tab. Further windows/tabs can be
-    // opened via the `new_window`/`new_tab` actions (keybindings).
-    self.openInitialWindow() catch |err| {
-        log.err("failed to create initial window err={}", .{err});
-        return err;
-    };
+        // Open our first window with one tab. Further windows/tabs can be
+        // opened via the `new_window`/`new_tab` actions (keybindings).
+        self.openInitialWindow() catch |err| {
+            log.err("failed to create initial window err={}", .{err});
+            return err;
+        };
+    }
 
     var msg: w32.MSG = undefined;
     while (!self.quitting) {
         const ret = w32.GetMessageW(&msg, null, 0, 0);
         if (ret == 0 or ret == -1) break;
 
+        if (msg.hwnd == null and msg.message == w32.WM_TIMER and
+            self.embedding_timer != 0 and msg.wParam == self.embedding_timer)
+        {
+            _ = w32.KillTimer(null, self.embedding_timer);
+            self.embedding_timer = 0;
+            if (self.windows.items.len == 0 and self.handoffs.items.len == 0) {
+                log.warn("started for a console handoff that never came, quitting", .{});
+                break;
+            }
+            continue;
+        }
+
         // The config watcher's tick. A thread timer belongs to no window,
         // so nothing would dispatch it.
         if (msg.hwnd == null and msg.message == w32.WM_TIMER) {
             self.checkConfigChanged();
+            continue;
+        }
+
+        // A handed-off console session, queued by the COM call.
+        if (msg.hwnd == null and msg.message == wm_handoff) {
+            self.openHandoffs();
             continue;
         }
         // The quick terminal's hotkey, which is likewise the thread's.
@@ -1404,6 +1493,12 @@ pub fn performAction(
         .toggle_fullscreen => {
             const window = targetWindow(target) orelse return false;
             setFullscreen(window, !window.fullscreen);
+            return true;
+        },
+
+        .toggle_window_decorations => {
+            const window = targetWindow(target) orelse return false;
+            setDecorated(window, !window.decorated);
             return true;
         },
 
@@ -1793,16 +1888,41 @@ pub const Window = struct {
     /// rather than opening anew.
     quick: bool = false,
 
-    /// True while the tab strip owns the title bar, which is only the case
-    /// when the native strip is up. The GDI fallback keeps the system
-    /// title bar, because it has no caption buttons of its own.
+    /// Whether the window has its title bar and tab strip at all
+    /// (`window-decoration`, flipped at runtime by
+    /// `toggle_window_decorations`). Without them it is the terminal and a
+    /// resizable border, like Windows Terminal's focus mode.
+    decorated: bool = true,
+
+    /// True while the system caption is gone from the window: the native
+    /// tab strip is standing in for it, or the window has no decorations.
+    /// The GDI fallback strip keeps the system title bar, because it has no
+    /// caption buttons of its own.
     fn customFrame(self: *const Window) bool {
-        return self.tab_bar != null;
+        if (!self.decorated) return true;
+        return self.tab_bar != null and self.stripShown();
     }
 
+    /// Whether the tab strip is on screen. `window-show-tab-bar = auto` is
+    /// the same as `always` here: the strip is also the title bar, with the
+    /// caption buttons and the drag area, so hiding it for a single tab
+    /// would change what the window looks like every time a tab opens.
+    /// `never` gives the window the system title bar instead.
+    fn stripShown(self: *const Window) bool {
+        if (self.fullscreen or !self.decorated) return false;
+        return self.app.config.@"window-show-tab-bar" != .never;
+    }
+
+    /// The strip's height whether or not it is shown: where it is put
+    /// when it is out of sight, and what it needs when it comes back.
     fn stripHeight(self: *Window) i32 {
         if (self.tab_bar) |bar| return tabbar.ghostty_tabbar_height(bar);
         return tab_bar_height;
+    }
+
+    /// The height the strip takes from the terminal: none when hidden.
+    fn shownStripHeight(self: *Window) i32 {
+        return if (self.stripShown()) self.stripHeight() else 0;
     }
 
     fn indexOfTab(self: *Window, tab: *const Tab) ?usize {
@@ -2859,6 +2979,36 @@ fn openUrl(self: *App, value: apprt.action.OpenUrl) void {
     shellOpen(self.core_app.alloc, value.url, null);
 }
 
+/// Gives the window its title bar and tab strip, or takes them away.
+fn setDecorated(window: *Window, on: bool) void {
+    if (window.decorated == on) return;
+    window.decorated = on;
+    refreshFrame(window);
+}
+
+/// Has Windows ask for the frame again (WM_NCCALCSIZE) and lays the strip
+/// and the terminal out for it, after something `customFrame` or
+/// `stripShown` depend on changed. Fullscreen sets its own frame and puts
+/// this one back when it ends.
+fn refreshFrame(window: *Window) void {
+    if (window.fullscreen) return;
+    const flags = w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOZORDER |
+        w32.SWP_NOACTIVATE | w32.SWP_FRAMECHANGED;
+    _ = w32.SetWindowPos(window.hwnd, null, 0, 0, 0, 0, flags);
+    // The client area may keep its size (the strip only moves out of the
+    // way), and then no WM_SIZE comes: send one so the terminal grows into
+    // the strip's space or gives it back.
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(window.hwnd, &rect) != w32.FALSE) {
+        const kind: w32.WPARAM = if (w32.IsZoomed(window.hwnd) != 0) w32.SIZE_MAXIMIZED else 0;
+        const size: u32 = (@as(u32, @intCast(@max(0, rect.bottom))) << 16) |
+            @as(u32, @intCast(@max(0, rect.right) & 0xFFFF));
+        _ = w32.SendMessageW(window.hwnd, w32.WM_SIZE, kind, @intCast(size));
+    }
+    if (!window.customFrame()) applyTitlebarTheme(window.hwnd, &window.app.config);
+    reflow(window);
+}
+
 /// Puts the window into fullscreen or takes it back out.
 fn setFullscreen(window: *Window, on: bool) void {
     if (window.fullscreen == on) return;
@@ -3159,6 +3309,7 @@ fn newWindow(self: *App, adopt: ?*Tab) !*Window {
         .gl_hwnd = undefined,
         .hdc = undefined,
         .hglrc = undefined,
+        .decorated = self.config.@"window-decoration" != .none,
     };
 
     const hwnd = w32.CreateWindowExW(
@@ -3197,9 +3348,9 @@ fn newWindow(self: *App, adopt: ?*Tab) !*Window {
         // which sit on top of it, are not painted over by every swap.
         w32.WS_CHILD | w32.WS_VISIBLE | w32.WS_CLIPSIBLINGS,
         0,
-        window.stripHeight(),
+        window.shownStripHeight(),
         client_rect.right - client_rect.left,
-        @max(0, (client_rect.bottom - client_rect.top) - window.stripHeight()),
+        @max(0, (client_rect.bottom - client_rect.top) - window.shownStripHeight()),
         hwnd,
         null,
         self.hinstance,
@@ -3310,7 +3461,7 @@ fn newPane(
         .tab = tab,
         .core_surface = undefined,
         .core_ready = false,
-        .pending = .{ .context = context, .argv = argv },
+        .pending = .{ .context = context, .argv = argv, .handoff = self.pending_handoff },
         .title_buf = undefined,
         .title_len = 0,
         .cursor_pos = .{ .x = 0, .y = 0 },
@@ -3323,6 +3474,8 @@ fn newPane(
     node.* = .{ .data = .{ .leaf = surf } };
     surf.node = node;
 
+    // The pane owns it now.
+    self.pending_handoff = null;
     return surf;
 }
 
@@ -3370,6 +3523,17 @@ fn startPane(self: *App, surf: *Surface) !void {
         const owned = try arena.alloc([:0]const u8, a.len);
         for (a, owned) |src, *dst| dst.* = try arena.dupeSentinel(u8, src, 0);
         config.command = .{ .direct = owned };
+    };
+
+    // A handed-off console session: the core's exec backend takes it in
+    // place of starting the configured command (termio.Exec.WindowsHandoff).
+    termio.Exec.windows_handoff = pending.handoff;
+    defer if (termio.Exec.windows_handoff) |left| {
+        // The core failed before it took it.
+        termio.Exec.windows_handoff = null;
+        var dropped = left;
+        dropped.pty.deinit();
+        _ = internal_os.windows.exp.kernel32.CloseHandle(left.client);
     };
 
     try CoreSurface.init(
@@ -3535,7 +3699,10 @@ fn newTab(
         const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
         tab.bar_id = tabbar.ghostty_tabbar_add_tab(bar, title);
         if (tab.bar_id != 0) {
-            setTabIcon(self, window, tab, profile);
+            // A handed-off program is not the configured command, whose
+            // icon this would be.
+            const handed_off = if (surf.pending) |p| p.handoff != null else false;
+            if (!handed_off) setTabIcon(self, window, tab, profile);
             tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
         }
     }
@@ -4333,7 +4500,7 @@ fn tabTitle(tab: *Tab, buf: []u16) usize {
 fn syncOverviewLabels(window: *Window, width: i32, height: i32) void {
     const app = window.app;
     const alloc = app.core_app.alloc;
-    const strip = if (window.fullscreen) 0 else window.stripHeight();
+    const strip = window.shownStripHeight();
 
     while (window.overview_labels.items.len < window.tabs.items.len) {
         const label = w32.CreateWindowExW(
@@ -4699,6 +4866,9 @@ pub const Surface = struct {
         context: apprt.surface.NewSurfaceContext,
         /// Borrowed from the window's profile list, which outlives the pane.
         argv: ?[]const []const u8,
+        /// A handed-off console session to attach to instead of starting
+        /// a shell. Owned by the pane until its core takes it.
+        handoff: ?termio.Exec.WindowsHandoff = null,
     };
 
     pub fn deinit(self: *Surface) void {
@@ -5103,8 +5273,9 @@ fn frameWndProc(
             const width: i32 = w32.LOWORD(lparam);
             const height: i32 = w32.HIWORD(lparam);
             const full_strip = window.stripHeight();
-            // Fullscreen is the terminal and nothing else.
-            const strip: i32 = if (window.fullscreen) 0 else full_strip;
+            // Fullscreen, no decorations or `window-show-tab-bar = never`:
+            // the terminal and nothing else.
+            const strip: i32 = window.shownStripHeight();
 
             // A maximized window with a custom frame is positioned offset
             // by the frame thickness, which would push the top of the
@@ -5120,7 +5291,7 @@ fn frameWndProc(
                 // Out of sight above the window rather than hidden: XAML
                 // stops composing for a hidden island, and it would come
                 // back white.
-                const y: i32 = if (window.fullscreen) -full_strip else pad;
+                const y: i32 = if (window.stripShown()) pad else -full_strip;
                 tabbar.ghostty_tabbar_resize(bar, 0, y, width, full_strip);
                 tabbar.ghostty_tabbar_set_maximized(bar, if (maximized) 1 else 0);
             }
@@ -5176,7 +5347,7 @@ fn frameWndProc(
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);
             // The native strip paints itself; only the fallback needs us.
-            if (!window.customFrame()) paintTabBar(window, hdc);
+            if (window.tab_bar == null and window.stripShown()) paintTabBar(window, hdc);
             return 0;
         },
 

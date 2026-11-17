@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = mem.Allocator;
@@ -104,6 +105,14 @@ pub fn parse(
                 try dst.help();
                 return;
             }
+        }
+
+        // COM adds this to the command line when it starts Ghostty to
+        // take a console session as Windows' default terminal
+        // (apprt/win32/handoff.zig); it is not a config flag.
+        if (comptime builtin.os.tag == .windows) {
+            if (std.ascii.eqlIgnoreCase(arg, "-Embedding") or
+                std.ascii.eqlIgnoreCase(arg, "/Embedding")) continue;
         }
 
         // If this doesn't start with "--" then it isn't a config

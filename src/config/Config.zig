@@ -2156,6 +2156,12 @@ keybind: Keybinds = .{},
 ///
 /// macOS: To hide the titlebar without removing the native window borders
 ///        or rounded corners, use `macos-titlebar-style = hidden` instead.
+///
+/// Windows: `none` removes the title bar and the tab strip and keeps the
+///          resizable border, like Windows Terminal's focus mode; the other
+///          values are all the same. As with any option, it can be given
+///          for one window on the command line:
+///          `ghostty --window-decoration=none -e btop`.
 @"window-decoration": WindowDecoration = .auto,
 
 /// The font that will be used for the application's window and tab titles.
@@ -2334,7 +2340,9 @@ keybind: Keybinds = .{},
 ///    Never show the tab bar. Tabs are only accessible via the tab
 ///    overview or by keybind actions.
 ///
-/// Currently only supported on Linux (GTK).
+/// Currently only supported on Linux (GTK) and Windows. On Windows the tab
+/// bar is also the title bar, with the caption buttons, so `auto` keeps it
+/// up even with one tab, and `never` brings back the system title bar.
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if

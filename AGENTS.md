@@ -54,6 +54,22 @@ Launch the result with
 a signed `.msix` to hand to someone else; it prompts for a password, so do
 not run it unattended.
 
+Windows' default terminal (`src/apprt/win32/handoff.zig`): COM starts
+`ghostty.exe -Embedding` and calls `ITerminalHandoff3`; the session is
+attached through `Pty.adopt` and `termio.Exec.WindowsHandoff`. The setup.exe
+registers the class under HKCU; choosing Ghostty is
+`HKCU\Console\%%Startup` `DelegationTerminal` = its CLSID with
+`DelegationConsole` left on Windows Terminal's OpenConsole (its proxy DLL
+carries the interface). To test a build without installing it, point
+`HKCU\Software\Classes\CLSID\{5BFD48CD-0D7C-4D2C-96BB-2CC643119AB7}\LocalServer32`
+at the staged exe, set `DelegationTerminal` for the test only (put Windows
+Terminal's `{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}` back after), and run
+`Start-Process cmd.exe`.
+
+`window-decoration = none` (or `--window-decoration=none`) drops the title
+bar and the tab strip, like Windows Terminal's focus mode;
+`window-show-tab-bar = never` keeps the system title bar instead.
+
 ## libghostty-vt
 
 - Build: `zig build -Demit-lib-vt`

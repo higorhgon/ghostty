@@ -65,5 +65,14 @@ Source: "layout\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs create
 Name: "{userprograms}\Ghostty"; Filename: "{app}\bin\ghostty.exe"; AppUserModelID: "{#AppUserModelID}"
 Name: "{userdesktop}\Ghostty"; Filename: "{app}\bin\ghostty.exe"; AppUserModelID: "{#AppUserModelID}"; Tasks: desktopicon
 
+[Registry]
+; The class Windows' console host calls to hand a console session to Ghostty
+; when it is the default terminal (src/apprt/win32/handoff.zig, which holds
+; the same CLSID). COM starts ghostty.exe with -Embedding for it. Registering
+; it changes nothing by itself: the default terminal is chosen by
+; HKCU\Console\%%Startup DelegationTerminal, which this leaves alone.
+Root: HKCU; Subkey: "Software\Classes\CLSID\{{5BFD48CD-0D7C-4D2C-96BB-2CC643119AB7}"; ValueType: string; ValueData: "Ghostty terminal handoff"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\CLSID\{{5BFD48CD-0D7C-4D2C-96BB-2CC643119AB7}\LocalServer32"; ValueType: string; ValueData: """{app}\bin\ghostty.exe"""
+
 [Run]
 Filename: "{app}\bin\ghostty.exe"; Description: "{cm:LaunchProgram,Ghostty}"; Flags: nowait postinstall skipifsilent

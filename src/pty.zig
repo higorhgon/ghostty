@@ -364,6 +364,17 @@ const WindowsPty = struct {
             windows.COORD,
         ) callconv(.winapi) windows.HRESULT,
         close: *const fn (windows.HPCON) callconv(.winapi) void,
+        /// Only in conpty.dll: wraps the handles of a console session
+        /// someone else started (see `adopt`) into a pseudoconsole.
+        pack: ?*const fn (
+            windows.HANDLE,
+            windows.HANDLE,
+            windows.HANDLE,
+            *windows.HPCON,
+        ) callconv(.winapi) windows.HRESULT = null,
+        /// Only in conpty.dll: lets go of the session's reference handle,
+        /// so the console host ends once the last program in it does.
+        release: ?*const fn (windows.HPCON) callconv(.winapi) windows.HRESULT = null,
 
         const system: Conpty = .{
             .create = &windows.exp.kernel32.CreatePseudoConsole,
@@ -388,10 +399,14 @@ const WindowsPty = struct {
                 log.warn("conpty.dll is missing an export, using the system ConPTY", .{});
                 return system;
             }
+            const pack = k32.GetProcAddress(module, "ConptyPackPseudoConsole");
+            const release = k32.GetProcAddress(module, "ConptyReleasePseudoConsole");
             return .{
                 .create = @ptrCast(create.?),
                 .resize = @ptrCast(resize.?),
                 .close = @ptrCast(close.?),
+                .pack = if (pack) |p| @ptrCast(p) else null,
+                .release = if (release) |r| @ptrCast(r) else null,
             };
         }
     };
@@ -400,6 +415,85 @@ const WindowsPty = struct {
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
+        var pty = try openPipes();
+        errdefer pty.closePipes();
+
+        pty.conpty = Conpty.load();
+        const result = pty.conpty.create(
+            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+            pty.in_pipe_pty,
+            pty.out_pipe_pty,
+            0,
+            &pty.pseudo_console,
+        );
+        if (result != windows.S_OK) return error.Unexpected;
+
+        pty.size = size;
+        return pty;
+    }
+
+    /// The ends of an adopted session's pipes that belong to the console
+    /// host: it reads the terminal's input from `input` and writes the
+    /// program's output to `output`.
+    pub const HostPipes = struct {
+        input: windows.HANDLE,
+        output: windows.HANDLE,
+    };
+
+    /// A PTY for a console session that is already running: one Windows
+    /// handed over because Ghostty is the default terminal (the
+    /// `ITerminalHandoff3` call, see apprt/win32/handoff.zig). The console
+    /// host is already up and the program already started in it, so there
+    /// is nothing to create, only pipes to give the host and its handles to
+    /// wrap into a pseudoconsole, which is what Windows Terminal does with
+    /// the same call. `server`, `reference` and `signal` become the PTY's;
+    /// the returned host pipes are the caller's to hand over.
+    ///
+    /// Needs the conpty.dll beside the executable: only it can wrap
+    /// handles, and a pseudoconsole it made must be resized and closed by
+    /// it too.
+    pub fn adopt(
+        server: windows.HANDLE,
+        reference: windows.HANDLE,
+        signal: windows.HANDLE,
+    ) OpenError!struct { pty: Pty, host: HostPipes } {
+        var pty = try openPipes();
+        errdefer pty.closePipes();
+
+        pty.conpty = Conpty.load();
+        const pack = pty.conpty.pack orelse {
+            log.warn("no conpty.dll with ConptyPackPseudoConsole beside ghostty.exe, cannot take a console handoff", .{});
+            return error.Unexpected;
+        };
+        if (pack(server, reference, signal, &pty.pseudo_console) != windows.S_OK) {
+            return error.Unexpected;
+        }
+
+        const host: HostPipes = .{ .input = pty.in_pipe_pty, .output = pty.out_pipe_pty };
+        // Given away: the caller hands them to the console host, and COM
+        // closes them once they are across.
+        pty.in_pipe_pty = windows.INVALID_HANDLE_VALUE;
+        pty.out_pipe_pty = windows.INVALID_HANDLE_VALUE;
+        pty.size = .{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+        return .{ .pty = pty, .host = host };
+    }
+
+    /// Lets go of an adopted session's reference handle once the PTY has
+    /// its real size: from then on the console host ends when the program
+    /// does, as it would for a session Ghostty started.
+    pub fn releaseReference(self: *Pty) void {
+        if (self.conpty.release) |release| _ = release(self.pseudo_console);
+    }
+
+    fn closePipes(self: *Pty) void {
+        for ([_]windows.HANDLE{ self.in_pipe_pty, self.in_pipe, self.out_pipe_pty, self.out_pipe }) |h| {
+            if (h != windows.INVALID_HANDLE_VALUE) _ = windows.exp.kernel32.CloseHandle(h);
+        }
+    }
+
+    /// The pipes between Ghostty and the console host. Ghostty writes to
+    /// `in_pipe` and reads `out_pipe`; the host gets the `_pty` ends.
+    fn openPipes() OpenError!Pty {
         var pty: Pty = undefined;
 
         var pipe_path_buf: [128]u8 = undefined;
@@ -553,25 +647,11 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        pty.conpty = Conpty.load();
-        const result = pty.conpty.create(
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-            pty.in_pipe_pty,
-            pty.out_pipe_pty,
-            0,
-            &pty.pseudo_console,
-        );
-        if (result != windows.S_OK) return error.Unexpected;
-
-        pty.size = size;
         return pty;
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+        self.closePipes();
         self.conpty.close(self.pseudo_console);
         self.* = undefined;
     }

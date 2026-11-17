@@ -54,6 +54,24 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
     pub const Completion = struct {};
 } else internal_os.FlatpakHostCommand;
 
+/// A console session Windows handed to Ghostty as the default terminal
+/// (apprt/win32/handoff.zig): the console host and the program in it are
+/// already running, so the surface that takes it starts nothing and just
+/// attaches to them.
+pub const WindowsHandoff = if (builtin.os.tag == .windows) struct {
+    /// From `Pty.adopt`.
+    pty: Pty,
+    /// The program the session was started for. The surface ends when it
+    /// does, as it would when its own shell exits.
+    client: windows.HANDLE,
+} else void;
+
+/// Set by the apprt, on its own thread, around the creation of the one
+/// surface that takes a handoff; `Subprocess.init` consumes it. A global
+/// rather than a config field because the surface config is shared with
+/// every runtime, and this is a Windows apprt matter.
+pub var windows_handoff: ?WindowsHandoff = null;
+
 /// The subprocess state for our exec backend.
 subprocess: Subprocess,
 
@@ -658,6 +676,9 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+    /// A handed-off console session to attach to instead of starting
+    /// `args` (see `WindowsHandoff`).
+    handoff: ?WindowsHandoff = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -931,11 +952,17 @@ const Subprocess = struct {
         // https://github.com/ghostty-org/ghostty/discussions/7769
         if (cwd) |pwd| try env.put("PWD", pwd);
 
+        // Last, after everything that can fail: on failure the apprt still
+        // owns it and cleans it up.
+        const handoff = windows_handoff;
+        windows_handoff = null;
+
         return .{
             .arena = arena,
             .env = env,
             .cwd = cwd,
             .args = args,
+            .handoff = handoff,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -950,6 +977,11 @@ const Subprocess = struct {
     pub fn deinit(self: *Subprocess) void {
         self.stop();
         if (self.pty) |*pty| pty.deinit();
+        // A handoff that was never started.
+        if (comptime builtin.os.tag == .windows) if (self.handoff) |*h| {
+            h.pty.deinit();
+            _ = windows.exp.kernel32.CloseHandle(h.client);
+        };
         if (self.env) |*env| env.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -957,11 +989,18 @@ const Subprocess = struct {
 
     /// Start the subprocess. If the subprocess is already started this
     /// will crash.
-    pub fn start(self: *Subprocess, alloc: Allocator) !struct {
+    /// The ends of the pty Ghostty reads from and writes to.
+    const PtyFds = struct {
         read: Pty.Fd,
         write: Pty.Fd,
-    } {
+    };
+
+    pub fn start(self: *Subprocess, alloc: Allocator) !PtyFds {
         assert(self.pty == null and self.process == null);
+
+        if (comptime builtin.os.tag == .windows) if (self.handoff) |h| {
+            return self.startHandoff(h);
+        };
 
         // This function is funny because on POSIX systems it can
         // fail in the forked process. This is flipped to true if
@@ -1155,6 +1194,46 @@ const Subprocess = struct {
                 .write = pty.master,
             },
         };
+    }
+
+    /// `start` for a handed-off console session: the program is already
+    /// running in it, so the pty is sized and the program tracked as if
+    /// Ghostty had started it.
+    fn startHandoff(self: *Subprocess, h: WindowsHandoff) !PtyFds {
+        self.handoff = null;
+        self.pty = h.pty;
+        const pty = &self.pty.?;
+
+        // The session was packed before there was a window to size it by.
+        pty.setSize(.{
+            .ws_row = @intCast(self.grid_size.rows),
+            .ws_col = @intCast(self.grid_size.columns),
+            .ws_xpixel = @intCast(self.screen_size.width),
+            .ws_ypixel = @intCast(self.screen_size.height),
+        }) catch |err| log.warn("could not size the handed-off console err={}", .{err});
+        pty.releaseReference();
+
+        // Never started, only watched and, when the surface closes,
+        // terminated, which is what the process watcher and `stop` do with
+        // a Command's pid.
+        self.process = .{ .fork_exec = .{
+            .path = self.args[0],
+            .args = self.args,
+            .os_pre_exec = null,
+            .rt_pre_exec = null,
+            .rt_pre_exec_info = self.rt_pre_exec_info,
+            .rt_post_fork = null,
+            .rt_post_fork_info = self.rt_post_fork_info,
+            .pseudo_console = pty.pseudo_console,
+            .pid = h.client,
+        } };
+        log.info("attached to a handed-off console session", .{});
+
+        if (self.env) |*env| {
+            env.deinit();
+            self.env = null;
+        }
+        return .{ .read = pty.out_pipe, .write = pty.in_pipe };
     }
 
     /// This should be called after fork but before exec in the child process.
