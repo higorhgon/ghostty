@@ -222,6 +222,10 @@ const w32 = struct {
     pub const WM_NCCALCSIZE: UINT = 0x0083;
     pub const WM_NCHITTEST: UINT = 0x0084;
     pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+    pub const WM_SYSCOMMAND: UINT = 0x0112;
+    /// SC_MOVE with HTCAPTION in its low bits is what a press on a real
+    /// title bar becomes: a move that follows the mouse, not the keyboard.
+    pub const SC_MOVE: WPARAM = 0xF010;
 
     pub const HTCLIENT: LRESULT = 1;
     pub const HTCAPTION: LRESULT = 2;
@@ -359,6 +363,10 @@ const w32 = struct {
     pub extern "user32" fn GetDC(HWND) callconv(.winapi) ?HDC;
     pub extern "user32" fn ReleaseDC(HWND, HDC) callconv(.winapi) c_int;
     pub extern "user32" fn GetKeyState(c_int) callconv(.winapi) i16;
+    pub extern "user32" fn GetAsyncKeyState(c_int) callconv(.winapi) i16;
+    pub extern "user32" fn GetKeyboardState(*[256]u8) callconv(.winapi) BOOL;
+    pub extern "user32" fn SetKeyboardState(*[256]u8) callconv(.winapi) BOOL;
+    pub const VK_LBUTTON = 0x01;
     pub extern "user32" fn SetWindowTextW(HWND, [*:0]const u16) callconv(.winapi) BOOL;
     pub extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
     pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
@@ -2225,10 +2233,35 @@ const bar_callbacks = struct {
     /// Hand the drag to the system's move loop. The strip is a child HWND
     /// and swallows the mouse, so WM_NCHITTEST on the frame never sees
     /// these points and cannot report HTCAPTION for them.
+    ///
+    /// The system's move loop gives up at once unless this thread's key
+    /// state has the left button down, and here it never does: the press
+    /// went to the XAML island, which takes mouse input through its own
+    /// input site, so the thread never saw a WM_LBUTTONDOWN. Measured: the
+    /// loop saw the button up and returned in 0 ms, so dragging the title
+    /// bar did nothing. The button is therefore marked down in the thread's
+    /// key state first, but only when it really is down, after which the
+    /// loop runs as for a native title bar: until the button is released,
+    /// with snapping and the move events window managers listen for.
+    ///
+    /// Posted, not sent, so that the loop starts once the island has
+    /// finished with the press rather than inside its PointerPressed.
     fn onDragStart(ctx: ?*anyopaque) callconv(.c) void {
         const win = window(ctx) orelse return;
+        if (w32.GetAsyncKeyState(w32.VK_LBUTTON) < 0) {
+            var keys: [256]u8 = undefined;
+            if (w32.GetKeyboardState(&keys) != w32.FALSE) {
+                keys[w32.VK_LBUTTON] |= 0x80;
+                _ = w32.SetKeyboardState(&keys);
+            }
+        }
         _ = w32.ReleaseCapture();
-        _ = w32.SendMessageW(win.hwnd, w32.WM_NCLBUTTONDOWN, w32.HTCAPTION, 0);
+        _ = w32.PostMessageW(
+            win.hwnd,
+            w32.WM_SYSCOMMAND,
+            w32.SC_MOVE | @as(w32.WPARAM, @intCast(w32.HTCAPTION)),
+            0,
+        );
     }
 
     fn onDragDoubleClick(ctx: ?*anyopaque) callconv(.c) void {
