@@ -52,6 +52,15 @@ typedef void (*GhosttyNewTabFn)(void* ctx, GhosttyProfileId profile);
 
 #define GHOSTTY_PROFILE_DEFAULT ((GhosttyProfileId)0xFFFFFFFFu)
 
+// The dropdown's two rows that are not shells. They arrive through
+// on_new_tab like any other row, under these ids.
+#define GHOSTTY_MENU_SETTINGS ((GhosttyProfileId)0xFFFFFFF0u)
+#define GHOSTTY_MENU_PALETTE ((GhosttyProfileId)0xFFFFFFF1u)
+
+// Or-ed into a shell's id when the user held Ctrl while picking it, which
+// asks for that shell elevated.
+#define GHOSTTY_PROFILE_ELEVATED ((GhosttyProfileId)0x40000000u)
+
 // Which caption button was pressed. The strip doubles as the title bar
 // (Windows Terminal style), so it draws these itself -- removing the
 // system title bar also removes the system's buttons.
@@ -77,6 +86,14 @@ typedef void (*GhosttyDragStartFn)(void* ctx);
 // maximize.
 typedef void (*GhosttyDragDoubleClickFn)(void* ctx);
 
+// The user dragged a tab to a new place in the strip. `index` is where it
+// now sits, counting from zero. The strip has already moved it; this is so
+// the host can keep its own list in the same order.
+typedef void (*GhosttyTabMovedFn)(void* ctx, GhosttyTabId tab, int32_t index);
+
+// The user pressed the tab overview button.
+typedef void (*GhosttyOverviewFn)(void* ctx);
+
 typedef struct {
     void* ctx;
     GhosttyTabSelectedFn on_selected;
@@ -85,7 +102,78 @@ typedef struct {
     GhosttyCaptionFn on_caption_button;
     GhosttyDragStartFn on_drag_start;
     GhosttyDragDoubleClickFn on_drag_double_click;
+    GhosttyTabMovedFn on_tab_moved;
+    GhosttyOverviewFn on_overview;
+    // The user right-clicked a tab. The host decides what to offer,
+    // typically with ghostty_tabbar_popup_menu.
+    GhosttyTabSelectedFn on_tab_context;
 } GhosttyTabBarCallbacks;
+
+// The input popup: a line of text with an optional list under it. It is
+// the search box, the command palette and the rename prompt; which one is
+// up to the host, which is told what was typed, what was picked, and that
+// the popup was dismissed.
+//
+// on_text fires as the text changes. on_submit fires on Enter or a click
+// on an item: `index` is the selected item or -1 when there is no list,
+// `shift` is non-zero when Shift was held. on_cancel fires on Escape or
+// when the popup loses activation.
+typedef void (*GhosttyInputTextFn)(void* ctx, const wchar_t* text);
+typedef void (*GhosttyInputSubmitFn)(
+    void* ctx, int32_t index, const wchar_t* text, int32_t shift);
+typedef void (*GhosttyInputCancelFn)(void* ctx);
+
+typedef struct {
+    void* ctx;
+    GhosttyInputTextFn on_text;
+    GhosttyInputSubmitFn on_submit;
+    GhosttyInputCancelFn on_cancel;
+} GhosttyInputCallbacks;
+
+// Shows the popup at a screen position, `width` pixels wide. With
+// `keep_open` non-zero, Enter reports and leaves the popup up.
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_show(
+    GhosttyTabBar* bar, int32_t x, int32_t y, int32_t width,
+    const wchar_t* placeholder, const wchar_t* text, int32_t keep_open,
+    GhosttyInputCallbacks callbacks);
+
+// Replaces the list under the text. A count of zero removes the list.
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_set_items(
+    GhosttyTabBar* bar, const wchar_t* const* items, int32_t count);
+
+// A short note at the right of the text, such as "3/17". NULL or empty
+// removes it.
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_set_status(
+    GhosttyTabBar* bar, const wchar_t* text);
+
+// Hides the popup without firing on_cancel.
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_hide(GhosttyTabBar* bar);
+
+GHOSTTY_TABBAR_API int32_t ghostty_tabbar_input_visible(GhosttyTabBar* bar);
+
+// Shows a context menu at a screen position, or at the pointer when both
+// coordinates are negative, and returns the id of what was picked or 0. A
+// NULL label is a separator. Blocks until the menu closes.
+GHOSTTY_TABBAR_API uint32_t ghostty_tabbar_popup_menu(
+    GhosttyTabBar* bar, int32_t x, int32_t y, const wchar_t* const* labels,
+    const uint32_t* ids, int32_t count);
+
+// Shows a desktop notification. Needs package identity, like the strip.
+GHOSTTY_TABBAR_API void ghostty_tabbar_notify(
+    const wchar_t* title, const wchar_t* body);
+
+typedef enum {
+    GHOSTTY_PROGRESS_NONE = 0,
+    GHOSTTY_PROGRESS_NORMAL = 1,
+    GHOSTTY_PROGRESS_ERROR = 2,
+    GHOSTTY_PROGRESS_INDETERMINATE = 3,
+    GHOSTTY_PROGRESS_PAUSED = 4,
+} GhosttyProgressState;
+
+// Shows progress on a window's taskbar button. `hwnd` is the top-level
+// window; `percent` is 0-100 and ignored for NONE and INDETERMINATE.
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_progress(
+    void* hwnd, int32_t state, int32_t percent);
 
 // Creates the tab strip as a child of `parent_hwnd`. Returns NULL on
 // failure. `parent_hwnd` is a HWND (void* to keep windows.h out of this
@@ -114,6 +202,11 @@ GHOSTTY_TABBAR_API GhosttyTabId ghostty_tabbar_add_tab(
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_remove_tab(
     GhosttyTabBar* bar, GhosttyTabId tab);
+
+// Moves a tab to `index`, counting from zero, without firing on_tab_moved
+// (this is Ghostty telling the strip, not the user dragging).
+GHOSTTY_TABBAR_API void ghostty_tabbar_move_tab(
+    GhosttyTabBar* bar, GhosttyTabId tab, int32_t index);
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_title(
     GhosttyTabBar* bar, GhosttyTabId tab, const wchar_t* title);

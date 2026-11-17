@@ -22,14 +22,23 @@
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <winrt/Windows.System.h>
 #include <shellapi.h>
+// FSCTL_GET_REPARSE_POINT; WIN32_LEAN_AND_MEAN leaves it out of windows.h.
+#include <winioctl.h>
 #include <dwmapi.h>
 #include <robuffer.h>
+// ITaskbarList3, for progress on the taskbar button.
+#include <shobjidl.h>
+// SetWindowTheme, for a dark scrollbar in the input popup's list.
+#include <uxtheme.h>
+#include <winrt/Windows.Data.Xml.Dom.h>
+#include <winrt/Windows.UI.Notifications.h>
 
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.XamlTypeInfo.h>
 
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -144,6 +153,7 @@ private:
 // Defined further down, alongside the menu itself. Declared here so the
 // bar can hold a pointer to the open one.
 struct ProfileMenu;
+struct InputPopup;
 
 } // namespace
 
@@ -175,6 +185,21 @@ struct GhosttyTabBar {
     WUX::Media::SolidColorBrush b_selected{nullptr};
     WUX::Media::SolidColorBrush b_unselected{nullptr};
     WUX::Media::SolidColorBrush b_hover{nullptr};
+    WUX::Media::SolidColorBrush b_pressed{nullptr};
+
+    /// The tab and button templates and the brushes above, parsed for
+    /// this bar alone and merged into its own root rather than into the
+    /// Application.
+    ///
+    /// The Application is shared by every window in the process, and its
+    /// dictionary used to be where these went. A second window then merged
+    /// a second copy on top, and the objects its templates are built from
+    /// ended up belonging to two XAML trees at once -- which XAML answers
+    /// by killing the process ("Failed to assign to property
+    /// Path.Data"). So every new window, the quick terminal and a tab
+    /// moved to a window of its own all took Ghostty down. One dictionary
+    /// per bar keeps each tree's objects its own.
+    WUX::ResourceDictionary theme_dict{nullptr};
 
     std::unordered_map<GhosttyTabId, MUX::Controls::TabViewItem> tabs;
     GhosttyTabId next_id = 1;
@@ -182,6 +207,9 @@ struct GhosttyTabBar {
     // Guards against feedback loops: when Ghostty drives the selection we
     // must not report it back as if the user had clicked.
     bool suppress_selection = false;
+    // The same for the order: set while Ghostty adds, removes or moves a
+    // tab, so that only a drag by the user is reported as a move.
+    bool suppress_items = false;
 
     /// Set on the strip's first composed frame. Until then the island
     /// paints white, so the host keeps the window off-screen.
@@ -192,9 +220,18 @@ struct GhosttyTabBar {
     /// GetMessageTime of the moment the profile menu last closed, so a
     /// click on the chevron that closed it cannot immediately reopen it.
     LONG menu_closed_at = 0;
-    /// The open profile menu, or null. Owned by the menu itself, which
-    /// clears this as it closes.
+    /// The profile menu, or null until it is first built. It outlives
+    /// being closed: see ProfileMenu for why it is parked, not destroyed.
     ProfileMenu* menu = nullptr;
+    /// Set when the profiles or the theme changed since the menu was last
+    /// built, so its content has to be laid out again.
+    bool menu_dirty = true;
+    /// Builds the menu shortly after startup, so the first click on the
+    /// chevron does not pay for a XAML island.
+    WUX::DispatcherTimer menu_prewarm{nullptr};
+    /// The search box / command palette / rename prompt, built on first
+    /// use and then kept.
+    InputPopup* input = nullptr;
 
     /// Menu chrome. Kept as plain colours, not brushes: the menu lives in
     /// a second XAML island with its own XamlRoot, and a Brush belongs to
@@ -269,6 +306,7 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
               <SolidColorBrush x:Key="GhosttyTabSelected" Color="#FF202020"/>
               <SolidColorBrush x:Key="GhosttyTabUnselected" Color="#FF141414"/>
               <SolidColorBrush x:Key="GhosttyTabHover" Color="#FF2D2D2D"/>
+              <SolidColorBrush x:Key="GhosttyTabPressed" Color="#FF3A3A3A"/>
               <SolidColorBrush x:Key="GhosttyMenuBackground" Color="#FF202020"/>
               <SolidColorBrush x:Key="GhosttyMenuBorder" Color="#FF303030"/>
 
@@ -364,16 +402,23 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
     // themed brush instead of WinUI's default translucent overlay. That
     // overlay is also why lighting the pair from code did not match:
     // whichever half the pointer sat on stacked the overlay on top of the
-    // brush and came out lighter. Here "lit" is the same brush as
-    // "hovered", so the two halves cannot disagree.
+    // brush and came out lighter.
+    //
+    // Three fills, as in Windows Terminal: hovered, pressed (a step
+    // lighter again, which is the only feedback a click gets), and "lit"
+    // while the profile menu is open. Lit is a second Border drawn over the
+    // state-driven one and filled from BorderBrush -- unused otherwise,
+    // since these buttons have no border -- so that code can light both
+    // halves at once and neither half's pointer state can disagree with it.
     static constexpr wchar_t kXamlFooter[] =
         LR"XAML(   <Style x:Key="GhosttyFooterButtonStyle" TargetType="Button">
                 <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="BorderBrush" Value="Transparent"/>
                 <Setter Property="Foreground" Value="{ThemeResource TabViewItemHeaderForeground}"/>
                 <Setter Property="Template">
                   <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                      <Border x:Name="Root" Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}">
+                      <Grid>
                         <VisualStateManager.VisualStateGroups>
                           <VisualStateGroup x:Name="CommonStates">
                             <VisualState x:Name="Normal"/>
@@ -384,14 +429,16 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
                             </VisualState>
                             <VisualState x:Name="Pressed">
                               <VisualState.Setters>
-                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabHover}"/>
+                                <Setter Target="Root.Background" Value="{StaticResource GhosttyTabPressed}"/>
                               </VisualState.Setters>
                             </VisualState>
                             <VisualState x:Name="Disabled"/>
                           </VisualStateGroup>
                         </VisualStateManager.VisualStateGroups>
+                        <Border x:Name="Root" Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}"/>
+                        <Border x:Name="Lit" Background="{TemplateBinding BorderBrush}" CornerRadius="{TemplateBinding CornerRadius}"/>
                         <ContentPresenter x:Name="ContentPresenter" HorizontalAlignment="Center" VerticalAlignment="Center" Content="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"/>
-                      </Border>
+                      </Grid>
                     </ControlTemplate>
                   </Setter.Value>
                 </Setter>
@@ -616,7 +663,9 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
         Log("theme: XamlReader did not yield a ResourceDictionary");
         return false;
     }
-    app.Resources().MergedDictionaries().Append(dict);
+    // Merged into the bar's root once that exists, not into the
+    // Application: see GhosttyTabBar::theme_dict.
+    bar->theme_dict = dict;
 
     auto grab = [&](wchar_t const* key) {
         return dict.TryLookup(winrt::box_value(key))
@@ -625,6 +674,7 @@ bool InstallThemeOverrides(GhosttyTabBar* bar) {
     bar->b_selected = grab(L"GhosttyTabSelected");
     bar->b_unselected = grab(L"GhosttyTabUnselected");
     bar->b_hover = grab(L"GhosttyTabHover");
+    bar->b_pressed = grab(L"GhosttyTabPressed");
 
     Log("theme: template installed (selected=%d unselected=%d hover=%d)",
         bar->b_selected ? 1 : 0, bar->b_unselected ? 1 : 0,
@@ -649,6 +699,9 @@ struct Profile {
     GhosttyProfileId id;
     std::wstring name;
     std::wstring icon_path;
+    /// A Segoe Fluent Icons glyph to show instead of a file's icon, for
+    /// the rows that are commands rather than shells.
+    std::wstring glyph;
 };
 std::unordered_map<GhosttyTabBar*, std::vector<Profile>> g_profiles;
 
@@ -716,6 +769,11 @@ constexpr wchar_t kGlyphMaximize[] = L"";
 constexpr wchar_t kGlyphRestore[]  = L"";
 constexpr wchar_t kGlyphClose[]    = L"";
 
+// TaskView, E7C4: the overlapping-windows glyph Windows itself uses for
+// "show me everything that is open". Spelled as a number so that it does
+// not depend on the literals above surviving an editor.
+constexpr wchar_t kGlyphOverview[] = {0xE7C4, 0};
+
 // Builds one caption button. `danger` gives the close button the standard
 // red hover treatment.
 WUX::Controls::Button MakeCaptionButton(
@@ -773,19 +831,37 @@ WUX::Controls::Button MakeCaptionButton(
 // it is shown, activated, and left to the host's message loop; it closes
 // itself when an item is picked, when Escape is pressed, or when it loses
 // activation.
+//
+// It is built once and then kept, parked off-screen while closed, rather
+// than created on every click. Building it on demand cost the better part
+// of half a second -- a second XAML island each time -- and the window was
+// on screen before XAML had composed anything into it, so it opened as an
+// empty frame with the terminal showing through. Hiding it instead of
+// parking it would bring that frame back: XAML does not compose for a
+// hidden window, which is the same reason the main window starts life
+// off-screen. Parked, it is already composed, and opening it is a move.
 struct ProfileMenu {
     GhosttyTabBar* bar = nullptr;
     HWND hwnd = nullptr;
     WUX::Hosting::DesktopWindowXamlSource source{nullptr};
     com_ptr<IDesktopWindowXamlSourceNative2> native;
-    // Guards against re-entering Close from inside WM_DESTROY.
-    bool closing = false;
+    /// On screen and taking input, as opposed to parked.
+    bool open = false;
     /// Set once the window has actually taken activation. Until then a
     /// WM_ACTIVATE(WA_INACTIVE) is part of the show sequence, not the user
     /// dismissing anything -- closing on it made the menu vanish the
     /// instant it appeared.
     bool activated = false;
+    /// One row per profile, in order, and the profile each one opens.
+    std::vector<WUX::Controls::Border> rows;
+    std::vector<GhosttyProfileId> ids;
+    /// The row the pointer or the arrow keys are on, or -1.
+    int highlighted = -1;
 };
+
+// Where a closed menu waits. The same coordinates Windows itself uses for
+// a minimized window, so nothing treats it as being on any monitor.
+constexpr int kMenuParkedAt = -32000;
 
 constexpr wchar_t kMenuClassName[] = L"GhosttyProfileMenu";
 
@@ -802,12 +878,66 @@ constexpr UINT WM_GHOSTTY_SHOW_MENU = WM_APP + 1;
 constexpr int kMenuItemHeight = 32;
 constexpr int kMenuIconSize = 16;
 constexpr int kMenuPadding = 4;
-constexpr int kMenuWidth = 220;
+constexpr int kMenuWidth = 300;
 constexpr int kMenuCornerRadius = 8;
 
 std::unordered_map<HWND, ProfileMenu*> g_menus;
 
-void CloseProfileMenu(ProfileMenu* menu);
+/// Follows an app execution alias to the executable behind it.
+///
+/// A Store-installed shell is reached through a zero-byte stub in
+/// %LOCALAPPDATA%\Microsoft\WindowsApps -- that is what `pwsh.exe` resolves
+/// to on the search path when PowerShell came from the Store or winget's
+/// MSIX. The stub has no resources, so asking the shell for its icon gets
+/// the generic "program" one. The real path is recorded in the stub's
+/// reparse data: a version, then three NUL-terminated strings, of which
+/// the third is the target executable. Anything that is not such a stub
+/// comes back unchanged.
+std::wstring ResolveAppExecAlias(std::wstring const& path) {
+    const DWORD attrs = ::GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        !(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return path;
+    }
+
+    HANDLE file = ::CreateFileW(
+        path.c_str(), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return path;
+
+    std::vector<uint8_t> data(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    DWORD got = 0;
+    const BOOL ok = ::DeviceIoControl(
+        file, FSCTL_GET_REPARSE_POINT, nullptr, 0, data.data(),
+        static_cast<DWORD>(data.size()), &got, nullptr);
+    ::CloseHandle(file);
+
+    // An 8-byte reparse header, then the 4-byte version.
+    constexpr size_t kStrings = 12;
+    if (!ok || got <= kStrings) return path;
+    DWORD tag = 0;
+    memcpy(&tag, data.data(), sizeof(tag));
+    if (tag != IO_REPARSE_TAG_APPEXECLINK) return path;
+
+    const size_t count = (got - kStrings) / sizeof(wchar_t);
+    std::vector<wchar_t> text(count);
+    memcpy(text.data(), data.data() + kStrings, count * sizeof(wchar_t));
+
+    size_t start = 0;
+    for (int field = 0; field < 3; ++field) {
+        size_t end = start;
+        while (end < count && text[end] != L'\0') ++end;
+        if (field == 2) {
+            return end > start
+                       ? std::wstring(text.data() + start, end - start)
+                       : path;
+        }
+        start = end + 1;
+        if (start >= count) break;
+    }
+    return path;
+}
 
 /// Turns a file's shell icon into something XAML can draw.
 ///
@@ -816,8 +946,9 @@ void CloseProfileMenu(ProfileMenu* menu);
 /// WriteableBitmap wants, so this is a straight copy -- except that icon
 /// bitmaps carry straight alpha and XAML expects it premultiplied, hence
 /// the scaling of the colour channels.
-WUX::Media::Imaging::WriteableBitmap LoadShellIcon(std::wstring const& path) {
-    if (path.empty()) return nullptr;
+WUX::Media::Imaging::WriteableBitmap LoadShellIcon(std::wstring const& given) {
+    if (given.empty()) return nullptr;
+    const std::wstring path = ResolveAppExecAlias(given);
 
     SHFILEINFOW info{};
     if (!::SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info),
@@ -889,14 +1020,97 @@ WUX::Media::Imaging::WriteableBitmap CachedShellIcon(std::wstring const& path) {
     return bmp;
 }
 
+UINT DpiOf(GhosttyTabBar* bar) {
+    if (bar && bar->parent_hwnd) {
+        if (UINT dpi = ::GetDpiForWindow(bar->parent_hwnd)) return dpi;
+    }
+    return 96;
+}
+
+/// Lights both halves of the new-tab button, or puts them back. See the
+/// "Lit" border in GhosttyFooterButtonStyle.
+void LightFooter(GhosttyTabBar* bar, bool lit) {
+    try {
+        for (auto const& button : {bar->plus, bar->chevron}) {
+            if (!button) continue;
+            if (lit && bar->b_pressed) {
+                button.BorderBrush(bar->b_pressed);
+            } else {
+                button.BorderBrush(WUX::Media::SolidColorBrush(
+                    winrt::Windows::UI::Color{0, 0, 0, 0}));
+            }
+        }
+    } catch (...) {
+    }
+}
+
+/// Moves the highlight to `index`, or clears it with -1.
+///
+/// Driven from code rather than from XAML pointer states because the
+/// arrow keys move it too, and because a row the pointer was on when the
+/// menu was parked never hears that the pointer left.
+void HighlightMenuRow(ProfileMenu* menu, int index) {
+    if (!menu || menu->highlighted == index) return;
+    const int count = static_cast<int>(menu->rows.size());
+    try {
+        if (menu->highlighted >= 0 && menu->highlighted < count) {
+            menu->rows[menu->highlighted].Background(WUX::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{0, 0, 0, 0}));
+        }
+        if (index >= 0 && index < count) {
+            menu->rows[index].Background(
+                WUX::Media::SolidColorBrush(menu->bar->menu_hover));
+        }
+    } catch (...) {
+    }
+    menu->highlighted = (index >= 0 && index < count) ? index : -1;
+}
+
+/// Takes the menu off screen. `reactivate` hands activation back to the
+/// host window, which is wanted when the menu closed itself (a pick,
+/// Escape) and not when it closed because something else was activated.
+void HideProfileMenu(ProfileMenu* menu, bool reactivate) {
+    if (!menu || !menu->open) return;
+    menu->open = false;
+    menu->activated = false;
+
+    GhosttyTabBar* bar = menu->bar;
+    bar->menu_closed_at = ::GetMessageTime();
+    LightFooter(bar, false);
+    HighlightMenuRow(menu, -1);
+
+    const bool active = ::GetActiveWindow() == menu->hwnd;
+    ::SetWindowPos(menu->hwnd, nullptr, kMenuParkedAt, kMenuParkedAt, 0, 0,
+                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    // Destroying the window used to return activation to its owner for
+    // free. Parking it does not, and a parked window that still holds
+    // activation would swallow the keyboard.
+    if (reactivate && active && bar->parent_hwnd) {
+        ::SetActiveWindow(bar->parent_hwnd);
+    }
+}
+
+void PickMenuRow(ProfileMenu* menu, int index) {
+    if (!menu || index < 0 || index >= static_cast<int>(menu->ids.size())) return;
+    GhosttyTabBar* bar = menu->bar;
+    GhosttyProfileId id = menu->ids[index];
+    // Ctrl held while picking a shell asks for it elevated, which is
+    // Windows Terminal's gesture for the same thing.
+    if (id < GHOSTTY_MENU_SETTINGS && ::GetKeyState(VK_CONTROL) < 0) {
+        id |= GHOSTTY_PROFILE_ELEVATED;
+    }
+    HideProfileMenu(menu, true);
+    if (bar->cb.on_new_tab) bar->cb.on_new_tab(bar->cb.ctx, id);
+}
+
 /// Builds one row: icon, then label, filling the menu's width.
 ///
 /// A Border with its own brushes and hand-rolled hover, rather than a
 /// Button wearing a Style out of the shared dictionary. Everything the
 /// menu draws with has to be created here, in the menu's own tree -- see
 /// the note on GhosttyTabBar::menu_bg.
-WUX::FrameworkElement MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
-                                   ProfileMenu* menu) {
+WUX::Controls::Border MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
+                                   ProfileMenu* menu, int index) {
     WUX::Controls::Grid row;
     WUX::Controls::ColumnDefinition icon_col;
     icon_col.Width(WUX::GridLengthHelper::FromValueAndType(
@@ -907,7 +1121,17 @@ WUX::FrameworkElement MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
     row.ColumnDefinitions().Append(icon_col);
     row.ColumnDefinitions().Append(text_col);
 
-    if (auto bmp = CachedShellIcon(p.icon_path)) {
+    if (!p.glyph.empty()) {
+        WUX::Controls::FontIcon icon;
+        icon.Glyph(p.glyph);
+        icon.FontFamily(
+            WUX::Media::FontFamily(L"Segoe Fluent Icons, Segoe MDL2 Assets"));
+        icon.FontSize(kMenuIconSize);
+        icon.HorizontalAlignment(WUX::HorizontalAlignment::Left);
+        icon.VerticalAlignment(WUX::VerticalAlignment::Center);
+        icon.Foreground(WUX::Media::SolidColorBrush(bar->menu_text));
+        row.Children().Append(icon);
+    } else if (auto bmp = CachedShellIcon(p.icon_path)) {
         WUX::Controls::Image image;
         image.Source(bmp);
         image.Width(kMenuIconSize);
@@ -934,29 +1158,21 @@ WUX::FrameworkElement MakeMenuItem(GhosttyTabBar* bar, Profile const& p,
     item.Background(WUX::Media::SolidColorBrush(
         winrt::Windows::UI::Color{0, 0, 0, 0}));
 
-    const auto hover = bar->menu_hover;
-    item.PointerEntered([item, hover](auto&&, auto&&) {
-        item.Background(WUX::Media::SolidColorBrush(hover));
+    item.PointerEntered([menu, index](auto&&, auto&&) {
+        HighlightMenuRow(menu, index);
     });
-    item.PointerExited([item](auto&&, auto&&) {
-        item.Background(WUX::Media::SolidColorBrush(
-            winrt::Windows::UI::Color{0, 0, 0, 0}));
+    item.PointerExited([menu, index](auto&&, auto&&) {
+        if (menu->highlighted == index) HighlightMenuRow(menu, -1);
     });
-
-    const auto id = p.id;
-    item.Tapped([bar, menu, id](auto&&, auto&&) {
-        CloseProfileMenu(menu);
-        if (bar->cb.on_new_tab) bar->cb.on_new_tab(bar->cb.ctx, id);
-    });
+    item.Tapped([menu, index](auto&&, auto&&) { PickMenuRow(menu, index); });
     return item;
 }
 
-void CloseProfileMenu(ProfileMenu* menu) {
-    if (!menu || menu->closing) return;
-    menu->closing = true;
-
-    menu->bar->menu_closed_at = ::GetMessageTime();
-    menu->bar->menu = nullptr;
+void DestroyProfileMenu(GhosttyTabBar* bar) {
+    ProfileMenu* menu = bar ? bar->menu : nullptr;
+    if (!menu) return;
+    bar->menu = nullptr;
+    menu->open = false;
 
     if (menu->source) {
         try {
@@ -977,8 +1193,7 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
 
     switch (msg) {
         case WM_GHOSTTY_SHOW_MENU:
-            if (!menu) return 0;
-            ::ShowWindow(hwnd, SW_SHOW);
+            if (!menu || !menu->open) return 0;
             ::SetForegroundWindow(hwnd);
             ::SetFocus(hwnd);
             return 0;
@@ -986,17 +1201,47 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         case WM_ACTIVATE:
             if (!menu) break;
             if (LOWORD(wparam) != WA_INACTIVE) {
-                menu->activated = true;
+                if (menu->open) menu->activated = true;
                 return 0;
             }
             // Anything that takes activation away dismisses the menu, which
             // is how clicking the terminal, another window, or the chevron
             // closes it -- but only once it has been activated at all.
             if (menu->activated) {
-                CloseProfileMenu(menu);
+                HideProfileMenu(menu, false);
                 return 0;
             }
             break;
+
+        // The keyboard. Focus is on this window rather than on anything
+        // inside the island -- the rows are Borders, which cannot take
+        // focus -- so a KeyDown handler in the XAML tree never fires. That
+        // is why Escape used to do nothing.
+        case WM_KEYDOWN: {
+            if (!menu || !menu->open) break;
+            const int count = static_cast<int>(menu->rows.size());
+            switch (wparam) {
+                case VK_ESCAPE:
+                    HideProfileMenu(menu, true);
+                    return 0;
+                case VK_DOWN:
+                    if (count > 0) {
+                        HighlightMenuRow(menu, (menu->highlighted + 1) % count);
+                    }
+                    return 0;
+                case VK_UP:
+                    if (count > 0) {
+                        HighlightMenuRow(
+                            menu, menu->highlighted <= 0 ? count - 1
+                                                         : menu->highlighted - 1);
+                    }
+                    return 0;
+                case VK_RETURN:
+                    PickMenuRow(menu, menu->highlighted);
+                    return 0;
+            }
+            break;
+        }
 
         case WM_SIZE:
             if (menu && menu->source) {
@@ -1004,7 +1249,8 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
                     HWND island = nullptr;
                     if (SUCCEEDED(n->get_WindowHandle(&island)) && island) {
                         ::SetWindowPos(island, nullptr, 0, 0, LOWORD(lparam),
-                                       HIWORD(lparam), SWP_NOZORDER);
+                                       HIWORD(lparam),
+                                       SWP_NOZORDER | SWP_SHOWWINDOW);
                     }
                 }
             }
@@ -1013,27 +1259,11 @@ LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     return ::DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-void ShowProfileMenu(GhosttyTabBar* bar) {
+/// Creates the menu's window and island if they do not exist yet, lays its
+/// rows out from the current profiles and theme, and leaves it parked.
+bool BuildProfileMenu(GhosttyTabBar* bar) {
     auto const& profiles = g_profiles[bar];
-    if (profiles.empty()) return;
-
-    // Clicking the chevron while the menu is open must only close it. The
-    // click first takes activation away, which closes the menu, and only
-    // then reaches the button -- which would ask for a new one. Refusing to
-    // reopen within a moment of closing is what makes the pair behave as a
-    // toggle. GetMessageTime reports when the input happened rather than
-    // when we got round to it, which is what makes the window meaningful.
-    if (bar->menu) {
-        CloseProfileMenu(bar->menu);
-        return;
-    }
-    if (bar->menu_closed_at != 0) {
-        const LONG dt = ::GetMessageTime() - bar->menu_closed_at;
-        if (dt >= 0 && dt < kMenuReopenGuardMs) {
-            bar->menu_closed_at = 0;
-            return;
-        }
-    }
+    if (profiles.empty()) return false;
 
     static bool registered = false;
     if (!registered) {
@@ -1048,71 +1278,91 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
         wc.lpszClassName = kMenuClassName;
         if (!::RegisterClassExW(&wc)) {
             Log("menu: RegisterClassExW failed err=%lu", ::GetLastError());
-            return;
+            return false;
         }
         registered = true;
     }
 
-    // Anchor under the "+" so the menu belongs to the whole split button,
-    // which is where Windows Terminal hangs it from.
-    POINT pt{0, 0};
-    auto anchor = bar->plus ? bar->plus : bar->chevron;
-    if (anchor && bar->island_hwnd) {
-        try {
-            auto transform = anchor.TransformToVisual(nullptr);
-            auto origin = transform.TransformPoint(
-                winrt::Windows::Foundation::Point{
-                    0.0f, static_cast<float>(anchor.ActualHeight())});
-            pt.x = static_cast<LONG>(origin.X);
-            pt.y = static_cast<LONG>(origin.Y);
-        } catch (...) {
-        }
-        ::ClientToScreen(bar->island_hwnd, &pt);
-    } else {
-        ::GetCursorPos(&pt);
-    }
+    // The island lays out in DIPs and the window is sized in pixels.
+    const int dpi = static_cast<int>(DpiOf(bar));
+    const int width = ::MulDiv(kMenuWidth, dpi, 96);
+    // Below the shells, the two things that are not shells, as in Windows
+    // Terminal's menu. They go back through on_new_tab under reserved ids.
+    const Profile commands[] = {
+        {GHOSTTY_MENU_SETTINGS, L"Settings", L"", {wchar_t{0xE713}}},
+        {GHOSTTY_MENU_PALETTE, L"Command palette", L"", {wchar_t{0xE945}}},
+    };
+    constexpr int kMenuSeparator = 9;
+    const int row_count =
+        static_cast<int>(profiles.size() + std::size(commands));
+    const int height = ::MulDiv(
+        row_count * kMenuItemHeight + kMenuSeparator + kMenuPadding * 2, dpi,
+        96);
 
-    const int height = static_cast<int>(profiles.size()) * kMenuItemHeight +
-                       kMenuPadding * 2;
-
-    auto* menu = new ProfileMenu{};
-    menu->bar = bar;
-
-    // WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt-Tab.
-    menu->hwnd = ::CreateWindowExW(
-        WS_EX_TOOLWINDOW, kMenuClassName, L"", WS_POPUP, pt.x, pt.y,
-        kMenuWidth, height, bar->parent_hwnd, nullptr,
-        ::GetModuleHandleW(nullptr), nullptr);
-    if (!menu->hwnd) {
-        Log("menu: CreateWindowExW failed err=%lu", ::GetLastError());
-        delete menu;
-        return;
-    }
-    g_menus[menu->hwnd] = menu;
-
-    // Rounded corners. Windows 11 only; the call simply fails on 10, which
-    // leaves square corners and nothing else broken.
-    const DWORD corner = 2;  // DWMWCP_ROUND
-    ::DwmSetWindowAttribute(menu->hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                            &corner, sizeof(corner));
-
+    ProfileMenu* menu = bar->menu;
     try {
-        menu->source = WUX::Hosting::DesktopWindowXamlSource();
-        auto native = menu->source.as<IDesktopWindowXamlSourceNative>();
-        check_hresult(native->AttachToWindow(menu->hwnd));
-        HWND island = nullptr;
-        check_hresult(native->get_WindowHandle(&island));
-        // AttachToWindow leaves the island hidden -- it comes back as a
-        // bare WS_CHILD with no WS_VISIBLE, so the window rendered as an
-        // empty frame with the terminal showing straight through it.
-        ::SetWindowPos(island, nullptr, 0, 0, kMenuWidth, height,
-                       SWP_NOZORDER | SWP_SHOWWINDOW);
-        menu->native = menu->source.try_as<IDesktopWindowXamlSourceNative2>();
+        if (!menu) {
+            menu = new ProfileMenu{};
+            menu->bar = bar;
+
+            // WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt-Tab.
+            menu->hwnd = ::CreateWindowExW(
+                WS_EX_TOOLWINDOW, kMenuClassName, L"", WS_POPUP, kMenuParkedAt,
+                kMenuParkedAt, width, height, bar->parent_hwnd, nullptr,
+                ::GetModuleHandleW(nullptr), nullptr);
+            if (!menu->hwnd) {
+                Log("menu: CreateWindowExW failed err=%lu", ::GetLastError());
+                delete menu;
+                return false;
+            }
+            g_menus[menu->hwnd] = menu;
+            bar->menu = menu;
+
+            // Rounded corners. Windows 11 only; the call simply fails on
+            // 10, which leaves square corners and nothing else broken.
+            const DWORD corner = 2;  // DWMWCP_ROUND
+            ::DwmSetWindowAttribute(
+                menu->hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner,
+                sizeof(corner));
+
+            menu->source = WUX::Hosting::DesktopWindowXamlSource();
+            auto native = menu->source.as<IDesktopWindowXamlSourceNative>();
+            check_hresult(native->AttachToWindow(menu->hwnd));
+            HWND island = nullptr;
+            check_hresult(native->get_WindowHandle(&island));
+            // AttachToWindow leaves the island hidden -- it comes back as a
+            // bare WS_CHILD with no WS_VISIBLE, so the window rendered as
+            // an empty frame with the terminal showing straight through it.
+            ::SetWindowPos(island, nullptr, 0, 0, width, height,
+                           SWP_NOZORDER | SWP_SHOWWINDOW);
+            menu->native = menu->source.try_as<IDesktopWindowXamlSourceNative2>();
+        }
+
+        menu->rows.clear();
+        menu->ids.clear();
+        menu->highlighted = -1;
 
         WUX::Controls::StackPanel list;
         list.Orientation(WUX::Controls::Orientation::Vertical);
+        int index = 0;
         for (auto const& p : profiles) {
-            list.Children().Append(MakeMenuItem(bar, p, menu));
+            auto row = MakeMenuItem(bar, p, menu, index++);
+            menu->rows.push_back(row);
+            menu->ids.push_back(p.id);
+            list.Children().Append(row);
+        }
+
+        WUX::Controls::Border separator;
+        separator.Height(1);
+        separator.Margin(WUX::ThicknessHelper::FromLengths(0, 4, 0, 4));
+        separator.Background(WUX::Media::SolidColorBrush(bar->menu_border));
+        list.Children().Append(separator);
+
+        for (auto const& p : commands) {
+            auto row = MakeMenuItem(bar, p, menu, index++);
+            menu->rows.push_back(row);
+            menu->ids.push_back(p.id);
+            list.Children().Append(row);
         }
 
         WUX::Controls::Border root;
@@ -1125,29 +1375,456 @@ void ShowProfileMenu(GhosttyTabBar* bar) {
                                       : WUX::ElementTheme::Default);
         root.Background(WUX::Media::SolidColorBrush(bar->menu_bg));
         root.BorderBrush(WUX::Media::SolidColorBrush(bar->menu_border));
-
-        // Escape closes, like any menu.
-        root.KeyDown([menu](auto&&, WUX::Input::KeyRoutedEventArgs const& e) {
-            if (e.Key() == winrt::Windows::System::VirtualKey::Escape) {
-                CloseProfileMenu(menu);
-            }
-        });
-
         menu->source.Content(root);
-
     } catch (hresult_error const& e) {
         Log("menu: island failed 0x%08X: %ls", (unsigned)e.code(),
             e.message().c_str());
-        CloseProfileMenu(menu);
-        return;
+        DestroyProfileMenu(bar);
+        return false;
     }
 
-    bar->menu = menu;
-    // Deferred: see WM_GHOSTTY_SHOW_MENU. Activation is what makes
+    // Shown, but where nobody can see it: XAML only composes for a visible
+    // window, and composed is what makes opening it instant. An open menu
+    // is left where it is and only resized.
+    if (menu->open) {
+        ::SetWindowPos(menu->hwnd, nullptr, 0, 0, width, height,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
+        ::SetWindowPos(menu->hwnd, nullptr, kMenuParkedAt, kMenuParkedAt, width,
+                       height,
+                       SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    bar->menu_dirty = false;
+    return true;
+}
+
+void ShowProfileMenu(GhosttyTabBar* bar) {
+    // Clicking the chevron while the menu is open must only close it. The
+    // click first takes activation away, which closes the menu, and only
+    // then reaches the button -- which would ask for a new one. Refusing to
+    // reopen within a moment of closing is what makes the pair behave as a
+    // toggle. GetMessageTime reports when the input happened rather than
+    // when we got round to it, which is what makes the window meaningful.
+    if (bar->menu && bar->menu->open) {
+        HideProfileMenu(bar->menu, true);
+        return;
+    }
+    if (bar->menu_closed_at != 0) {
+        const LONG dt = ::GetMessageTime() - bar->menu_closed_at;
+        if (dt >= 0 && dt < kMenuReopenGuardMs) {
+            bar->menu_closed_at = 0;
+            return;
+        }
+    }
+
+    // Normally already built by the prewarm timer; this is the click that
+    // beat it, or the first one after the profiles or theme changed.
+    if (!bar->menu || bar->menu_dirty) {
+        if (!BuildProfileMenu(bar)) return;
+    }
+    ProfileMenu* menu = bar->menu;
+
+    // Anchor under the "+" so the menu belongs to the whole split button,
+    // which is where Windows Terminal hangs it from -- and below the strip
+    // rather than below the button, so it does not sit on top of the
+    // strip's bottom edge.
+    POINT pt{0, 0};
+    auto anchor = bar->plus ? bar->plus : bar->chevron;
+    if (anchor && bar->island_hwnd) {
+        const double scale = static_cast<double>(DpiOf(bar)) / 96.0;
+        try {
+            auto transform = anchor.TransformToVisual(nullptr);
+            auto origin = transform.TransformPoint(
+                winrt::Windows::Foundation::Point{
+                    0.0f, static_cast<float>(anchor.ActualHeight())});
+            pt.x = static_cast<LONG>(origin.X * scale);
+            pt.y = static_cast<LONG>(
+                (origin.Y + kFooterButtonBottomGap + 2.0) * scale);
+        } catch (...) {
+        }
+        ::ClientToScreen(bar->island_hwnd, &pt);
+    } else {
+        ::GetCursorPos(&pt);
+    }
+
+    menu->open = true;
+    menu->activated = false;
+    LightFooter(bar, true);
+    ::SetWindowPos(menu->hwnd, HWND_TOP, pt.x, pt.y, 0, 0,
+                   SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    // Activation is deferred: see WM_GHOSTTY_SHOW_MENU. It is what makes
     // WM_ACTIVATE(WA_INACTIVE) fire when the user clicks anywhere else,
     // which is the whole dismissal mechanism -- so it has to happen after
-    // the click that opened the menu is completely done with.
+    // the click that opened the menu is completely done with. The menu is
+    // already on screen by then; only the keyboard waits.
     ::PostMessageW(menu->hwnd, WM_GHOSTTY_SHOW_MENU, 0, 0);
+}
+
+/// Arranges for the menu to be built once startup has settled.
+///
+/// A timer rather than building it on the spot: this is reached from
+/// set_theme, which runs while the window is still coming up, and a second
+/// XAML island is not something to put between the user and a prompt.
+void ScheduleMenuPrewarm(GhosttyTabBar* bar) {
+    try {
+        if (!bar->menu_prewarm) {
+            WUX::DispatcherTimer timer;
+            timer.Interval(std::chrono::milliseconds(1500));
+            timer.Tick([bar](auto&&, auto&&) {
+                // The bar's entry in g_profiles lasts exactly as long as
+                // the bar does.
+                if (g_profiles.find(bar) == g_profiles.end()) return;
+                if (bar->menu_prewarm) bar->menu_prewarm.Stop();
+                if (bar->menu_dirty) BuildProfileMenu(bar);
+            });
+            bar->menu_prewarm = timer;
+        }
+        bar->menu_prewarm.Stop();
+        bar->menu_prewarm.Start();
+    } catch (...) {
+    }
+}
+
+// The input popup: one line of text, optionally with a list under it.
+//
+// It is the search box, the command palette and the rename prompt, which
+// are the same thing three times: somewhere to type, something to pick
+// from, and Enter or Escape. What each one means is the host's business;
+// this only reports what was typed, what was picked and that it was
+// dismissed.
+//
+// Plain Win32 controls rather than a third XAML island. A XAML TextBox
+// needs keyboard focus inside its island, and focus across islands is the
+// one thing here that has never behaved; an EDIT control simply takes it.
+// The price is that the list is an owner-drawn LISTBOX instead of a
+// ListView, which nobody looking at a list of commands will notice.
+struct InputPopup {
+    GhosttyTabBar* bar = nullptr;
+    HWND hwnd = nullptr;
+    HWND edit = nullptr;
+    HWND list = nullptr;
+    WNDPROC edit_proc = nullptr;
+    GhosttyInputCallbacks cb{};
+    /// Enter reports and leaves the popup up, for "find next".
+    bool keep_open = false;
+    bool visible = false;
+    bool activated = false;
+    /// Set while the text is being replaced from code, which must not be
+    /// reported back as the user typing.
+    bool setting = false;
+    std::wstring status;
+    HFONT font = nullptr;
+    HBRUSH bg = nullptr;
+    int width = 0;
+    int items = 0;
+};
+
+constexpr wchar_t kInputClassName[] = L"GhosttyInputPopup";
+constexpr UINT WM_GHOSTTY_ACTIVATE_INPUT = WM_APP + 2;
+
+// Metrics at 96 DPI.
+constexpr int kInputPad = 8;
+constexpr int kInputRowHeight = 36;
+constexpr int kInputEditHeight = 20;
+constexpr int kInputItemHeight = 30;
+constexpr int kInputMaxItems = 10;
+constexpr int kInputStatusWidth = 90;
+
+std::unordered_map<HWND, InputPopup*> g_inputs;
+
+COLORREF Ref(winrt::Windows::UI::Color c) { return RGB(c.R, c.G, c.B); }
+
+int InputScale(InputPopup* p, int v) {
+    return ::MulDiv(v, static_cast<int>(DpiOf(p->bar)), 96);
+}
+
+std::wstring WindowText(HWND hwnd) {
+    const int len = ::GetWindowTextLengthW(hwnd);
+    std::wstring text(static_cast<size_t>(len), L'\0');
+    if (len > 0) ::GetWindowTextW(hwnd, text.data(), len + 1);
+    return text;
+}
+
+/// Sizes the popup for its current width and item count and puts the
+/// controls where they go.
+void InputLayout(InputPopup* p) {
+    const int pad = InputScale(p, kInputPad);
+    const int row = InputScale(p, kInputRowHeight);
+    const int edit_h = InputScale(p, kInputEditHeight);
+    const int item_h = InputScale(p, kInputItemHeight);
+    const int status_w = p->status.empty() ? 0 : InputScale(p, kInputStatusWidth);
+    const int shown = p->items > kInputMaxItems ? kInputMaxItems : p->items;
+    const int list_h = shown * item_h;
+    const int height = row + (shown > 0 ? list_h + pad : 0);
+
+    ::SetWindowPos(p->hwnd, nullptr, 0, 0, p->width, height,
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ::MoveWindow(p->edit, pad + 4, (row - edit_h) / 2,
+                 p->width - 2 * pad - 8 - status_w, edit_h, TRUE);
+    ::MoveWindow(p->list, pad, row, p->width - 2 * pad, list_h, TRUE);
+    ::ShowWindow(p->list, shown > 0 ? SW_SHOW : SW_HIDE);
+    ::InvalidateRect(p->hwnd, nullptr, TRUE);
+}
+
+void InputHide(InputPopup* p, bool reactivate) {
+    if (!p || !p->visible) return;
+    p->visible = false;
+    p->activated = false;
+    const bool active = ::GetActiveWindow() == p->hwnd;
+    ::ShowWindow(p->hwnd, SW_HIDE);
+    if (reactivate && active && p->bar->parent_hwnd) {
+        ::SetActiveWindow(p->bar->parent_hwnd);
+    }
+}
+
+void InputCancel(InputPopup* p) {
+    if (!p || !p->visible) return;
+    const auto cb = p->cb;
+    InputHide(p, true);
+    if (cb.on_cancel) cb.on_cancel(cb.ctx);
+}
+
+void InputSubmit(InputPopup* p, bool shift) {
+    if (!p || !p->visible) return;
+    const auto cb = p->cb;
+    const std::wstring text = WindowText(p->edit);
+    int index = -1;
+    if (p->items > 0) {
+        index = static_cast<int>(::SendMessageW(p->list, LB_GETCURSEL, 0, 0));
+    }
+    if (!p->keep_open) InputHide(p, true);
+    if (cb.on_submit) cb.on_submit(cb.ctx, index, text.c_str(), shift ? 1 : 0);
+}
+
+/// The EDIT control, with the keys that mean something to the popup taken
+/// out before the control sees them.
+LRESULT CALLBACK InputEditProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    auto it = g_inputs.find(hwnd);
+    if (it == g_inputs.end()) return ::DefWindowProcW(hwnd, msg, wparam, lparam);
+    InputPopup* p = it->second;
+
+    switch (msg) {
+        case WM_KEYDOWN:
+            switch (wparam) {
+                case VK_ESCAPE:
+                    InputCancel(p);
+                    return 0;
+                case VK_RETURN:
+                    InputSubmit(p, ::GetKeyState(VK_SHIFT) < 0);
+                    return 0;
+                case VK_DOWN:
+                case VK_UP:
+                    if (p->items > 0) {
+                        int sel = static_cast<int>(
+                            ::SendMessageW(p->list, LB_GETCURSEL, 0, 0));
+                        sel += wparam == VK_DOWN ? 1 : -1;
+                        if (sel < 0) sel = p->items - 1;
+                        if (sel >= p->items) sel = 0;
+                        ::SendMessageW(p->list, LB_SETCURSEL, sel, 0);
+                    }
+                    return 0;
+            }
+            break;
+        // The characters those keys also produce, which an EDIT answers
+        // with the system beep.
+        case WM_CHAR:
+            if (wparam == L'\r' || wparam == L'\n' || wparam == 27 ||
+                wparam == L'\t') {
+                return 0;
+            }
+            break;
+    }
+    return ::CallWindowProcW(p->edit_proc, hwnd, msg, wparam, lparam);
+}
+
+LRESULT CALLBACK InputWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    auto it = g_inputs.find(hwnd);
+    InputPopup* p = it == g_inputs.end() ? nullptr : it->second;
+    if (!p) return ::DefWindowProcW(hwnd, msg, wparam, lparam);
+    GhosttyTabBar* bar = p->bar;
+
+    switch (msg) {
+        case WM_GHOSTTY_ACTIVATE_INPUT:
+            if (!p->visible) return 0;
+            ::SetForegroundWindow(hwnd);
+            ::SetFocus(p->edit);
+            return 0;
+
+        case WM_ACTIVATE:
+            if (LOWORD(wparam) != WA_INACTIVE) {
+                if (p->visible) p->activated = true;
+                ::SetFocus(p->edit);
+                return 0;
+            }
+            // Clicking anywhere else dismisses it, as with the menu.
+            if (p->activated && p->visible) {
+                const auto cb = p->cb;
+                InputHide(p, false);
+                if (cb.on_cancel) cb.on_cancel(cb.ctx);
+                return 0;
+            }
+            break;
+
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wparam);
+            ::SetTextColor(dc, Ref(bar->menu_text));
+            ::SetBkColor(dc, Ref(bar->menu_bg));
+            return reinterpret_cast<LRESULT>(p->bg);
+        }
+
+        case WM_ERASEBKGND: {
+            RECT rc;
+            ::GetClientRect(hwnd, &rc);
+            ::FillRect(reinterpret_cast<HDC>(wparam), &rc, p->bg);
+            return 1;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = ::BeginPaint(hwnd, &ps);
+            if (!p->status.empty()) {
+                RECT rc;
+                ::GetClientRect(hwnd, &rc);
+                rc.bottom = InputScale(p, kInputRowHeight);
+                rc.right -= InputScale(p, kInputPad) + 4;
+                rc.left = rc.right - InputScale(p, kInputStatusWidth);
+                HGDIOBJ old = ::SelectObject(dc, p->font);
+                ::SetBkMode(dc, TRANSPARENT);
+                // Dimmer than the text: it is a count, not content.
+                const auto t = bar->menu_text;
+                const auto b = bar->menu_bg;
+                ::SetTextColor(dc, RGB((t.R + b.R) / 2, (t.G + b.G) / 2,
+                                       (t.B + b.B) / 2));
+                ::DrawTextW(dc, p->status.c_str(), -1, &rc,
+                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                ::SelectObject(dc, old);
+            }
+            ::EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_COMMAND:
+            if (reinterpret_cast<HWND>(lparam) == p->edit &&
+                HIWORD(wparam) == EN_CHANGE && !p->setting) {
+                const std::wstring text = WindowText(p->edit);
+                if (p->cb.on_text) p->cb.on_text(p->cb.ctx, text.c_str());
+                return 0;
+            }
+            // Only the mouse produces this: the arrow keys move the
+            // selection with LB_SETCURSEL, which does not notify.
+            if (reinterpret_cast<HWND>(lparam) == p->list &&
+                HIWORD(wparam) == LBN_SELCHANGE) {
+                InputSubmit(p, false);
+                return 0;
+            }
+            break;
+
+        case WM_MEASUREITEM: {
+            auto* mi = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+            mi->itemHeight = InputScale(p, kInputItemHeight);
+            return TRUE;
+        }
+
+        case WM_DRAWITEM: {
+            auto* di = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (di->itemID == static_cast<UINT>(-1)) return TRUE;
+            const bool selected = (di->itemState & ODS_SELECTED) != 0;
+            HBRUSH fill = ::CreateSolidBrush(
+                Ref(selected ? bar->menu_hover : bar->menu_bg));
+            ::FillRect(di->hDC, &di->rcItem, fill);
+            ::DeleteObject(fill);
+
+            wchar_t text[512];
+            const LRESULT len = ::SendMessageW(
+                di->hwndItem, LB_GETTEXTLEN, di->itemID, 0);
+            if (len >= 0 && len < 512) {
+                ::SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID,
+                               reinterpret_cast<LPARAM>(text));
+                RECT rc = di->rcItem;
+                rc.left += InputScale(p, 10);
+                rc.right -= InputScale(p, 10);
+                HGDIOBJ old = ::SelectObject(di->hDC, p->font);
+                ::SetBkMode(di->hDC, TRANSPARENT);
+                ::SetTextColor(di->hDC, Ref(bar->menu_text));
+                ::DrawTextW(di->hDC, text, -1, &rc,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+                                DT_END_ELLIPSIS | DT_NOPREFIX);
+                ::SelectObject(di->hDC, old);
+            }
+            return TRUE;
+        }
+    }
+    return ::DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// Creates the popup's window and controls, once per tab bar.
+InputPopup* EnsureInput(GhosttyTabBar* bar) {
+    if (bar->input) return bar->input;
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = InputWndProc;
+        wc.hInstance = ::GetModuleHandleW(nullptr);
+        wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kInputClassName;
+        if (!::RegisterClassExW(&wc)) return nullptr;
+        registered = true;
+    }
+
+    auto* p = new InputPopup{};
+    p->bar = bar;
+    p->hwnd = ::CreateWindowExW(
+        WS_EX_TOOLWINDOW, kInputClassName, L"", WS_POPUP | WS_CLIPCHILDREN, 0,
+        0, 100, 100, bar->parent_hwnd, nullptr, ::GetModuleHandleW(nullptr),
+        nullptr);
+    if (!p->hwnd) {
+        delete p;
+        return nullptr;
+    }
+    g_inputs[p->hwnd] = p;
+
+    const DWORD corner = 2;  // DWMWCP_ROUND
+    ::DwmSetWindowAttribute(p->hwnd, 33, &corner, sizeof(corner));
+
+    p->edit = ::CreateWindowExW(
+        0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10,
+        p->hwnd, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+    p->list = ::CreateWindowExW(
+        0, L"LISTBOX", L"",
+        WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
+            LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+        0, 0, 10, 10, p->hwnd, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+    if (!p->edit || !p->list) {
+        g_inputs.erase(p->hwnd);
+        ::DestroyWindow(p->hwnd);
+        delete p;
+        return nullptr;
+    }
+    g_inputs[p->edit] = p;
+    p->edit_proc = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(
+        p->edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(InputEditProc)));
+
+    bar->input = p;
+    return p;
+}
+
+void DestroyInput(GhosttyTabBar* bar) {
+    InputPopup* p = bar ? bar->input : nullptr;
+    if (!p) return;
+    bar->input = nullptr;
+    p->visible = false;
+    g_inputs.erase(p->edit);
+    g_inputs.erase(p->hwnd);
+    ::DestroyWindow(p->hwnd);
+    if (p->font) ::DeleteObject(p->font);
+    if (p->bg) ::DeleteObject(p->bg);
+    delete p;
 }
 
 } // namespace
@@ -1221,6 +1898,34 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
                     bar->cb.on_close_requested(bar->cb.ctx, id);
             });
 
+        // Dragging a tab along the strip reorders the TabView's items by
+        // taking the item out and putting it back, so the insertion is the
+        // moment the new order exists. Without telling the host, its list
+        // stays in the old order and "next tab" walks tabs in an order
+        // that is no longer the one on screen.
+        tv.TabItemsChanged(
+            [bar](MUX::Controls::TabView const&,
+                  winrt::Windows::Foundation::Collections::
+                      IVectorChangedEventArgs const& args) {
+                if (bar->suppress_items) return;
+                if (args.CollectionChange() !=
+                    winrt::Windows::Foundation::Collections::CollectionChange::
+                        ItemInserted) {
+                    return;
+                }
+                try {
+                    auto item = bar->tab_view.TabItems()
+                                    .GetAt(args.Index())
+                                    .try_as<MUX::Controls::TabViewItem>();
+                    auto id = IdOf(item);
+                    if (id && bar->cb.on_tab_moved) {
+                        bar->cb.on_tab_moved(bar->cb.ctx, id,
+                                             static_cast<int32_t>(args.Index()));
+                    }
+                } catch (...) {
+                }
+            });
+
         tv.SelectionChanged([bar](auto&&, auto&&) {
             if (bar->suppress_selection) return;
             auto sel = bar->tab_view.SelectedItem()
@@ -1237,12 +1942,13 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // chevron glyph, but it reserves a content column beside it and
         // ends up drawing the glyph ~5px right of its own centre, which no
         // amount of padding straightens out.
-        auto make_button = [&](wchar_t const* glyph, WUX::CornerRadius radius) {
+        auto make_button = [&](wchar_t const* glyph, double glyph_size,
+                               WUX::CornerRadius radius) {
             WUX::Controls::Button b;
             WUX::Controls::FontIcon icon;
             icon.Glyph(glyph);
             icon.FontFamily(WUX::Media::FontFamily(L"Segoe Fluent Icons"));
-            icon.FontSize(12);
+            icon.FontSize(glyph_size);
             b.Content(icon);
             b.Width(kFooterButtonWidth);
             b.Height(kFooterButtonHeight);
@@ -1254,11 +1960,11 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
             b.CornerRadius(radius);
             b.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
             // Flat, and hovering in our own colours rather than WinUI's
-            // translucent overlay. Looked up rather than assigned from a
-            // handle because the dictionary is merged at Application level.
-            if (auto app = WUX::Application::Current()) {
-                auto style = app.Resources()
-                                 .Lookup(winrt::box_value(
+            // translucent overlay. From this bar's own dictionary: see
+            // GhosttyTabBar::theme_dict.
+            if (bar->theme_dict) {
+                auto style = bar->theme_dict
+                                 .TryLookup(winrt::box_value(
                                      L"GhosttyFooterButtonStyle"))
                                  .try_as<WUX::Style>();
                 if (style) b.Style(style);
@@ -1269,17 +1975,37 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // FromRadii is (topLeft, topRight, bottomRight, bottomLeft): the
         // square corners are the ones meeting the divider.
         auto plus = make_button(
-            kGlyphAdd, WUX::CornerRadiusHelper::FromRadii(
-                           kFooterCornerRadius, 0, 0, kFooterCornerRadius));
+            kGlyphAdd, 12,
+            WUX::CornerRadiusHelper::FromRadii(
+                kFooterCornerRadius, 0, 0, kFooterCornerRadius));
         plus.Click([bar](auto&&, auto&&) {
             if (bar->cb.on_new_tab)
                 bar->cb.on_new_tab(bar->cb.ctx, GHOSTTY_PROFILE_DEFAULT);
         });
         bar->plus = plus;
 
+        // A size smaller than the "+": Windows Terminal draws the chevron
+        // as the lesser half of the pair.
         auto chevron = make_button(
-            kGlyphChevron, WUX::CornerRadiusHelper::FromRadii(
-                               0, kFooterCornerRadius, kFooterCornerRadius, 0));
+            kGlyphChevron, 10,
+            WUX::CornerRadiusHelper::FromRadii(
+                0, kFooterCornerRadius, kFooterCornerRadius, 0));
+        // The chevron dips while it is held down, as Windows Terminal's
+        // does. Hung off IsPressed rather than the Pressed visual state
+        // because the two buttons share a template and only this one moves.
+        try {
+            WUX::Media::TranslateTransform nudge;
+            chevron.Content().as<WUX::UIElement>().RenderTransform(nudge);
+            chevron.RegisterPropertyChangedCallback(
+                WUX::Controls::Primitives::ButtonBase::IsPressedProperty(),
+                [nudge](WUX::DependencyObject const& sender,
+                        WUX::DependencyProperty const&) {
+                    auto button =
+                        sender.try_as<WUX::Controls::Primitives::ButtonBase>();
+                    nudge.Y(button && button.IsPressed() ? 2.0 : 0.0);
+                });
+        } catch (...) {
+        }
         // No XAML Flyout is attached (see ShowProfileMenu for why); the
         // button just raises Click and we open a Win32 menu ourselves.
         chevron.Click([bar](auto&&, auto&&) { ShowProfileMenu(bar); });
@@ -1311,6 +2037,10 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         // The middle column is elastic and does nothing but absorb space
         // and start window drags.
         WUX::Controls::Grid root;
+        // Before anything below it is laid out: the implicit TabViewItem
+        // style in here is only found by items that are under it when
+        // their template is applied.
+        if (bar->theme_dict) root.Resources().MergedDictionaries().Append(bar->theme_dict);
         // An explicit theme + background is required: without it the strip
         // paints on an undefined surface and unselected tabs can render
         // white-on-white, which looks exactly like missing tabs.
@@ -1351,6 +2081,30 @@ GHOSTTY_TABBAR_API GhosttyTabBar* ghostty_tabbar_create(
         WUX::Controls::StackPanel caption;
         caption.Orientation(WUX::Controls::Orientation::Horizontal);
         caption.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+        // The tab overview, where GTK's header bar and the macOS toolbar
+        // have theirs: beside the window controls, away from the tabs. It
+        // is built as a caption button because it should look and hover
+        // like its neighbours; only what the click does is its own.
+        {
+            WUX::Controls::FontIcon icon;
+            icon.Glyph(kGlyphOverview);
+            icon.FontFamily(WUX::Media::FontFamily(
+                L"Segoe Fluent Icons, Segoe MDL2 Assets"));
+            icon.FontSize(12);
+            WUX::Controls::Button overview;
+            overview.Content(icon);
+            overview.Width(kCaptionButtonWidth);
+            overview.VerticalAlignment(WUX::VerticalAlignment::Stretch);
+            overview.Padding(WUX::ThicknessHelper::FromUniformLength(0));
+            overview.BorderThickness(WUX::ThicknessHelper::FromUniformLength(0));
+            overview.CornerRadius(WUX::CornerRadiusHelper::FromUniformRadius(0));
+            overview.Background(WUX::Media::SolidColorBrush(
+                winrt::Windows::UI::Color{0, 0, 0, 0}));
+            overview.Click([bar](auto&&, auto&&) {
+                if (bar->cb.on_overview) bar->cb.on_overview(bar->cb.ctx);
+            });
+            caption.Children().Append(overview);
+        }
         caption.Children().Append(MakeCaptionButton(
             bar, kGlyphMinimize, GHOSTTY_CAPTION_MINIMIZE, false, nullptr));
         caption.Children().Append(MakeCaptionButton(
@@ -1402,6 +2156,12 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_destroy(GhosttyTabBar* bar) {
     if (!bar) return;
     g_profiles.erase(bar);
     try {
+        if (bar->menu_prewarm) bar->menu_prewarm.Stop();
+    } catch (...) {
+    }
+    DestroyProfileMenu(bar);
+    DestroyInput(bar);
+    try {
         if (bar->source) bar->source.Close();
     } catch (...) {
     }
@@ -1433,7 +2193,8 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_resize(
         if (d) dpi = d;
     }
     const double dips = static_cast<double>(width) * 96.0 / static_cast<double>(dpi);
-    const double reserved = kCaptionButtonWidth * 3.0;
+    // Minimize, maximize, close, and the overview button beside them.
+    const double reserved = kCaptionButtonWidth * 4.0;
     // Always leave a slice of drag area, otherwise a full-width tab strip
     // would make the window impossible to move by its title bar.
     constexpr double kMinDragArea = 32.0;
@@ -1452,7 +2213,7 @@ GHOSTTY_TABBAR_API int32_t ghostty_tabbar_pretranslate(
     // window of its own, and an island only sees keyboard input that is
     // handed to it here -- without this, Escape and arrow keys never reach
     // the menu.
-    if (bar->menu && bar->menu->native) {
+    if (bar->menu && bar->menu->open && bar->menu->native) {
         BOOL handled = FALSE;
         if (SUCCEEDED(bar->menu->native->PreTranslateMessage(
                 static_cast<MSG*>(msg), &handled)) &&
@@ -1476,16 +2237,54 @@ GHOSTTY_TABBAR_API GhosttyTabId ghostty_tabbar_add_tab(
         item.Header(winrt::box_value(hstring{title ? title : L""}));
         const GhosttyTabId id = bar->next_id++;
         item.Tag(winrt::box_value(static_cast<uint64_t>(id)));
+        // Right-clicking a tab is the host's to answer: what a tab can do
+        // -- rename, close the others, move to a window -- is policy.
+        item.RightTapped(
+            [bar, id](auto&&, WUX::Input::RightTappedRoutedEventArgs const& e) {
+                e.Handled(true);
+                if (bar->cb.on_tab_context) bar->cb.on_tab_context(bar->cb.ctx, id);
+            });
 
         bar->suppress_selection = true;
+        bar->suppress_items = true;
         bar->tab_view.TabItems().Append(item);
+        bar->suppress_items = false;
         bar->suppress_selection = false;
 
         bar->tabs.emplace(id, item);
         return id;
     } catch (...) {
+        bar->suppress_items = false;
         bar->suppress_selection = false;
         return 0;
+    }
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_move_tab(
+    GhosttyTabBar* bar, GhosttyTabId tab, int32_t index) {
+    if (!bar || !bar->tab_view || index < 0) return;
+    auto it = bar->tabs.find(tab);
+    if (it == bar->tabs.end()) return;
+    try {
+        auto items = bar->tab_view.TabItems();
+        uint32_t from = 0;
+        if (!items.IndexOf(it->second, from)) return;
+        const uint32_t to = static_cast<uint32_t>(index);
+        if (to >= items.Size() || to == from) return;
+
+        // Taking the selected tab out moves the selection to a neighbour,
+        // so it is put back afterwards.
+        auto selected = bar->tab_view.SelectedItem();
+        bar->suppress_selection = true;
+        bar->suppress_items = true;
+        items.RemoveAt(from);
+        items.InsertAt(to, it->second);
+        bar->tab_view.SelectedItem(selected);
+        bar->suppress_items = false;
+        bar->suppress_selection = false;
+    } catch (...) {
+        bar->suppress_items = false;
+        bar->suppress_selection = false;
     }
 }
 
@@ -1498,10 +2297,13 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_remove_tab(
         uint32_t index = 0;
         if (bar->tab_view.TabItems().IndexOf(it->second, index)) {
             bar->suppress_selection = true;
+            bar->suppress_items = true;
             bar->tab_view.TabItems().RemoveAt(index);
+            bar->suppress_items = false;
             bar->suppress_selection = false;
         }
     } catch (...) {
+        bar->suppress_items = false;
         bar->suppress_selection = false;
     }
     bar->tabs.erase(it);
@@ -1561,6 +2363,7 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_add_profile(
     if (!bar) return;
     g_profiles[bar].push_back(Profile{profile, name ? name : L"",
                                       icon_path ? icon_path : L""});
+    bar->menu_dirty = true;
 }
 
 GHOSTTY_TABBAR_API int32_t ghostty_tabbar_rendered(GhosttyTabBar* bar) {
@@ -1570,6 +2373,7 @@ GHOSTTY_TABBAR_API int32_t ghostty_tabbar_rendered(GhosttyTabBar* bar) {
 GHOSTTY_TABBAR_API void ghostty_tabbar_clear_profiles(GhosttyTabBar* bar) {
     if (!bar) return;
     g_profiles[bar].clear();
+    bar->menu_dirty = true;
 }
 
 GHOSTTY_TABBAR_API void ghostty_tabbar_set_maximized(
@@ -1644,6 +2448,18 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
         if (bar->b_selected) bar->b_selected.Color(content);
         if (bar->b_unselected) bar->b_unselected.Color(unselected);
         if (bar->b_hover) bar->b_hover.Color(hover);
+        // Pressed is a fixed step past hovered rather than another factor
+        // of the background: Windows Terminal's hover and pressed fills
+        // are 12 apart per channel whatever the theme, and a factor would
+        // make the step vanish on a near-black background.
+        const int press_step = dark ? 12 : -12;
+        auto step = [press_step](uint8_t c) {
+            const int v = static_cast<int>(c) + press_step;
+            return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        };
+        if (bar->b_pressed) {
+            bar->b_pressed.Color(Rgb(step(hover.R), step(hover.G), step(hover.B)));
+        }
         // A Windows 11 menu sits slightly above its window's background
         // rather than matching it, with a hairline border a step lighter
         // again.
@@ -1657,12 +2473,190 @@ GHOSTTY_TABBAR_API void ghostty_tabbar_set_theme(
         bar->menu_text = dark ? winrt::Windows::UI::Color{255, 255, 255, 255}
                               : winrt::Windows::UI::Color{255, 0, 0, 0};
 
+        // The menu is drawn in these colours, so one built before now is
+        // stale. This is also the last thing the host does when it sets a
+        // window up, which makes it the moment to start warming the menu.
+        bar->menu_dirty = true;
+        ScheduleMenuPrewarm(bar);
+
         Log("set_theme: content=%02X%02X%02X strip=%02X%02X%02X",
             content.R, content.G, content.B, strip.R, strip.G, strip.B);
     } catch (hresult_error const& e) {
         Log("set_theme: FAILED 0x%08X: %ls", (unsigned)e.code(), e.message().c_str());
     } catch (...) {
         Log("set_theme: FAILED (unknown)");
+    }
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_show(
+    GhosttyTabBar* bar, int32_t x, int32_t y, int32_t width,
+    const wchar_t* placeholder, const wchar_t* text, int32_t keep_open,
+    GhosttyInputCallbacks callbacks) {
+    if (!bar) return;
+    InputPopup* p = EnsureInput(bar);
+    if (!p) return;
+
+    // Rebuilt on every show: the theme and the DPI can both have changed
+    // since the last one, and neither is worth tracking for two objects.
+    const int dpi = static_cast<int>(DpiOf(bar));
+    if (p->font) ::DeleteObject(p->font);
+    p->font = ::CreateFontW(-::MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0,
+                            L"Segoe UI");
+    if (p->bg) ::DeleteObject(p->bg);
+    p->bg = ::CreateSolidBrush(Ref(bar->menu_bg));
+    ::SendMessageW(p->edit, WM_SETFONT, reinterpret_cast<WPARAM>(p->font), TRUE);
+    ::SendMessageW(p->list, WM_SETFONT, reinterpret_cast<WPARAM>(p->font), TRUE);
+
+    const COLORREF border = Ref(bar->menu_border);
+    ::DwmSetWindowAttribute(p->hwnd, 34 /* DWMWA_BORDER_COLOR */, &border,
+                            sizeof(border));
+    // The list's scrollbar is the one part the colours above do not reach.
+    const bool dark = bar->menu_text.R > 128;
+    ::SetWindowTheme(p->list, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+
+    p->cb = callbacks;
+    p->keep_open = keep_open != 0;
+    p->status.clear();
+    p->items = 0;
+    ::SendMessageW(p->list, LB_RESETCONTENT, 0, 0);
+
+    p->setting = true;
+    ::SetWindowTextW(p->edit, text ? text : L"");
+    ::SendMessageW(p->edit, EM_SETSEL, 0, -1);
+    ::SendMessageW(p->edit, 0x1501 /* EM_SETCUEBANNER */, TRUE,
+                   reinterpret_cast<LPARAM>(placeholder ? placeholder : L""));
+    p->setting = false;
+
+    p->width = width;
+    p->visible = true;
+    p->activated = false;
+    InputLayout(p);
+    ::SetWindowPos(p->hwnd, HWND_TOP, x, y, 0, 0,
+                   SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // Deferred for the same reason as the profile menu: whatever input
+    // opened this is still being processed, and would take focus back.
+    ::PostMessageW(p->hwnd, WM_GHOSTTY_ACTIVATE_INPUT, 0, 0);
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_set_items(
+    GhosttyTabBar* bar, const wchar_t* const* items, int32_t count) {
+    InputPopup* p = bar ? bar->input : nullptr;
+    if (!p || !p->visible) return;
+    ::SendMessageW(p->list, WM_SETREDRAW, FALSE, 0);
+    ::SendMessageW(p->list, LB_RESETCONTENT, 0, 0);
+    int added = 0;
+    for (int32_t i = 0; items && i < count; ++i) {
+        if (!items[i]) continue;
+        ::SendMessageW(p->list, LB_ADDSTRING, 0,
+                       reinterpret_cast<LPARAM>(items[i]));
+        ++added;
+    }
+    p->items = added;
+    if (added > 0) ::SendMessageW(p->list, LB_SETCURSEL, 0, 0);
+    ::SendMessageW(p->list, WM_SETREDRAW, TRUE, 0);
+    InputLayout(p);
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_set_status(
+    GhosttyTabBar* bar, const wchar_t* text) {
+    InputPopup* p = bar ? bar->input : nullptr;
+    if (!p || !p->visible) return;
+    const bool had = !p->status.empty();
+    p->status = text ? text : L"";
+    // The edit gives up room for the status only while there is one.
+    if (had != !p->status.empty()) {
+        InputLayout(p);
+    } else {
+        ::InvalidateRect(p->hwnd, nullptr, TRUE);
+    }
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_input_hide(GhosttyTabBar* bar) {
+    if (bar && bar->input) InputHide(bar->input, true);
+}
+
+GHOSTTY_TABBAR_API int32_t ghostty_tabbar_input_visible(GhosttyTabBar* bar) {
+    return (bar && bar->input && bar->input->visible) ? 1 : 0;
+}
+
+GHOSTTY_TABBAR_API uint32_t ghostty_tabbar_popup_menu(
+    GhosttyTabBar* bar, int32_t x, int32_t y, const wchar_t* const* labels,
+    const uint32_t* ids, int32_t count) {
+    if (!bar || !bar->parent_hwnd || !labels || !ids || count <= 0) return 0;
+    HMENU menu = ::CreatePopupMenu();
+    if (!menu) return 0;
+    for (int32_t i = 0; i < count; ++i) {
+        if (labels[i]) {
+            ::AppendMenuW(menu, MF_STRING, ids[i], labels[i]);
+        } else {
+            ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+    }
+
+    POINT pt{x, y};
+    if (x < 0 && y < 0) ::GetCursorPos(&pt);
+    // Without this the menu does not close when the user clicks away from
+    // it; the WM_NULL afterwards is the other half of the same old rule.
+    ::SetForegroundWindow(bar->parent_hwnd);
+    const UINT picked = static_cast<UINT>(::TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0,
+        bar->parent_hwnd, nullptr));
+    ::PostMessageW(bar->parent_hwnd, WM_NULL, 0, 0);
+    ::DestroyMenu(menu);
+    return picked;
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_notify(
+    const wchar_t* title, const wchar_t* body) {
+    // A packaged process has an identity for the notification platform to
+    // file the toast under, so there is no AppUserModelID to pass.
+    try {
+        Log("notify: title=%ls", title ? title : L"");
+        using namespace winrt::Windows::UI::Notifications;
+        auto xml = ToastNotificationManager::GetTemplateContent(
+            ToastTemplateType::ToastText02);
+        auto nodes = xml.GetElementsByTagName(L"text");
+        nodes.Item(0).AppendChild(
+            xml.CreateTextNode(title && *title ? title : L"Ghostty"));
+        nodes.Item(1).AppendChild(xml.CreateTextNode(body ? body : L""));
+        ToastNotificationManager::CreateToastNotifier().Show(
+            ToastNotification(xml));
+    } catch (hresult_error const& e) {
+        Log("notify: FAILED 0x%08X: %ls", (unsigned)e.code(),
+            e.message().c_str());
+    } catch (...) {
+        Log("notify: FAILED (unknown)");
+    }
+}
+
+GHOSTTY_TABBAR_API void ghostty_tabbar_set_progress(
+    void* hwnd, int32_t state, int32_t percent) {
+    if (!hwnd) return;
+    static com_ptr<ITaskbarList3> taskbar;
+    if (!taskbar) {
+        if (FAILED(::CoCreateInstance(CLSID_TaskbarList, nullptr,
+                                      CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(taskbar.put()))) ||
+            FAILED(taskbar->HrInit())) {
+            taskbar = nullptr;
+            return;
+        }
+    }
+    TBPFLAG flag = TBPF_NOPROGRESS;
+    switch (state) {
+        case GHOSTTY_PROGRESS_NORMAL: flag = TBPF_NORMAL; break;
+        case GHOSTTY_PROGRESS_ERROR: flag = TBPF_ERROR; break;
+        case GHOSTTY_PROGRESS_INDETERMINATE: flag = TBPF_INDETERMINATE; break;
+        case GHOSTTY_PROGRESS_PAUSED: flag = TBPF_PAUSED; break;
+        default: break;
+    }
+    const HWND target = static_cast<HWND>(hwnd);
+    Log("progress: state=%d percent=%d", (int)state, (int)percent);
+    taskbar->SetProgressState(target, flag);
+    if (flag == TBPF_NORMAL || flag == TBPF_ERROR || flag == TBPF_PAUSED) {
+        const int value = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+        taskbar->SetProgressValue(target, static_cast<ULONGLONG>(value), 100);
     }
 }
 

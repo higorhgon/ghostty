@@ -40,7 +40,83 @@ pub const Callbacks = extern struct {
     on_caption_button: ?*const fn (?*anyopaque, CaptionButton) callconv(.c) void = null,
     on_drag_start: ?*const fn (?*anyopaque) callconv(.c) void = null,
     on_drag_double_click: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    on_tab_moved: ?*const fn (?*anyopaque, TabId, i32) callconv(.c) void = null,
+    on_overview: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    on_tab_context: ?*const fn (?*anyopaque, TabId) callconv(.c) void = null,
 };
+
+/// The dropdown's rows that are not shells. They arrive through
+/// `on_new_tab` under these ids.
+pub const menu_settings: ProfileId = 0xFFFF_FFF0;
+pub const menu_palette: ProfileId = 0xFFFF_FFF1;
+/// Or-ed into a shell's id when it was picked with Ctrl held.
+pub const profile_elevated: ProfileId = 0x4000_0000;
+
+/// Callbacks for the input popup: the search box, the command palette and
+/// the rename prompt. See ghostty_tabbar.h.
+pub const InputCallbacks = extern struct {
+    ctx: ?*anyopaque = null,
+    on_text: ?*const fn (?*anyopaque, [*:0]const u16) callconv(.c) void = null,
+    on_submit: ?*const fn (?*anyopaque, i32, [*:0]const u16, i32) callconv(.c) void = null,
+    on_cancel: ?*const fn (?*anyopaque) callconv(.c) void = null,
+};
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_input_show(
+    bar: *TabBar,
+    x: i32,
+    y: i32,
+    width: i32,
+    placeholder: ?[*:0]const u16,
+    text: ?[*:0]const u16,
+    keep_open: i32,
+    callbacks: InputCallbacks,
+) callconv(.c) void;
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_input_set_items(
+    bar: *TabBar,
+    items: ?[*]const ?[*:0]const u16,
+    count: i32,
+) callconv(.c) void;
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_input_set_status(
+    bar: *TabBar,
+    text: ?[*:0]const u16,
+) callconv(.c) void;
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_input_hide(bar: *TabBar) callconv(.c) void;
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_input_visible(bar: *TabBar) callconv(.c) i32;
+
+/// A context menu at a screen position, or at the pointer when both
+/// coordinates are negative. A null label is a separator. Returns the id
+/// picked, or 0. Blocks until the menu closes.
+pub extern "ghostty_tabbar" fn ghostty_tabbar_popup_menu(
+    bar: *TabBar,
+    x: i32,
+    y: i32,
+    labels: [*]const ?[*:0]const u16,
+    ids: [*]const u32,
+    count: i32,
+) callconv(.c) u32;
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_notify(
+    title: ?[*:0]const u16,
+    body: ?[*:0]const u16,
+) callconv(.c) void;
+
+pub const Progress = enum(i32) {
+    none = 0,
+    normal = 1,
+    @"error" = 2,
+    indeterminate = 3,
+    paused = 4,
+};
+
+pub extern "ghostty_tabbar" fn ghostty_tabbar_set_progress(
+    hwnd: ?*anyopaque,
+    state: Progress,
+    percent: i32,
+) callconv(.c) void;
 
 pub const TabBar = opaque {};
 
@@ -74,6 +150,14 @@ pub extern "ghostty_tabbar" fn ghostty_tabbar_add_tab(
 pub extern "ghostty_tabbar" fn ghostty_tabbar_remove_tab(
     bar: *TabBar,
     tab: TabId,
+) callconv(.c) void;
+
+/// Moves a tab to `index`, counting from zero. Does not fire
+/// `on_tab_moved`, which is only for a drag by the user.
+pub extern "ghostty_tabbar" fn ghostty_tabbar_move_tab(
+    bar: *TabBar,
+    tab: TabId,
+    index: i32,
 ) callconv(.c) void;
 
 pub extern "ghostty_tabbar" fn ghostty_tabbar_set_title(
@@ -159,8 +243,14 @@ const invalid_file_attributes: u32 = 0xFFFF_FFFF;
 /// actually exist are returned, so the menu never offers something that
 /// would fail to launch.
 ///
+/// `custom` is the user's own entries, each `Name=command` as written in
+/// `windows-profile`. They follow the detected shells.
+///
 /// Caller owns the returned slice and everything reachable from it.
-pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
+pub fn detectProfiles(
+    alloc: std.mem.Allocator,
+    custom: []const [:0]const u8,
+) ![]Profile {
     var list: std.ArrayListUnmanaged(Profile) = .empty;
     errdefer {
         for (list.items) |p| freeProfile(alloc, p);
@@ -174,6 +264,9 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
         /// SearchPathW. pwsh in particular lands in different places
         /// depending on whether it came from the MSI, the Store or winget.
         absolute: bool = false,
+        /// A file to take the icon from when the executable has none worth
+        /// showing. Ignored if it does not exist.
+        icon: ?[]const u8 = null,
     };
 
     const candidates = [_]Candidate{
@@ -188,6 +281,10 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
             // "bash-5.2$" and none of their setup is loaded.
             .argv = &.{ "C:\\Program Files\\Git\\bin\\bash.exe", "--login", "-i" },
             .absolute = true,
+            // bin\bash.exe is a bare launcher stub with no icon resource,
+            // so the shell hands back the generic "program" icon for it.
+            // The Git for Windows logo lives in git-bash.exe.
+            .icon = "C:\\Program Files\\Git\\git-bash.exe",
         },
     };
 
@@ -197,10 +294,11 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
         // SHGetFileInfo wants a real path; a bare "cmd.exe" yields the
         // generic unknown-file icon.
         var icon_buf: [512]u8 = undefined;
-        const icon = if (c.absolute)
-            c.argv[0]
-        else
-            (resolvePath(c.argv[0], &icon_buf) orelse c.argv[0]);
+        const icon = icon: {
+            if (c.icon) |path| if (exists(path, true)) break :icon path;
+            if (c.absolute) break :icon c.argv[0];
+            break :icon resolvePath(c.argv[0], &icon_buf) orelse c.argv[0];
+        };
         try list.append(alloc, try makeProfile(alloc, next_id, c.name, c.argv, icon));
         next_id += 1;
     }
@@ -214,7 +312,268 @@ pub fn detectProfiles(alloc: std.mem.Allocator) ![]Profile {
         log.debug("WSL enumeration failed err={}", .{err});
     };
 
+    appendVsProfiles(alloc, &list, &next_id) catch |err| {
+        log.debug("Visual Studio enumeration failed err={}", .{err});
+    };
+
+    for (custom) |entry| {
+        appendCustomProfile(alloc, &list, &next_id, entry) catch |err| {
+            log.warn("windows-profile={s} ignored err={}", .{ entry, err });
+        };
+    }
+
     return list.toOwnedSlice(alloc);
+}
+
+/// Adds one profile from a `windows-profile` entry.
+fn appendCustomProfile(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Profile),
+    next_id: *ProfileId,
+    entry: []const u8,
+) !void {
+    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.NoCommand;
+    const name = std.mem.trim(u8, entry[0..eq], " \t");
+    const cmd = std.mem.trim(u8, entry[eq + 1 ..], " \t");
+    if (name.len == 0 or cmd.len == 0) return error.Empty;
+
+    // Split on spaces, with double quotes holding a word together. This is
+    // deliberately not the full Windows command-line grammar: there is no
+    // escaping of a quote, because a path cannot contain one.
+    var argv_buf: [32][]const u8 = undefined;
+    var argc: usize = 0;
+    var i: usize = 0;
+    while (i < cmd.len and argc < argv_buf.len) {
+        while (i < cmd.len and cmd[i] == ' ') i += 1;
+        if (i >= cmd.len) break;
+        if (cmd[i] == '"') {
+            const end = std.mem.indexOfScalarPos(u8, cmd, i + 1, '"') orelse cmd.len;
+            argv_buf[argc] = cmd[i + 1 .. end];
+            i = @min(cmd.len, end + 1);
+        } else {
+            const end = std.mem.indexOfScalarPos(u8, cmd, i, ' ') orelse cmd.len;
+            argv_buf[argc] = cmd[i..end];
+            i = end;
+        }
+        argc += 1;
+    }
+    if (argc == 0) return error.Empty;
+
+    const exe = argv_buf[0];
+    const absolute = std.mem.indexOfAny(u8, exe, "\\/") != null;
+    if (!exists(exe, absolute)) return error.ProgramNotFound;
+
+    var icon_buf: [512]u8 = undefined;
+    const icon = if (absolute) exe else (resolvePath(exe, &icon_buf) orelse exe);
+    try list.append(alloc, try makeProfile(alloc, next_id.*, name, argv_buf[0..argc], icon));
+    next_id.* += 1;
+}
+
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32,
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+
+extern "kernel32" fn FindFirstFileW(
+    lpFileName: [*:0]const u16,
+    lpFindFileData: *WIN32_FIND_DATAW,
+) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn FindNextFileW(
+    hFindFile: ?*anyopaque,
+    lpFindFileData: *WIN32_FIND_DATAW,
+) callconv(.winapi) i32;
+extern "kernel32" fn FindClose(hFindFile: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CreateFileW(
+    lpFileName: [*:0]const u16,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?*anyopaque,
+) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn ReadFile(
+    hFile: ?*anyopaque,
+    lpBuffer: [*]u8,
+    nNumberOfBytesToRead: u32,
+    lpNumberOfBytesRead: *u32,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) i32;
+extern "kernel32" fn WriteFile(
+    hFile: ?*anyopaque,
+    lpBuffer: [*]const u8,
+    nNumberOfBytesToWrite: u32,
+    lpNumberOfBytesWritten: *u32,
+    lpOverlapped: ?*anyopaque,
+) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
+
+fn invalidHandle(h: ?*anyopaque) bool {
+    return h == null or @intFromPtr(h) == std.math.maxInt(usize);
+}
+
+/// Reads up to `buf.len` bytes from the start of a file. Null if it cannot
+/// be opened.
+pub fn readFileHead(path: []const u8, buf: []u8) ?[]u8 {
+    var wpath: [1024:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wpath[0..1023], path) catch return null;
+    wpath[n] = 0;
+
+    // GENERIC_READ, shared for reading and writing, OPEN_EXISTING.
+    const file = CreateFileW(wpath[0..n :0], 0x8000_0000, 3, null, 3, 0, null);
+    if (invalidHandle(file)) return null;
+    defer _ = CloseHandle(file);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        var got: u32 = 0;
+        const want: u32 = @intCast(@min(buf.len - total, 1 << 20));
+        if (ReadFile(file, buf[total..].ptr, want, &got, null) == 0 or got == 0) break;
+        total += got;
+    }
+    return buf[0..total];
+}
+
+/// Writes a whole file, replacing what was there. False on failure.
+pub fn writeWholeFile(path: []const u8, data: []const u8) bool {
+    var wpath: [1024:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wpath[0..1023], path) catch return false;
+    wpath[n] = 0;
+
+    // GENERIC_WRITE, no sharing, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL.
+    const file = CreateFileW(wpath[0..n :0], 0x4000_0000, 0, null, 2, 0x80, null);
+    if (invalidHandle(file)) return false;
+    defer _ = CloseHandle(file);
+
+    var written: u32 = 0;
+    return WriteFile(file, data.ptr, @intCast(data.len), &written, null) != 0 and
+        written == data.len;
+}
+
+/// The value of a string member named `key`, found by looking for the key
+/// rather than by parsing the document: the files this reads are large and
+/// only two short values are wanted from near the top. Undoes the two
+/// escapes a Windows path can contain. Null if the key is not there or the
+/// value does not fit.
+fn jsonString(data: []const u8, comptime key: []const u8, out: []u8) ?[]const u8 {
+    const needle = "\"" ++ key ++ "\"";
+    const at = std.mem.indexOf(u8, data, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < data.len and data[i] != ':') i += 1;
+    while (i < data.len and data[i] != '"') i += 1;
+    if (i >= data.len) return null;
+    i += 1;
+
+    var len: usize = 0;
+    while (i < data.len and data[i] != '"') : (i += 1) {
+        if (data[i] == '\\' and i + 1 < data.len) i += 1;
+        if (len >= out.len) return null;
+        out[len] = data[i];
+        len += 1;
+    }
+    return out[0..len];
+}
+
+/// Adds the developer prompts of every installed Visual Studio.
+///
+/// Read from the installer's own record of each instance rather than by
+/// running vswhere: that is a console program, and spawning one from a GUI
+/// app flashes a console window on every start.
+fn appendVsProfiles(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Profile),
+    next_id: *ProfileId,
+) !void {
+    const instances = "C:\\ProgramData\\Microsoft\\VisualStudio\\Packages\\_Instances";
+    var find: WIN32_FIND_DATAW = undefined;
+    const handle = FindFirstFileW(
+        std.unicode.utf8ToUtf16LeStringLiteral(instances ++ "\\*"),
+        &find,
+    );
+    if (invalidHandle(handle)) return error.NoVisualStudio;
+    defer _ = FindClose(handle);
+
+    const state = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(state);
+
+    while (true) {
+        const name_len = std.mem.indexOfScalar(u16, &find.cFileName, 0) orelse find.cFileName.len;
+        var name_buf: [512]u8 = undefined;
+        const name_n = std.unicode.utf16LeToUtf8(&name_buf, find.cFileName[0..name_len]) catch 0;
+        const name = name_buf[0..name_n];
+
+        // FILE_ATTRIBUTE_DIRECTORY.
+        if (find.dwFileAttributes & 0x10 != 0 and name.len > 0 and name[0] != '.') add: {
+            var path_buf: [1024]u8 = undefined;
+            const state_path = std.fmt.bufPrint(
+                &path_buf,
+                "{s}\\{s}\\state.json",
+                .{ instances, name },
+            ) catch break :add;
+            const data = readFileHead(state_path, state) orelse break :add;
+
+            var install_buf: [512]u8 = undefined;
+            const install = jsonString(data, "installationPath", &install_buf) orelse break :add;
+            var version_buf: [32]u8 = undefined;
+            const version = jsonString(data, "productLineVersion", &version_buf) orelse "";
+
+            var cmd_buf: [1024]u8 = undefined;
+            const dev_cmd = std.fmt.bufPrint(
+                &cmd_buf,
+                "{s}\\Common7\\Tools\\VsDevCmd.bat",
+                .{install},
+            ) catch break :add;
+            if (exists(dev_cmd, true)) {
+                var title_buf: [128]u8 = undefined;
+                const title = std.fmt.bufPrint(
+                    &title_buf,
+                    "Developer Command Prompt for VS {s}",
+                    .{version},
+                ) catch break :add;
+                var icon_buf: [512]u8 = undefined;
+                const icon = resolvePath("cmd.exe", &icon_buf) orelse "cmd.exe";
+                const argv = [_][]const u8{ "cmd.exe", "/k", dev_cmd };
+                try list.append(alloc, try makeProfile(alloc, next_id.*, title, &argv, icon));
+                next_id.* += 1;
+            }
+
+            var dll_buf: [1024]u8 = undefined;
+            const dev_shell = std.fmt.bufPrint(
+                &dll_buf,
+                "{s}\\Common7\\Tools\\Microsoft.VisualStudio.DevShell.dll",
+                .{install},
+            ) catch break :add;
+            if (exists(dev_shell, true) and exists("powershell.exe", false)) {
+                var title_buf: [128]u8 = undefined;
+                const title = std.fmt.bufPrint(
+                    &title_buf,
+                    "Developer PowerShell for VS {s}",
+                    .{version},
+                ) catch break :add;
+                var script_buf: [2048]u8 = undefined;
+                const script = std.fmt.bufPrint(
+                    &script_buf,
+                    "&{{Import-Module '{s}'; Enter-VsDevShell -VsInstallPath '{s}' -SkipAutomaticLocation}}",
+                    .{ dev_shell, install },
+                ) catch break :add;
+                var icon_buf: [512]u8 = undefined;
+                const icon = resolvePath("powershell.exe", &icon_buf) orelse "powershell.exe";
+                const argv = [_][]const u8{ "powershell.exe", "-NoExit", "-Command", script };
+                try list.append(alloc, try makeProfile(alloc, next_id.*, title, &argv, icon));
+                next_id.* += 1;
+            }
+        }
+
+        if (FindNextFileW(handle, &find) == 0) break;
+    }
 }
 
 fn makeProfile(
@@ -389,11 +748,14 @@ fn appendWslProfiles(
         // --cd ~ lands in the distro's home directory. Without it WSL
         // inherits our Windows working directory and drops the user in
         // /mnt/c/..., which is not where anyone wants to start.
-        // The Start Menu shortcut is where the distro logo lives; the
-        // registry has no icon of its own and wsl.exe would give every
-        // distribution the same one.
+        // The distro's own logo, which wsl.exe would not give us: every
+        // distribution would get the same penguin. WSL keeps it as
+        // shortcut.ico in the distro's directory and points the Start Menu
+        // shortcut at it. The .ico is preferred over the shortcut because
+        // the shell draws a shortcut's icon with the link arrow on top.
         var icon_buf: [1024]u8 = undefined;
-        const icon = shortcutPath(lxss, guid[0..guid_len :0], &icon_buf) orelse blk: {
+        const icon = distroIconPath(lxss, guid[0..guid_len :0], &icon_buf) orelse
+            shortcutPath(lxss, guid[0..guid_len :0], &icon_buf) orelse blk: {
             var exe_buf: [512]u8 = undefined;
             break :blk if (resolvePath("wsl.exe", &exe_buf)) |p|
                 (std.fmt.bufPrint(&icon_buf, "{s}", .{p}) catch "")
@@ -405,6 +767,38 @@ fn appendWslProfiles(
         try list.append(alloc, try makeProfile(alloc, next_id.*, name, &argv, icon));
         next_id.* += 1;
     }
+}
+
+/// The `shortcut.ico` WSL writes into a distribution's `BasePath`. Null
+/// when either is missing, which is the case for distros registered by
+/// older versions of WSL.
+fn distroIconPath(lxss: HKEY, guid: [:0]const u16, buf: []u8) ?[]const u8 {
+    var wbuf: [512:0]u16 = undefined;
+    var cb: u32 = @sizeOf(@TypeOf(wbuf));
+    if (RegGetValueW(
+        lxss,
+        guid,
+        std.unicode.utf8ToUtf16LeStringLiteral("BasePath"),
+        rrf_rt_reg_sz,
+        null,
+        &wbuf,
+        &cb,
+    ) != error_success) return null;
+    if (cb < 2 * @sizeOf(u16)) return null;
+
+    var base_buf: [1024]u8 = undefined;
+    const base_len = std.unicode.utf16LeToUtf8(
+        &base_buf,
+        wbuf[0 .. cb / @sizeOf(u16) - 1],
+    ) catch return null;
+    // Some versions record the path with the \\?\ prefix, which the shell's
+    // icon lookup does not accept.
+    var base: []const u8 = base_buf[0..base_len];
+    if (std.mem.startsWith(u8, base, "\\\\?\\")) base = base[4..];
+
+    const path = std.fmt.bufPrint(buf, "{s}\\shortcut.ico", .{base}) catch return null;
+    if (!exists(path, true)) return null;
+    return path;
 }
 
 /// Reads a distribution's `ShortcutPath` -- the .lnk WSL drops in the

@@ -3922,6 +3922,22 @@ else
 /// Available since: 1.3.0
 @"windows-default-shell": ?[:0]const u8 = null,
 
+/// An extra entry for the tab strip's new-tab dropdown, as `Name=command`.
+/// The command is split on spaces, with double quotes keeping a path or an
+/// argument that contains spaces together:
+///
+///     windows-profile = Node REPL=node.exe
+///     windows-profile = Dev box=ssh.exe -t dev@example.com
+///     windows-profile = MSYS2="C:\msys64\usr\bin\bash.exe" --login -i
+///
+/// May be repeated. Entries appear after the shells Ghostty finds by
+/// itself, in the order they are written, and their names can be used with
+/// `windows-default-shell`. An entry whose program cannot be found is left
+/// out, as a detected shell would be.
+///
+/// This is only supported on Windows.
+@"windows-profile": RepeatableString = .{},
+
 /// If `true` (default), applications running in the terminal can show desktop
 /// notifications using certain escape sequences such as OSC 9 or OSC 777.
 @"desktop-notifications": bool = true,

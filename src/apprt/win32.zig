@@ -2,14 +2,13 @@
 //!
 //! This is an early skeleton: it opens real top-level Win32 windows, drives
 //! a WGL (desktop OpenGL) context, supports multiple tabs per window (each
-//! tab optionally split into two panes), and forwards keyboard/mouse/
-//! clipboard events into the core Ghostty engine. It does NOT have feature
-//! parity with the GTK (Linux) or macOS (Swift) apps -- splits are limited
-//! to a single 2-pane split per tab (no recursive nesting, no drag-resize
-//! of the divider), there's no settings UI, no command palette, no
-//! high-DPI awareness, and keyboard handling only covers the common
-//! ASCII/navigation cases. Its purpose is to be a real, buildable starting
-//! point for a fuller native Windows app.
+//! tab split into as many panes as wanted, with a tab overview), and
+//! forwards keyboard/mouse/clipboard events into the core Ghostty engine.
+//! It does NOT have feature parity with the GTK (Linux) or macOS (Swift)
+//! apps -- there's no settings UI, no command palette, no search box, no
+//! quick terminal, no high-DPI awareness, and keyboard handling only covers
+//! the common ASCII/navigation cases. Its purpose is to be a real,
+//! buildable starting point for a fuller native Windows app.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -23,6 +22,7 @@ const input = @import("../input.zig");
 const global = @import("../global.zig");
 const internal_os = @import("../os/main.zig");
 const tabbar = @import("win32/tabbar.zig");
+const file_load = @import("../config/file_load.zig");
 const gl = @import("opengl");
 const wgl = @import("../renderer/OpenGL.zig").wgl;
 
@@ -193,7 +193,7 @@ const w32 = struct {
     pub const CS_HREDRAW: UINT = 0x0002;
     pub const CS_VREDRAW: UINT = 0x0002;
     pub const GWLP_USERDATA: c_int = -21;
-    pub const IDC_ARROW: [*:0]const u16 = @ptrFromInt(32512);
+    pub const IDC_ARROW: [*:0]align(1) const u16 = @ptrFromInt(32512);
 
     pub const WM_CREATE: UINT = 0x0001;
     pub const WM_DESTROY: UINT = 0x0002;
@@ -355,7 +355,7 @@ const w32 = struct {
     pub extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
     pub extern "user32" fn SetWindowLongPtrW(HWND, c_int, isize) callconv(.winapi) isize;
     pub extern "user32" fn GetWindowLongPtrW(HWND, c_int) callconv(.winapi) isize;
-    pub extern "user32" fn LoadCursorW(?HINSTANCE, [*:0]const u16) callconv(.winapi) ?HCURSOR;
+    pub extern "user32" fn LoadCursorW(?HINSTANCE, [*:0]align(1) const u16) callconv(.winapi) ?HCURSOR;
     pub extern "user32" fn GetDC(HWND) callconv(.winapi) ?HDC;
     pub extern "user32" fn ReleaseDC(HWND, HDC) callconv(.winapi) c_int;
     pub extern "user32" fn GetKeyState(c_int) callconv(.winapi) i16;
@@ -384,6 +384,130 @@ const w32 = struct {
     pub extern "user32" fn IsZoomed(HWND) callconv(.winapi) BOOL;
     pub extern "user32" fn GetSystemMetrics(c_int) callconv(.winapi) c_int;
     pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
+
+    pub const WM_ACTIVATE: UINT = 0x0006;
+    pub const WM_HOTKEY: UINT = 0x0312;
+    pub extern "user32" fn RegisterHotKey(?HWND, c_int, UINT, UINT) callconv(.winapi) BOOL;
+    pub extern "user32" fn UnregisterHotKey(?HWND, c_int) callconv(.winapi) BOOL;
+    pub extern "user32" fn VkKeyScanW(ch: u16) callconv(.winapi) i16;
+    pub extern "user32" fn keybd_event(bVk: u8, bScan: u8, dwFlags: DWORD, dwExtraInfo: usize) callconv(.winapi) void;
+    pub extern "kernel32" fn CreateDirectoryW([*:0]const u16, ?*anyopaque) callconv(.winapi) BOOL;
+    pub extern "user32" fn IsWindowVisible(HWND) callconv(.winapi) BOOL;
+    pub extern "user32" fn FindWindowW(?[*:0]const u16, ?[*:0]const u16) callconv(.winapi) ?HWND;
+    pub extern "kernel32" fn GetModuleFileNameW(?HINSTANCE, [*]u16, DWORD) callconv(.winapi) DWORD;
+
+    pub const HMONITOR = *opaque {};
+    pub const HFONT = *opaque {};
+    pub const HDROP = *opaque {};
+
+    pub const WS_POPUP: DWORD = 0x80000000;
+    pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
+    pub const GWL_STYLE: c_int = -16;
+    pub const SWP_SHOWWINDOW: UINT = 0x0040;
+    pub const SWP_HIDEWINDOW: UINT = 0x0080;
+    pub const MONITOR_DEFAULTTONEAREST: DWORD = 2;
+    pub const SW_SHOWNORMAL: c_int = 1;
+
+    pub const WM_SETCURSOR: UINT = 0x0020;
+    pub const WM_TIMER: UINT = 0x0113;
+    pub const WM_DROPFILES: UINT = 0x0233;
+    pub const HTTRANSPARENT: LRESULT = -1;
+
+    pub const VK_LWIN: u32 = 0x5B;
+    pub const VK_RWIN: u32 = 0x5C;
+
+    pub const IDC_IBEAM: [*:0]align(1) const u16 = @ptrFromInt(32513);
+    pub const IDC_WAIT: [*:0]align(1) const u16 = @ptrFromInt(32514);
+    pub const IDC_CROSS: [*:0]align(1) const u16 = @ptrFromInt(32515);
+    pub const IDC_SIZENWSE: [*:0]align(1) const u16 = @ptrFromInt(32642);
+    pub const IDC_SIZENESW: [*:0]align(1) const u16 = @ptrFromInt(32643);
+    pub const IDC_SIZEWE: [*:0]align(1) const u16 = @ptrFromInt(32644);
+    pub const IDC_SIZENS: [*:0]align(1) const u16 = @ptrFromInt(32645);
+    pub const IDC_SIZEALL: [*:0]align(1) const u16 = @ptrFromInt(32646);
+    pub const IDC_NO: [*:0]align(1) const u16 = @ptrFromInt(32648);
+    pub const IDC_HAND: [*:0]align(1) const u16 = @ptrFromInt(32649);
+    pub const IDC_APPSTARTING: [*:0]align(1) const u16 = @ptrFromInt(32650);
+    pub const IDC_HELP: [*:0]align(1) const u16 = @ptrFromInt(32651);
+
+    /// The pseudo-handles SetWindowPos takes for "above everything" and
+    /// "back among the ordinary windows".
+    pub fn hwndTopmost() ?HWND {
+        return @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    }
+    pub fn hwndNoTopmost() ?HWND {
+        return @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+    }
+
+    pub const MONITORINFO = extern struct {
+        cbSize: DWORD = @sizeOf(MONITORINFO),
+        rcMonitor: RECT = undefined,
+        rcWork: RECT = undefined,
+        dwFlags: DWORD = 0,
+    };
+
+    pub const FLASHW_TRAY: DWORD = 0x2;
+    pub const FLASHW_TIMERNOFG: DWORD = 0xC;
+    pub const FLASHWINFO = extern struct {
+        cbSize: UINT = @sizeOf(FLASHWINFO),
+        hwnd: HWND,
+        dwFlags: DWORD,
+        uCount: UINT,
+        dwTimeout: DWORD,
+    };
+
+    pub const FILETIME = extern struct { low: DWORD, high: DWORD };
+    pub const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+        dwFileAttributes: DWORD,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: DWORD,
+        nFileSizeLow: DWORD,
+    };
+
+    pub extern "user32" fn MonitorFromWindow(HWND, DWORD) callconv(.winapi) ?HMONITOR;
+    pub extern "user32" fn GetMonitorInfoW(HMONITOR, *MONITORINFO) callconv(.winapi) BOOL;
+    pub extern "user32" fn SetCapture(HWND) callconv(.winapi) ?HWND;
+    pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
+    pub extern "user32" fn GetCursorPos(*POINT) callconv(.winapi) BOOL;
+    pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
+    pub extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) BOOL;
+    pub extern "user32" fn FlashWindowEx(*const FLASHWINFO) callconv(.winapi) BOOL;
+    pub extern "user32" fn SetTimer(?HWND, usize, UINT, ?*const anyopaque) callconv(.winapi) usize;
+    pub extern "user32" fn GetWindowTextW(HWND, [*]u16, c_int) callconv(.winapi) c_int;
+    pub extern "user32" fn IsIconic(HWND) callconv(.winapi) BOOL;
+    pub extern "gdi32" fn CreateFontW(
+        cHeight: c_int,
+        cWidth: c_int,
+        cEscapement: c_int,
+        cOrientation: c_int,
+        cWeight: c_int,
+        bItalic: DWORD,
+        bUnderline: DWORD,
+        bStrikeOut: DWORD,
+        iCharSet: DWORD,
+        iOutPrecision: DWORD,
+        iClipPrecision: DWORD,
+        iQuality: DWORD,
+        iPitchAndFamily: DWORD,
+        pszFaceName: [*:0]const u16,
+    ) callconv(.winapi) ?HFONT;
+    pub extern "shell32" fn ShellExecuteW(
+        hwnd: ?HWND,
+        lpOperation: ?[*:0]const u16,
+        lpFile: [*:0]const u16,
+        lpParameters: ?[*:0]const u16,
+        lpDirectory: ?[*:0]const u16,
+        nShowCmd: c_int,
+    ) callconv(.winapi) ?*anyopaque;
+    pub extern "shell32" fn DragAcceptFiles(HWND, BOOL) callconv(.winapi) void;
+    pub extern "shell32" fn DragQueryFileW(HDROP, UINT, ?[*]u16, UINT) callconv(.winapi) UINT;
+    pub extern "shell32" fn DragFinish(HDROP) callconv(.winapi) void;
+    pub extern "kernel32" fn GetFileAttributesExW(
+        lpFileName: [*:0]const u16,
+        fInfoLevelId: c_int,
+        lpFileInformation: *WIN32_FILE_ATTRIBUTE_DATA,
+    ) callconv(.winapi) BOOL;
 
     pub const TME_LEAVE: DWORD = 0x00000002;
     pub const TRACKMOUSEEVENT = extern struct {
@@ -467,6 +591,10 @@ const w32 = struct {
 
 const frame_class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyFrameClass");
 const gl_class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyGLClass");
+const label_class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyOverviewLabel");
+
+/// How often the config file's timestamp is looked at, in milliseconds.
+const config_poll_ms: w32.UINT = 1000;
 
 /// This is the main entrypoint to the apprt for Ghostty on Windows.
 pub const App = @This();
@@ -526,6 +654,27 @@ gl_root: wgl.Context,
 /// which takes a current context and so waits for the first window.
 gl_loaded: bool = false,
 
+/// Every open window. The core only knows surfaces, and a window is more
+/// than its surfaces: it has a strip to re-theme and a frame to redraw
+/// when the config changes.
+windows: std.ArrayListUnmanaged(*Window) = .empty,
+
+/// The config file whose changes are picked up while running, as a wide
+/// path, and the write time it had when it was last loaded. Null when the
+/// path could not be worked out, in which case nothing is watched.
+config_path: ?[:0]u16 = null,
+config_mtime: u64 = 0,
+
+/// The font the overview's labels are drawn in, made on first use.
+ui_font: ?w32.HFONT = null,
+
+/// The quick terminal's window, once it has been asked for.
+quick_window: ?*Window = null,
+
+/// While a saved session is being reopened: the name of the profile the
+/// window being created should open its first tab with.
+restore_profile: ?[]const u8 = null,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -556,6 +705,19 @@ pub fn init(
     };
     if (w32.RegisterClassExW(&gl_wc) == 0) return error.Unexpected;
 
+    const label_wc: w32.WNDCLASSEXW = .{
+        .lpfnWndProc = &labelWndProc,
+        .hInstance = hinstance,
+        .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
+        .lpszClassName = label_class_name,
+    };
+    if (w32.RegisterClassExW(&label_wc) == 0) return error.Unexpected;
+
+    // Before the config is loaded, so that a first run already loads the
+    // file it just wrote.
+    self.core_app = core_app;
+    self.writeDefaultConfig();
+
     var config = try Config.load(core_app.alloc);
     errdefer config.deinit();
 
@@ -569,17 +731,411 @@ pub fn init(
         .main_thread_id = w32.GetCurrentThreadId(),
         .gl_root = gl_root,
     };
+
+    self.watchConfig();
 }
 
 pub fn terminate(self: *App) void {
+    if (self.config_path) |p| self.core_app.alloc.free(p);
+    self.windows.deinit(self.core_app.alloc);
     self.gl_root.destroy();
     self.config.deinit();
 }
 
+/// Starts watching the config file, so that saving it re-themes every open
+/// window the way Windows Terminal follows its settings.json.
+///
+/// A timer that compares timestamps rather than a directory watch: the
+/// file is tiny, once a second is as live as a theme switch needs, and a
+/// timer has no handle to wait on and no thread to coordinate with. It is a
+/// thread timer, so its WM_TIMER arrives with no window and is picked out
+/// in `run`.
+fn watchConfig(self: *App) void {
+    const alloc = self.core_app.alloc;
+    const path = file_load.defaultXdgPath(alloc) catch |err| {
+        log.warn("config will not be watched, no path err={}", .{err});
+        return;
+    };
+    defer alloc.free(path);
+
+    self.config_path = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return;
+    self.config_mtime = self.configWriteTime();
+    _ = w32.SetTimer(null, 0, config_poll_ms, null);
+}
+
+/// Gives a fresh install a config file, with the default shell chosen.
+///
+/// Without one, a new window runs whatever `command` falls back to, which
+/// on Windows is cmd.exe -- hardly anyone's shell of choice -- and there is
+/// no file to show the user where that is decided. So the first run writes
+/// one, naming the best shell this machine has, in the order Windows
+/// Terminal prefers them. An existing config, in either file name, is left
+/// exactly as it is.
+fn writeDefaultConfig(self: *App) void {
+    const alloc = self.core_app.alloc;
+    const path = file_load.defaultXdgPath(alloc) catch return;
+    defer alloc.free(path);
+    const legacy = file_load.legacyDefaultXdgPath(alloc) catch return;
+    defer alloc.free(legacy);
+
+    var probe: [1]u8 = undefined;
+    if (tabbar.readFileHead(path, &probe) != null) return;
+    if (tabbar.readFileHead(legacy, &probe) != null) return;
+
+    const profiles = tabbar.detectProfiles(alloc, &.{}) catch return;
+    defer tabbar.freeProfiles(alloc, profiles);
+    const shell: []const u8 = shell: {
+        for ([_][]const u8{ "PowerShell 7", "Windows PowerShell", "Command Prompt" }) |want| {
+            for (profiles) |p| {
+                if (std.mem.eql(u8, p.name, want)) break :shell want;
+            }
+        }
+        return;
+    };
+
+    const text = std.fmt.allocPrint(alloc,
+        \\# Ghostty configuration.
+        \\#
+        \\# Every option is described at https://ghostty.org/docs/config, and
+        \\# `ghostty +show-config --default --docs` prints them all. Saving
+        \\# this file applies it to the windows that are open.
+        \\
+        \\# The shell new windows, tabs and splits open with: any name from the
+        \\# new-tab dropdown. It can also be changed from the command palette
+        \\# (Ctrl+Shift+P, "Set Default Shell").
+        \\windows-default-shell = {s}
+        \\
+    , .{shell}) catch return;
+    defer alloc.free(text);
+
+    if (std.fs.path.dirname(path)) |dir| createDir(dir);
+    if (!tabbar.writeWholeFile(path, text)) {
+        log.warn("failed to write the default config", .{});
+    }
+}
+
+fn createDir(path: []const u8) void {
+    var wide: [1024:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..1023], path) catch return;
+    wide[n] = 0;
+    // Fails if it is already there, which is the usual case and fine.
+    _ = w32.CreateDirectoryW(wide[0..n :0], null);
+}
+
+/// Makes `name` the shell new terminals open with, or with null goes back
+/// to following the current tab, by rewriting that one line of the config
+/// file and loading it again.
+///
+/// The file is edited as text, a line at a time, so everything else in it
+/// -- comments, order, spacing -- stays as the user wrote it.
+fn setDefaultShell(self: *App, name: ?[]const u8) void {
+    const alloc = self.core_app.alloc;
+    const path = file_load.defaultXdgPath(alloc) catch return;
+    defer alloc.free(path);
+
+    const buf = alloc.alloc(u8, 1024 * 1024) catch return;
+    defer alloc.free(buf);
+    const old: []const u8 = tabbar.readFileHead(path, buf) orelse "";
+    // A file too big to have been read whole is not one to rewrite from
+    // what was read of it.
+    if (old.len == buf.len) return;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var written = false;
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        const key = std.mem.trim(
+            u8,
+            line[0 .. std.mem.indexOfScalar(u8, line, '=') orelse line.len],
+            " \t\r",
+        );
+        const ours = std.mem.eql(u8, key, "windows-default-shell");
+        // The first such line is replaced in place; any later ones would
+        // override it, so they go.
+        if (ours and (written or name == null)) continue;
+
+        if (!first) out.append(alloc, '\n') catch return;
+        first = false;
+        if (ours) {
+            const cr = if (std.mem.endsWith(u8, line, "\r")) "\r" else "";
+            out.print(alloc, "windows-default-shell = {s}{s}", .{ name.?, cr }) catch return;
+            written = true;
+        } else {
+            out.appendSlice(alloc, line) catch return;
+        }
+    }
+    if (name) |n| if (!written) {
+        if (out.items.len > 0 and !std.mem.endsWith(u8, out.items, "\n")) {
+            out.append(alloc, '\n') catch return;
+        }
+        out.print(alloc, "windows-default-shell = {s}\n", .{n}) catch return;
+    };
+
+    if (std.fs.path.dirname(path)) |dir| createDir(dir);
+    if (!tabbar.writeWholeFile(path, out.items)) {
+        log.warn("failed to save the default shell", .{});
+        return;
+    }
+    self.reloadConfig(false) catch |err| {
+        log.warn("failed to reload config err={}", .{err});
+    };
+}
+
+/// The config file's last write time, or zero if it is not there.
+fn configWriteTime(self: *App) u64 {
+    const path = self.config_path orelse return 0;
+    var data: w32.WIN32_FILE_ATTRIBUTE_DATA = undefined;
+    // 0 is GetFileExInfoStandard.
+    if (w32.GetFileAttributesExW(path.ptr, 0, &data) == w32.FALSE) return 0;
+    return (@as(u64, data.ftLastWriteTime.high) << 32) | data.ftLastWriteTime.low;
+}
+
+fn checkConfigChanged(self: *App) void {
+    const mtime = self.configWriteTime();
+    if (mtime == self.config_mtime) return;
+    self.config_mtime = mtime;
+    // A file that went away is not a reason to drop to defaults: editors
+    // and theme switchers replace the file by deleting and renaming, and
+    // the next tick sees the new one.
+    if (mtime == 0) return;
+    log.info("config file changed, reloading", .{});
+    self.reloadConfig(false) catch |err| {
+        log.warn("failed to reload config err={}", .{err});
+    };
+}
+
+/// Loads the config again and hands it to every surface and window.
+fn reloadConfig(self: *App, soft: bool) !void {
+    if (soft) {
+        // Nothing to read: the core wants the same config back so it can
+        // apply conditional state to it.
+        try self.core_app.updateConfig(self, &self.config);
+    } else {
+        var config = try Config.load(self.core_app.alloc);
+        errdefer config.deinit();
+        try self.core_app.updateConfig(self, &config);
+        self.config.deinit();
+        self.config = config;
+        // Whatever triggered this, the file as it is now is what is loaded.
+        self.config_mtime = self.configWriteTime();
+        // The quick terminal's key may be a different one now.
+        self.registerHotkeys();
+    }
+
+    // The strip and the frame take their colours from the config too, and
+    // only the surfaces heard about it above.
+    for (self.windows.items) |window| {
+        applyTabBarTheme(window);
+        if (!window.customFrame()) applyTitlebarTheme(window.hwnd, &self.config);
+        for (window.overview_labels.items) |label| {
+            _ = w32.InvalidateRect(label, null, w32.TRUE);
+        }
+        reflow(window);
+    }
+}
+
+/// The id the quick terminal's hotkey is registered under.
+const hotkey_quick_terminal: c_int = 1;
+
+/// Makes the `toggle_quick_terminal` binding work from anywhere.
+///
+/// A quick terminal that can only be summoned while Ghostty already has
+/// focus is not one, so whatever key is bound to it is registered with the
+/// system. That takes the key away from every other program for as long as
+/// Ghostty runs, which is the point and is why nothing else is registered
+/// this way.
+fn registerHotkeys(self: *App) void {
+    _ = w32.UnregisterHotKey(null, hotkey_quick_terminal);
+    const trigger = self.config.keybind.set.getTrigger(.toggle_quick_terminal) orelse return;
+
+    const vk: u32 = switch (trigger.key) {
+        // Whatever key types that character on this layout.
+        .unicode => |cp| vk: {
+            if (cp > 0xFFFF) return;
+            const scan = w32.VkKeyScanW(@intCast(cp));
+            if (scan == -1) return;
+            break :vk @as(u32, @intCast(scan & 0xFF));
+        },
+        .physical => |key| vk: {
+            var candidate: u32 = 0;
+            while (candidate < 256) : (candidate += 1) {
+                if (vkToKey(candidate) == key) break :vk candidate;
+            }
+            return;
+        },
+        else => return,
+    };
+
+    var mods: w32.UINT = 0x4000; // MOD_NOREPEAT
+    if (trigger.mods.alt) mods |= 0x1;
+    if (trigger.mods.ctrl) mods |= 0x2;
+    if (trigger.mods.shift) mods |= 0x4;
+    if (trigger.mods.super) mods |= 0x8;
+    if (w32.RegisterHotKey(null, hotkey_quick_terminal, mods, vk) == w32.FALSE) {
+        log.warn("quick terminal hotkey is taken by another program", .{});
+    }
+}
+
+/// Shows the quick terminal, or hides it if it is what the user is in.
+fn toggleQuickTerminal(self: *App) void {
+    if (self.quick_window) |window| {
+        const hwnd = window.hwnd;
+        // By visibility alone. "Hide it only if it has the focus" sounds
+        // more careful and is not: Windows can decline to give a window
+        // the focus, and then a key that should hide it shows it again,
+        // for ever.
+        if (w32.IsWindowVisible(hwnd) != 0) {
+            _ = w32.ShowWindow(hwnd, w32.SW_HIDE);
+        } else {
+            _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
+            forceForeground(hwnd);
+        }
+        return;
+    }
+
+    const window = self.newWindow(null) catch |err| {
+        log.warn("failed to create quick terminal err={}", .{err});
+        return;
+    };
+    window.quick = true;
+    self.quick_window = window;
+
+    // Across the top of the monitor, a little under half its height, above
+    // everything else. `quick-terminal-position` and `-size` are not
+    // honoured yet: this is the default of both.
+    const monitor = w32.MonitorFromWindow(window.hwnd, w32.MONITOR_DEFAULTTONEAREST) orelse return;
+    var info: w32.MONITORINFO = .{};
+    if (w32.GetMonitorInfoW(monitor, &info) == w32.FALSE) return;
+    const work = info.rcWork;
+    window.floating = true;
+    _ = w32.SetWindowPos(
+        window.hwnd,
+        w32.hwndTopmost(),
+        work.left,
+        work.top,
+        work.right - work.left,
+        @divTrunc((work.bottom - work.top) * 45, 100),
+        w32.SWP_SHOWWINDOW,
+    );
+    forceForeground(window.hwnd);
+}
+
+/// Brings a window to the foreground even when this process is not the
+/// one the user is in.
+///
+/// Windows only lets the foreground process hand the foreground on, and a
+/// quick terminal is by definition summoned from somewhere else. A hotkey
+/// does carry that right, but it has lapsed by the time a window has been
+/// created. Pressing and releasing Alt is the long-standing way round: the
+/// system counts it as input from the user to this thread, and input is
+/// what the rule is really about.
+fn forceForeground(hwnd: w32.HWND) void {
+    if (w32.SetForegroundWindow(hwnd) != w32.FALSE and
+        w32.GetForegroundWindow() == hwnd) return;
+    w32.keybd_event(@intCast(w32.VK_MENU), 0, 0, 0);
+    w32.keybd_event(@intCast(w32.VK_MENU), 0, 2, 0); // KEYEVENTF_KEYUP
+    _ = w32.SetForegroundWindow(hwnd);
+}
+
+/// Where the session is kept: beside the config file.
+fn sessionPath(self: *App, buf: []u8) ?[]const u8 {
+    const alloc = self.core_app.alloc;
+    const config_path = file_load.defaultXdgPath(alloc) catch return null;
+    defer alloc.free(config_path);
+    const dir = std.fs.path.dirname(config_path) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}\\session.win32", .{dir}) catch null;
+}
+
+/// Writes down the tabs of the last window as it closes, for
+/// `window-save-state = always` to reopen next time.
+///
+/// One profile name per line, in tab order; an empty line is a tab that
+/// just ran the configured command. That is all that can be brought back:
+/// the shells themselves end with the window.
+fn saveSession(self: *App, window: *Window) void {
+    if (self.config.@"window-save-state" != .always) return;
+    // The last ordinary window. The quick terminal is not a session.
+    if (window.quick) return;
+    for (self.windows.items) |other| {
+        if (other != window and !other.quick) return;
+    }
+
+    var path_buf: [1024]u8 = undefined;
+    const path = self.sessionPath(&path_buf) orelse return;
+
+    const alloc = self.core_app.alloc;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    for (window.tabs.items) |tab| {
+        if (tab.profile) |p| out.appendSlice(alloc, p.name) catch return;
+        out.append(alloc, '\n') catch return;
+    }
+    if (!tabbar.writeWholeFile(path, out.items)) {
+        log.warn("failed to save the session", .{});
+    }
+}
+
+/// Opens the first window, with the tabs the last session ended with if
+/// the config asks for that.
+fn openInitialWindow(self: *App) !void {
+    restore: {
+        if (self.config.@"window-save-state" != .always) break :restore;
+        var path_buf: [1024]u8 = undefined;
+        const path = self.sessionPath(&path_buf) orelse break :restore;
+        var data_buf: [16 * 1024]u8 = undefined;
+        const data = tabbar.readFileHead(path, &data_buf) orelse break :restore;
+        if (data.len == 0) break :restore;
+
+        // Splitting on the newline that ends each line leaves one empty
+        // piece after the last, which is not a tab.
+        const body = std.mem.trimEnd(u8, data, "\n");
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        const first = lines.next() orelse break :restore;
+
+        self.restore_profile = std.mem.trim(u8, first, "\r");
+        const window = self.newWindow(null) catch |err| {
+            self.restore_profile = null;
+            return err;
+        };
+        self.restore_profile = null;
+
+        while (lines.next()) |line| {
+            const name = std.mem.trim(u8, line, "\r");
+            const profile = profileByName(window, name);
+            _ = self.newTab(window, .tab, profile) catch |err| {
+                log.warn("failed to restore tab err={}", .{err});
+            };
+        }
+        // Back on the first tab, as a fresh window would be.
+        switchTab(window, 0);
+        return;
+    }
+
+    _ = try self.newWindow(null);
+}
+
+fn profileByName(window: *Window, name: []const u8) ?*const tabbar.Profile {
+    if (name.len == 0) return null;
+    for (window.profiles) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    return null;
+}
+
+/// The profile a new window's first tab opens with.
+fn firstTabProfile(self: *App, window: *Window) ?*const tabbar.Profile {
+    if (self.restore_profile) |name| return profileByName(window, name);
+    return newTabProfile(self, window);
+}
+
 pub fn run(self: *App) !void {
+    self.registerHotkeys();
+
     // Open our first window with one tab. Further windows/tabs can be
     // opened via the `new_window`/`new_tab` actions (keybindings).
-    _ = self.newWindow() catch |err| {
+    self.openInitialWindow() catch |err| {
         log.err("failed to create initial window err={}", .{err});
         return err;
     };
@@ -588,6 +1144,18 @@ pub fn run(self: *App) !void {
     while (!self.quitting) {
         const ret = w32.GetMessageW(&msg, null, 0, 0);
         if (ret == 0 or ret == -1) break;
+
+        // The config watcher's tick. A thread timer belongs to no window,
+        // so nothing would dispatch it.
+        if (msg.hwnd == null and msg.message == w32.WM_TIMER) {
+            self.checkConfigChanged();
+            continue;
+        }
+        // The quick terminal's hotkey, which is likewise the thread's.
+        if (msg.hwnd == null and msg.message == w32.WM_HOTKEY) {
+            if (msg.wParam == hotkey_quick_terminal) self.toggleQuickTerminal();
+            continue;
+        }
 
         // The XAML island gets first refusal, or it never sees keyboard
         // input (tab navigation, accelerators). It reports back whether it
@@ -651,13 +1219,13 @@ pub fn performAction(
         },
 
         .new_window => {
-            _ = try self.newWindow();
+            _ = try self.newWindow(null);
             return true;
         },
 
         .new_tab => {
             switch (target) {
-                .app => _ = try self.newWindow(),
+                .app => _ = try self.newWindow(null),
                 .surface => |core| _ = try self.newTab(
                     core.rt_surface.tab.window,
                     .tab,
@@ -675,7 +1243,11 @@ pub fn performAction(
                         .right, .left => .vertical,
                         .down, .up => .horizontal,
                     };
-                    _ = self.newSplit(core.rt_surface, dir) catch |err| {
+                    const before = switch (value) {
+                        .left, .up => true,
+                        .right, .down => false,
+                    };
+                    _ = self.newSplit(core.rt_surface, dir, before) catch |err| {
                         log.warn("failed to create split err={}", .{err});
                     };
                 },
@@ -684,9 +1256,337 @@ pub fn performAction(
         },
 
         .close_tab => {
-            switch (target) {
-                .app => {},
-                .surface => |core| closePane(core.rt_surface),
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const tab = core.rt_surface.tab;
+            const window = tab.window;
+            const index = window.indexOfTab(tab) orelse return true;
+            switch (value) {
+                .this => closeTabAt(window, index),
+                // Back to front, so that closing one does not move the
+                // ones still to be closed.
+                .other => {
+                    var i = window.tabs.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        if (i != index) closeTabAt(window, i);
+                    }
+                },
+                .right => {
+                    var i = window.tabs.items.len;
+                    while (i > index + 1) {
+                        i -= 1;
+                        closeTabAt(window, i);
+                    }
+                },
+            }
+            return true;
+        },
+
+        .goto_tab => {
+            const window = targetWindow(target) orelse return false;
+            const count = window.tabs.items.len;
+            if (count == 0) return false;
+            const index: usize = switch (value) {
+                .previous => (window.active + count - 1) % count,
+                .next => (window.active + 1) % count,
+                .last => count - 1,
+                // Counted from one, whatever the action's own doc comment
+                // says: the core passes the binding's number straight
+                // through, and `goto_tab:1` is the first tab.
+                else => index: {
+                    const n = @backingInt(value);
+                    if (n < 1 or n > count) return false;
+                    break :index @intCast(n - 1);
+                },
+            };
+            setOverview(window, false);
+            switchTab(window, index);
+            return true;
+        },
+
+        .move_tab => {
+            const window = targetWindow(target) orelse return false;
+            const count: isize = @intCast(window.tabs.items.len);
+            if (count < 2) return false;
+            const from: isize = @intCast(window.active);
+            const to = @mod(from + value.amount, count);
+            moveTab(window, window.active, @intCast(to), true);
+            return true;
+        },
+
+        .goto_split => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            return gotoSplit(core.rt_surface, value);
+        },
+
+        .resize_split => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            return resizeSplit(core.rt_surface, value);
+        },
+
+        .equalize_splits => {
+            const window = targetWindow(target) orelse return false;
+            const tab = window.activeTabPtr() orelse return false;
+            const root = tab.root orelse return false;
+            equalizeNode(root);
+            tab.zoomed = null;
+            reflow(window);
+            return true;
+        },
+
+        .toggle_split_zoom => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const surf: *Surface = core.rt_surface;
+            const tab = surf.tab;
+            if (tab.panes.items.len < 2) return false;
+            tab.zoomed = if (tab.zoomed == surf) null else surf;
+            reflow(tab.window);
+            return true;
+        },
+
+        .toggle_tab_overview => {
+            const window = targetWindow(target) orelse return false;
+            setOverview(window, !window.overview);
+            return true;
+        },
+
+        .toggle_fullscreen => {
+            const window = targetWindow(target) orelse return false;
+            setFullscreen(window, !window.fullscreen);
+            return true;
+        },
+
+        .toggle_maximize => {
+            const window = targetWindow(target) orelse return false;
+            if (window.fullscreen) return false;
+            _ = w32.ShowWindow(
+                window.hwnd,
+                if (w32.IsZoomed(window.hwnd) != 0) w32.SW_RESTORE else w32.SW_MAXIMIZE,
+            );
+            return true;
+        },
+
+        .float_window => {
+            const window = targetWindow(target) orelse return false;
+            window.floating = switch (value) {
+                .on => true,
+                .off => false,
+                .toggle => !window.floating,
+            };
+            const ok = w32.SetWindowPos(
+                window.hwnd,
+                if (window.floating) w32.hwndTopmost() else w32.hwndNoTopmost(),
+                0,
+                0,
+                0,
+                0,
+                w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE,
+            );
+            if (ok == w32.FALSE) log.warn("float_window: SetWindowPos failed", .{});
+            return true;
+        },
+
+        .present_terminal => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const surf: *Surface = core.rt_surface;
+            const tab = surf.tab;
+            const window = tab.window;
+            if (tab.indexOfPane(surf)) |i| tab.focused = i;
+            if (window.indexOfTab(tab)) |i| switchTab(window, i);
+            if (w32.IsIconic(window.hwnd) != 0) _ = w32.ShowWindow(window.hwnd, w32.SW_RESTORE);
+            _ = w32.SetForegroundWindow(window.hwnd);
+            reflow(window);
+            return true;
+        },
+
+        .start_search => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            return showSearch(core.rt_surface, value.needle);
+        },
+
+        .end_search => {
+            const window = targetWindow(target) orelse return false;
+            if (window.input_mode != .search) return true;
+            window.input_mode = .none;
+            window.input_surface = null;
+            if (window.tab_bar) |bar| tabbar.ghostty_tabbar_input_hide(bar);
+            return true;
+        },
+
+        .search_total => {
+            const window = targetWindow(target) orelse return false;
+            window.search_total = value.total;
+            syncSearchStatus(window);
+            return true;
+        },
+
+        .search_selected => {
+            const window = targetWindow(target) orelse return false;
+            window.search_selected = value.selected;
+            syncSearchStatus(window);
+            return true;
+        },
+
+        .toggle_command_palette => {
+            const window = targetWindow(target) orelse return false;
+            showPalette(window);
+            return true;
+        },
+
+        // Whichever title is asked about, the tab's is the one there is
+        // somewhere to show: a pane has no caption of its own and the
+        // window's is the active tab's.
+        .prompt_title => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            showRename(core.rt_surface.tab);
+            return true;
+        },
+
+        .set_tab_title => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            setTabTitleOverride(core.rt_surface.tab, value.title);
+            return true;
+        },
+
+        .move_tab_to_new_window => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            try moveTabToNewWindow(self, core.rt_surface.tab);
+            return true;
+        },
+
+        .toggle_quick_terminal => {
+            self.toggleQuickTerminal();
+            return true;
+        },
+
+        .desktop_notification => {
+            var title: [256:0]u16 = undefined;
+            const title_len = std.unicode.utf8ToUtf16Le(title[0..255], value.title) catch 0;
+            title[title_len] = 0;
+            var body: [1024:0]u16 = undefined;
+            const body_len = std.unicode.utf8ToUtf16Le(body[0..1023], value.body) catch 0;
+            body[body_len] = 0;
+            tabbar.ghostty_tabbar_notify(title[0..title_len :0], body[0..body_len :0]);
+            return true;
+        },
+
+        .progress_report => {
+            const window = targetWindow(target) orelse return false;
+            const state: tabbar.Progress = switch (value.state) {
+                .remove => .none,
+                .set => .normal,
+                .@"error" => .@"error",
+                .indeterminate => .indeterminate,
+                .pause => .paused,
+            };
+            tabbar.ghostty_tabbar_set_progress(
+                window.hwnd,
+                state,
+                if (value.progress) |p| @intCast(p) else 0,
+            );
+            return true;
+        },
+
+        .reload_config => {
+            try self.reloadConfig(value.soft);
+            return true;
+        },
+
+        // Everything config-dependent this apprt holds is refreshed by
+        // reloadConfig itself, once the new config has been stored: the
+        // pointer here is only good for the length of this call.
+        .config_change => return true,
+
+        .open_config => {
+            const alloc = self.core_app.alloc;
+            const path = configpkg.edit.openPath(alloc) catch |err| {
+                log.warn("no config file to open err={}", .{err});
+                return false;
+            };
+            defer alloc.free(path);
+            // Notepad by name rather than "whatever opens this file": the
+            // config has no extension anything is registered for, so the
+            // shell's answer would be the "how do you want to open this?"
+            // dialog.
+            shellOpen(alloc, "notepad.exe", path);
+            return true;
+        },
+
+        .open_url => {
+            self.openUrl(value);
+            return true;
+        },
+
+        .ring_bell => {
+            const window = targetWindow(target) orelse return false;
+            // Only when the user is elsewhere: flashing the taskbar button
+            // of the window they are typing into tells them nothing.
+            if (w32.GetForegroundWindow() == window.hwnd) return true;
+            const info: w32.FLASHWINFO = .{
+                .hwnd = window.hwnd,
+                .dwFlags = w32.FLASHW_TRAY | w32.FLASHW_TIMERNOFG,
+                .uCount = 3,
+                .dwTimeout = 0,
+            };
+            _ = w32.FlashWindowEx(&info);
+            return true;
+        },
+
+        .mouse_shape => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const surf: *Surface = core.rt_surface;
+            surf.cursor = w32.LoadCursorW(null, switch (value) {
+                .text, .vertical_text, .cell => w32.IDC_IBEAM,
+                .pointer, .grab, .grabbing => w32.IDC_HAND,
+                .crosshair => w32.IDC_CROSS,
+                .wait => w32.IDC_WAIT,
+                .progress => w32.IDC_APPSTARTING,
+                .help => w32.IDC_HELP,
+                .not_allowed, .no_drop => w32.IDC_NO,
+                .move, .all_scroll => w32.IDC_SIZEALL,
+                .col_resize, .ew_resize, .e_resize, .w_resize => w32.IDC_SIZEWE,
+                .row_resize, .ns_resize, .n_resize, .s_resize => w32.IDC_SIZENS,
+                .nesw_resize, .ne_resize, .sw_resize => w32.IDC_SIZENESW,
+                .nwse_resize, .nw_resize, .se_resize => w32.IDC_SIZENWSE,
+                else => w32.IDC_ARROW,
+            });
+            // WM_SETCURSOR only comes with mouse movement, and the shape
+            // changes under a mouse that is standing still -- when a
+            // program turns mouse reporting on, say.
+            if (surf.tab.window.focusedSurface() == surf and
+                !surf.tab.window.overview)
+            {
+                _ = w32.SetCursor(surf.cursor);
             }
             return true;
         },
@@ -712,8 +1612,11 @@ pub fn performAction(
                 .app => {},
                 .surface => |core| {
                     const surf: *Surface = core.rt_surface;
-                    if (surf.tab.window.activeTabPtr() == surf.tab) {
-                        reflow(surf.tab.window);
+                    const window = surf.tab.window;
+                    // The overview shows every tab, so every tab's frames
+                    // are worth a redraw while it is up.
+                    if (window.overview or window.activeTabPtr() == surf.tab) {
+                        reflow(window);
                     }
                 },
             }
@@ -752,7 +1655,18 @@ pub fn performIpc(
     _ = alloc;
     _ = target;
     _ = value;
-    return false;
+    switch (action) {
+        // `ghostty +new-window`: hand the request to a Ghostty that is
+        // already running, if there is one, instead of starting another.
+        // Its frame class is how it is found, and a posted message is all
+        // the transport a request with no arguments needs. Whatever the
+        // caller wanted the window to run is not carried over yet.
+        .new_window => {
+            const existing = w32.FindWindowW(frame_class_name, null) orelse return false;
+            return w32.PostMessageW(existing, wm_ipc_new_window, 0, 0) != w32.FALSE;
+        },
+        else => return false,
+    }
 }
 
 /// No inspector UI in this skeleton.
@@ -796,6 +1710,44 @@ pub const Window = struct {
     /// not yet the size they will keep. See `Surface.pending`.
     settled: bool = false,
 
+    /// The split whose divider is being dragged, between the button going
+    /// down on it and coming back up.
+    drag_split: ?*SplitNode = null,
+
+    /// Covering the whole monitor, with the frame and the strip put away.
+    /// The style and placement the window had before are kept so that
+    /// leaving fullscreen puts it back exactly.
+    fullscreen: bool = false,
+    saved_style: isize = 0,
+    saved_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
+    /// Kept above other windows (`float_window`).
+    floating: bool = false,
+
+    /// Showing every tab as a thumbnail instead of the active tab.
+    overview: bool = false,
+    /// The thumbnail the pointer or the arrow keys are on.
+    overview_sel: usize = 0,
+    /// One caption per thumbnail, reused across openings. Plain child
+    /// windows drawn with GDI: the terminal area is a GL surface, which
+    /// has no way to draw text of its own.
+    overview_labels: std.ArrayListUnmanaged(w32.HWND) = .empty,
+
+    /// What the input popup is up as, and what it is about: the pane
+    /// being searched, or the tab being renamed.
+    input_mode: InputMode = .none,
+    input_surface: ?*Surface = null,
+    input_tab: ?*Tab = null,
+    /// For each row the palette is showing, which command it is.
+    palette_map: std.ArrayListUnmanaged(usize) = .empty,
+    /// The search's match count and current match, as last reported.
+    search_total: ?usize = null,
+    search_selected: ?usize = null,
+
+    /// The quick terminal: the one window that a hotkey shows and hides
+    /// rather than opening anew.
+    quick: bool = false,
+
     /// True while the tab strip owns the title bar, which is only the case
     /// when the native strip is up. The GDI fallback keeps the system
     /// title bar, because it has no caption buttons of its own.
@@ -806,6 +1758,13 @@ pub const Window = struct {
     fn stripHeight(self: *Window) i32 {
         if (self.tab_bar) |bar| return tabbar.ghostty_tabbar_height(bar);
         return tab_bar_height;
+    }
+
+    fn indexOfTab(self: *Window, tab: *const Tab) ?usize {
+        for (self.tabs.items, 0..) |t, i| {
+            if (t == tab) return i;
+        }
+        return null;
     }
 
     /// Finds the tab the native strip knows by `id`.
@@ -894,14 +1853,181 @@ fn syncFocus(window: *Window) void {
     }
 }
 
-/// One entry in a window's tab strip. Holds 1 or 2 panes (CoreSurfaces);
-/// with 2 panes, `split` says whether they're arranged side-by-side
-/// (vertical) or stacked (horizontal), matching Ghostty's naming (the
-/// split direction is the direction of the dividing line's *normal*).
+/// One node of a tab's layout: a pane, or a divider with a node on either
+/// side of it. Splitting a pane turns its leaf into a split holding the old
+/// pane and the new one, so panes nest to any depth.
+///
+/// A small mutable tree of its own rather than the core's SplitTree, which
+/// is immutable and reference-counted for the sake of undo in the other
+/// apprts. Nothing here keeps old layouts, and dragging a divider wants to
+/// change one ratio in place sixty times a second.
+const SplitNode = struct {
+    parent: ?*SplitNode = null,
+    /// Where this node was last laid out, in the GL window's client
+    /// coordinates. For a split that is both children and the divider.
+    rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    data: Data,
+
+    const Data = union(enum) {
+        leaf: *Surface,
+        split: Split,
+    };
+
+    const Split = struct {
+        dir: SplitDir,
+        /// The share of the space that goes to `a`.
+        ratio: f32 = 0.5,
+        /// Left or top.
+        a: *SplitNode,
+        /// Right or bottom.
+        b: *SplitNode,
+    };
+
+    fn leafCount(self: *const SplitNode) usize {
+        return switch (self.data) {
+            .leaf => 1,
+            .split => |s| s.a.leafCount() + s.b.leafCount(),
+        };
+    }
+
+    fn firstLeaf(self: *SplitNode) *Surface {
+        return switch (self.data) {
+            .leaf => |s| s,
+            .split => |s| s.a.firstLeaf(),
+        };
+    }
+};
+
+/// How far a split's ratio may go, so that neither side can be dragged or
+/// resized out of existence.
+const split_ratio_min: f32 = 0.1;
+const split_ratio_max: f32 = 0.9;
+/// How close to a divider, in pixels either side, a press still grabs it.
+/// The divider itself is too thin to aim at.
+const split_grab: i32 = 3;
+
+/// Gives `node` the area `rect` and divides it among whatever is below.
+fn layoutNode(node: *SplitNode, rect: w32.RECT) void {
+    node.rect = rect;
+    switch (node.data) {
+        .leaf => |surf| surf.last_rect = rect,
+        .split => |s| {
+            const half = @divTrunc(split_divider, 2);
+            switch (s.dir) {
+                .vertical => {
+                    const span: f32 = @floatFromInt(rect.right - rect.left);
+                    const mid = rect.left + @as(i32, @intFromFloat(span * s.ratio));
+                    layoutNode(s.a, .{
+                        .left = rect.left,
+                        .top = rect.top,
+                        .right = @max(rect.left, mid - half),
+                        .bottom = rect.bottom,
+                    });
+                    layoutNode(s.b, .{
+                        .left = @min(rect.right, mid + half),
+                        .top = rect.top,
+                        .right = rect.right,
+                        .bottom = rect.bottom,
+                    });
+                },
+                .horizontal => {
+                    const span: f32 = @floatFromInt(rect.bottom - rect.top);
+                    const mid = rect.top + @as(i32, @intFromFloat(span * s.ratio));
+                    layoutNode(s.a, .{
+                        .left = rect.left,
+                        .top = rect.top,
+                        .right = rect.right,
+                        .bottom = @max(rect.top, mid - half),
+                    });
+                    layoutNode(s.b, .{
+                        .left = rect.left,
+                        .top = @min(rect.bottom, mid + half),
+                        .right = rect.right,
+                        .bottom = rect.bottom,
+                    });
+                },
+            }
+        },
+    }
+}
+
+/// The split whose divider is at this point, if any.
+fn dividerAt(node: *SplitNode, x: i32, y: i32) ?*SplitNode {
+    const s = switch (node.data) {
+        .leaf => return null,
+        .split => |s| s,
+    };
+    const r = node.rect;
+    const hit = switch (s.dir) {
+        .vertical => x >= s.a.rect.right - split_grab and
+            x < s.b.rect.left + split_grab and
+            y >= r.top and y < r.bottom,
+        .horizontal => y >= s.a.rect.bottom - split_grab and
+            y < s.b.rect.top + split_grab and
+            x >= r.left and x < r.right,
+    };
+    if (hit) return node;
+    return dividerAt(s.a, x, y) orelse dividerAt(s.b, x, y);
+}
+
+/// Sizes every split by how many panes are on each side of it, which is
+/// what makes three panes in a row come out as thirds rather than a half
+/// and two quarters.
+fn equalizeNode(node: *SplitNode) void {
+    switch (node.data) {
+        .leaf => {},
+        .split => |*s| {
+            const a: f32 = @floatFromInt(s.a.leafCount());
+            const b: f32 = @floatFromInt(s.b.leafCount());
+            s.ratio = a / (a + b);
+            equalizeNode(s.a);
+            equalizeNode(s.b);
+        },
+    }
+}
+
+fn freeTree(alloc: Allocator, node: *SplitNode) void {
+    switch (node.data) {
+        .leaf => {},
+        .split => |s| {
+            freeTree(alloc, s.a);
+            freeTree(alloc, s.b);
+        },
+    }
+    alloc.destroy(node);
+}
+
+/// Appends the panes below `node` to `out`, left to right and top to
+/// bottom, which is the order "next split" walks them in.
+fn collectLeaves(node: *SplitNode, out: []*Surface, len: *usize) void {
+    switch (node.data) {
+        .leaf => |surf| if (len.* < out.len) {
+            out[len.*] = surf;
+            len.* += 1;
+        },
+        .split => |s| {
+            collectLeaves(s.a, out, len);
+            collectLeaves(s.b, out, len);
+        },
+    }
+}
+
+/// One entry in a window's tab strip. Holds one or more panes
+/// (CoreSurfaces), arranged by the tree at `root`.
 pub const Tab = struct {
     window: *Window,
+    /// Every pane in the tab, in the order they were opened. The tree
+    /// says where each one is; this is for everything that just needs
+    /// all of them.
     panes: std.ArrayListUnmanaged(*Surface) = .empty,
-    split: ?SplitDir = null,
+    /// The layout. Null only for a tab with no panes, which is one that is
+    /// on its way out.
+    root: ?*SplitNode = null,
+    /// The pane given the whole tab to itself, if one is zoomed.
+    zoomed: ?*Surface = null,
+    /// A name the user gave the tab, shown instead of what its shell
+    /// reports. Owned.
+    title_override: ?[]u8 = null,
     focused: usize = 0,
     /// This tab's identity in the native strip, or 0 when running on the
     /// GDI fallback.
@@ -918,26 +2044,37 @@ pub const Tab = struct {
         return self.panes.items[self.focused];
     }
 
-    /// Pixel rect for the pane at `index`, given the tab's total content
-    /// area. Only supports exactly 1 or 2 panes (MVP: no nested splits).
-    fn paneRect(self: *Tab, index: usize, total: w32.RECT) w32.RECT {
-        if (self.panes.items.len < 2 or self.split == null) return total;
-        return switch (self.split.?) {
-            .vertical => v: {
-                const mid = @divTrunc(total.left + total.right, 2);
-                break :v if (index == 0)
-                    w32.RECT{ .left = total.left, .top = total.top, .right = mid - @divTrunc(split_divider, 2), .bottom = total.bottom }
-                else
-                    w32.RECT{ .left = mid + @divTrunc(split_divider, 2), .top = total.top, .right = total.right, .bottom = total.bottom };
-            },
-            .horizontal => h: {
-                const mid = @divTrunc(total.top + total.bottom, 2);
-                break :h if (index == 0)
-                    w32.RECT{ .left = total.left, .top = total.top, .right = total.right, .bottom = mid - @divTrunc(split_divider, 2) }
-                else
-                    w32.RECT{ .left = total.left, .top = mid + @divTrunc(split_divider, 2), .right = total.right, .bottom = total.bottom };
-            },
-        };
+    fn indexOfPane(self: *Tab, surf: *const Surface) ?usize {
+        for (self.panes.items, 0..) |p, i| {
+            if (p == surf) return i;
+        }
+        return null;
+    }
+
+    /// Gives every pane its rect within `total`. A zoomed pane takes all
+    /// of it and the others get an empty rect, which is what everything
+    /// downstream reads as "not on screen": nothing is drawn for it, it is
+    /// not resized, and no click can land in it.
+    fn layout(self: *Tab, total: w32.RECT) void {
+        const root = self.root orelse return;
+        if (self.zoomed) |zoomed| {
+            for (self.panes.items) |pane| {
+                pane.last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            }
+            // Kept for when the zoom ends, and so the divider hit-test has
+            // nothing to find in the meantime.
+            root.rect = total;
+            zoomed.last_rect = total;
+            return;
+        }
+        layoutNode(root, total);
+    }
+
+    /// The divider under this point, or null -- always null while zoomed,
+    /// when there are no dividers on screen.
+    fn dividerHit(self: *Tab, x: i32, y: i32) ?*SplitNode {
+        if (self.zoomed != null) return null;
+        return dividerAt(self.root orelse return null, x, y);
     }
 
     fn paneAt(self: *Tab, x: i32, y: i32) ?usize {
@@ -999,6 +2136,33 @@ const bar_callbacks = struct {
 
     fn onNewTab(ctx: ?*anyopaque, profile: tabbar.ProfileId) callconv(.c) void {
         const win = window(ctx) orelse return;
+
+        // The dropdown's rows that are commands rather than shells.
+        if (profile == tabbar.menu_settings) {
+            _ = win.app.performAction(.app, .open_config, .os_open) catch {};
+            return;
+        }
+        if (profile == tabbar.menu_palette) {
+            showPalette(win);
+            return;
+        }
+
+        // Picked with Ctrl held: that shell, elevated, which has to be a
+        // process of its own -- a tab cannot have more rights than the
+        // window it is in.
+        if (profile != tabbar.profile_default and
+            profile & tabbar.profile_elevated != 0)
+        {
+            const id = profile & ~tabbar.profile_elevated;
+            for (win.profiles) |*p| {
+                if (p.id == id) {
+                    launchElevated(win.app, p);
+                    break;
+                }
+            }
+            return;
+        }
+
         // The plain "+" sends profile_default, which matches nothing, and
         // then it is newTabProfile's business what a tab opens with.
         const picked: ?*const tabbar.Profile = for (win.profiles) |*p| {
@@ -1037,7 +2201,748 @@ const bar_callbacks = struct {
             if (w32.IsZoomed(win.hwnd) != 0) w32.SW_RESTORE else w32.SW_MAXIMIZE,
         );
     }
+
+    /// The strip has already moved the tab; this only brings our list
+    /// into the same order.
+    fn onTabMoved(ctx: ?*anyopaque, id: tabbar.TabId, index: i32) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        const from = win.tabById(id) orelse return;
+        if (index < 0) return;
+        moveTab(win, from, @intCast(index), false);
+    }
+
+    fn onOverview(ctx: ?*anyopaque) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        setOverview(win, !win.overview);
+    }
+
+    /// Posted on rather than answered here: the menu runs a message loop
+    /// of its own, and this is being called from inside a XAML event.
+    fn onTabContext(ctx: ?*anyopaque, id: tabbar.TabId) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        _ = w32.PostMessageW(win.hwnd, wm_tab_menu, 0, @bitCast(@as(usize, @intCast(id))));
+    }
 };
+
+/// Posted to a frame window to open the context menu of the tab whose
+/// strip id is in lparam.
+const wm_tab_menu: w32.UINT = w32.WM_APP + 10;
+/// Posted to a frame window by another Ghostty process (`+new-window`) to
+/// ask this one for a new window.
+const wm_ipc_new_window: w32.UINT = w32.WM_APP + 11;
+
+/// What the input popup is being at the moment.
+const InputMode = enum { none, search, palette, rename };
+
+/// UTF-16 from the DLL, as UTF-8 in `buf`. Empty if it does not fit.
+fn fromWide(text: [*:0]const u16, buf: []u8) []const u8 {
+    const len = std.mem.len(text);
+    const n = std.unicode.utf16LeToUtf8(buf, text[0..len]) catch return "";
+    return buf[0..n];
+}
+
+/// Where the input popup goes: over the top of the terminal area, centred
+/// for the palette and the rename prompt, at the right for search, which
+/// is where every other program puts its find box.
+fn inputPlacement(window: *Window, mode: InputMode) struct { x: i32, y: i32, width: i32 } {
+    var r: w32.RECT = undefined;
+    _ = w32.GetWindowRect(window.gl_hwnd, &r);
+    const avail = r.right - r.left;
+    const width = @max(160, @min(avail - 32, @as(i32, switch (mode) {
+        .search => 360,
+        else => 560,
+    })));
+    return .{
+        .x = switch (mode) {
+            .search => r.right - width - 16,
+            else => r.left + @divTrunc(avail - width, 2),
+        },
+        .y = r.top + 10,
+        .width = width,
+    };
+}
+
+const input_callbacks = struct {
+    fn window(ctx: ?*anyopaque) ?*Window {
+        return @ptrCast(@alignCast(ctx orelse return null));
+    }
+
+    fn onText(ctx: ?*anyopaque, text: [*:0]const u16) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        var buf: [1024]u8 = undefined;
+        const utf8 = fromWide(text, &buf);
+        switch (win.input_mode) {
+            .search => if (win.input_surface) |surf| {
+                if (!surf.core_ready) return;
+                _ = surf.core_surface.performBindingAction(.{ .search = utf8 }) catch {};
+            },
+            .palette => fillPalette(win, utf8),
+            .rename, .none => {},
+        }
+    }
+
+    fn onSubmit(ctx: ?*anyopaque, index: i32, text: [*:0]const u16, shift: i32) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        switch (win.input_mode) {
+            // Enter is "next", Shift+Enter "previous"; the box stays up.
+            .search => if (win.input_surface) |surf| {
+                if (!surf.core_ready) return;
+                _ = surf.core_surface.performBindingAction(.{
+                    .navigate_search = if (shift != 0) .previous else .next,
+                }) catch {};
+            },
+            .palette => {
+                win.input_mode = .none;
+                if (index < 0 or index >= win.palette_map.items.len) return;
+                const entry = win.palette_map.items[@intCast(index)];
+                // Past the core's commands come this apprt's own: one per
+                // shell to make it the default, then one to have none.
+                if (entry >= input.command.defaults.len) {
+                    const shell = entry - input.command.defaults.len;
+                    win.app.setDefaultShell(
+                        if (shell < win.profiles.len) win.profiles[shell].name else null,
+                    );
+                    return;
+                }
+                const command = input.command.defaults[entry];
+                const surf = win.focusedSurface() orelse return;
+                if (!surf.core_ready) return;
+                _ = surf.core_surface.performBindingAction(command.action) catch |err| {
+                    log.warn("command failed err={}", .{err});
+                };
+            },
+            .rename => {
+                win.input_mode = .none;
+                const tab = win.input_tab orelse return;
+                win.input_tab = null;
+                // The tab may have closed while the prompt was up.
+                if (win.indexOfTab(tab) == null) return;
+                var buf: [512]u8 = undefined;
+                setTabTitleOverride(tab, std.mem.trim(u8, fromWide(text, &buf), " "));
+            },
+            .none => {},
+        }
+    }
+
+    fn onCancel(ctx: ?*anyopaque) callconv(.c) void {
+        const win = window(ctx) orelse return;
+        const mode = win.input_mode;
+        win.input_mode = .none;
+        win.input_tab = null;
+        if (mode == .search) {
+            if (win.input_surface) |surf| {
+                if (surf.core_ready) {
+                    _ = surf.core_surface.performBindingAction(.end_search) catch {};
+                }
+            }
+        }
+        win.input_surface = null;
+    }
+};
+
+fn showInput(
+    window: *Window,
+    mode: InputMode,
+    placeholder: [*:0]const u16,
+    text: ?[*:0]const u16,
+) bool {
+    const bar = window.tab_bar orelse return false;
+    setOverview(window, false);
+    window.input_mode = mode;
+    const at = inputPlacement(window, mode);
+    tabbar.ghostty_tabbar_input_show(
+        bar,
+        at.x,
+        at.y,
+        at.width,
+        placeholder,
+        text,
+        if (mode == .search) 1 else 0,
+        .{
+            .ctx = window,
+            .on_text = input_callbacks.onText,
+            .on_submit = input_callbacks.onSubmit,
+            .on_cancel = input_callbacks.onCancel,
+        },
+    );
+    return true;
+}
+
+/// Opens the search box on a pane, with `needle` already typed if given.
+fn showSearch(surf: *Surface, needle: []const u8) bool {
+    const window = surf.tab.window;
+    var wide: [512:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..511], needle) catch 0;
+    wide[n] = 0;
+
+    // Already searching this pane: with nothing new to look for there is
+    // nothing to do but leave the box where it is.
+    if (window.input_mode == .search and window.input_surface == surf and n == 0) {
+        return true;
+    }
+
+    window.input_surface = surf;
+    window.search_total = null;
+    window.search_selected = null;
+    return showInput(
+        window,
+        .search,
+        std.unicode.utf8ToUtf16LeStringLiteral("Find"),
+        wide[0..n :0],
+    );
+}
+
+/// Puts "3/17" beside the search text, or clears it.
+fn syncSearchStatus(window: *Window) void {
+    const bar = window.tab_bar orelse return;
+    if (window.input_mode != .search) return;
+    var buf: [64]u8 = undefined;
+    const text: []const u8 = if (window.search_total) |total| blk: {
+        if (window.search_selected) |sel| {
+            break :blk std.fmt.bufPrint(&buf, "{d}/{d}", .{ sel, total }) catch "";
+        }
+        break :blk std.fmt.bufPrint(&buf, "{d}", .{total}) catch "";
+    } else "";
+    var wide: [64:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..63], text) catch 0;
+    wide[n] = 0;
+    tabbar.ghostty_tabbar_input_set_status(bar, wide[0..n :0]);
+}
+
+/// Opens the command palette: every command the core offers, narrowed as
+/// the user types.
+fn showPalette(window: *Window) void {
+    if (window.input_mode == .palette) {
+        if (window.tab_bar) |bar| tabbar.ghostty_tabbar_input_hide(bar);
+        window.input_mode = .none;
+        return;
+    }
+    if (!showInput(
+        window,
+        .palette,
+        std.unicode.utf8ToUtf16LeStringLiteral("Type a command"),
+        null,
+    )) return;
+    fillPalette(window, "");
+}
+
+/// True if `haystack` contains `needle`, ignoring ASCII case.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Lists the commands whose title contains `filter`, ignoring case.
+fn fillPalette(window: *Window, filter: []const u8) void {
+    const bar = window.tab_bar orelse return;
+    const alloc = window.app.core_app.alloc;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    window.palette_map.clearRetainingCapacity();
+    var items: std.ArrayListUnmanaged(?[*:0]const u16) = .empty;
+    for (input.command.defaults, 0..) |command, i| {
+        if (filter.len > 0 and
+            !containsIgnoreCase(command.title, filter)) continue;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(arena, command.title) catch continue;
+        items.append(arena, wide.ptr) catch return;
+        window.palette_map.append(alloc, i) catch return;
+    }
+
+    // Choosing the default shell, which the core knows nothing about: one
+    // entry per shell in the dropdown, the current one marked, and a last
+    // one to go back to having none. They are numbered on from the core's
+    // commands.
+    const current = window.app.config.@"windows-default-shell";
+    const base = input.command.defaults.len;
+    for (window.profiles, 0..) |p, i| {
+        const is_current = if (current) |c| std.ascii.eqlIgnoreCase(c, p.name) else false;
+        const title = std.fmt.allocPrint(
+            arena,
+            "Set Default Shell: {s}{s}",
+            .{ p.name, if (is_current) "  (current)" else "" },
+        ) catch continue;
+        if (filter.len > 0 and !containsIgnoreCase(title, filter)) continue;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(arena, title) catch continue;
+        items.append(arena, wide.ptr) catch return;
+        window.palette_map.append(alloc, base + i) catch return;
+    }
+    unset: {
+        const title = if (current == null)
+            "Set Default Shell: Same as Current Tab  (current)"
+        else
+            "Set Default Shell: Same as Current Tab";
+        if (filter.len > 0 and !containsIgnoreCase(title, filter)) break :unset;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(arena, title) catch break :unset;
+        items.append(arena, wide.ptr) catch return;
+        window.palette_map.append(alloc, base + window.profiles.len) catch return;
+    }
+
+    tabbar.ghostty_tabbar_input_set_items(bar, items.items.ptr, @intCast(items.items.len));
+}
+
+/// Asks for a new name for a tab.
+fn showRename(tab: *Tab) void {
+    const window = tab.window;
+    var current: [256:0]u16 = undefined;
+    const n = tabTitle(tab, current[0..255]);
+    current[n] = 0;
+    window.input_tab = tab;
+    if (!showInput(
+        window,
+        .rename,
+        std.unicode.utf8ToUtf16LeStringLiteral("Tab name (empty to reset)"),
+        current[0..n :0],
+    )) window.input_tab = null;
+}
+
+/// Gives a tab a fixed name, or with an empty one goes back to showing
+/// what its shell reports.
+fn setTabTitleOverride(tab: *Tab, title: []const u8) void {
+    const alloc = tab.window.app.core_app.alloc;
+    if (tab.title_override) |old| alloc.free(old);
+    tab.title_override = if (title.len == 0) null else (alloc.dupe(u8, title) catch null);
+    syncTabTitle(tab);
+    if (tab.window.overview) reflow(tab.window);
+}
+
+/// One row of a context menu: its id and its label, or a null label for a
+/// separator.
+const MenuEntry = struct { u32, ?[]const u8 };
+
+/// Runs a context menu and returns the id picked, or 0.
+fn popupMenu(window: *Window, comptime entries: []const MenuEntry) u32 {
+    const bar = window.tab_bar orelse return 0;
+    const labels = comptime labels: {
+        var out: [entries.len]?[*:0]const u16 = undefined;
+        for (entries, 0..) |e, i| {
+            out[i] = if (e[1]) |text|
+                std.unicode.utf8ToUtf16LeStringLiteral(text).ptr
+            else
+                null;
+        }
+        const final = out;
+        break :labels final;
+    };
+    const ids = comptime ids: {
+        var out: [entries.len]u32 = undefined;
+        for (entries, 0..) |e, i| out[i] = e[0];
+        const final = out;
+        break :ids final;
+    };
+    return tabbar.ghostty_tabbar_popup_menu(bar, -1, -1, &labels, &ids, entries.len);
+}
+
+/// The terminal's right-click menu.
+fn showSurfaceMenu(surf: *Surface) void {
+    const window = surf.tab.window;
+    const picked = popupMenu(window, &.{
+        .{ 1, "Copy" },
+        .{ 2, "Paste" },
+        .{ 3, "Select all" },
+        .{ 0, null },
+        .{ 4, "Split right" },
+        .{ 5, "Split down" },
+        .{ 6, "New tab" },
+        .{ 0, null },
+        .{ 7, "Find..." },
+        .{ 8, "Command palette" },
+        .{ 0, null },
+        .{ 9, "Close pane" },
+    });
+    // The pane can have closed while the menu was up: its shell exiting
+    // does not wait for a menu.
+    if (surf.tab.window != window or surf.tab.indexOfPane(surf) == null) return;
+    if (!surf.core_ready) return;
+    const action: input.Binding.Action = switch (picked) {
+        1 => .{ .copy_to_clipboard = .mixed },
+        2 => .paste_from_clipboard,
+        3 => .select_all,
+        4 => .{ .new_split = .right },
+        5 => .{ .new_split = .down },
+        6 => .new_tab,
+        7 => .start_search,
+        8 => .toggle_command_palette,
+        9 => .close_surface,
+        else => return,
+    };
+    _ = surf.core_surface.performBindingAction(action) catch |err| {
+        log.warn("menu action failed err={}", .{err});
+    };
+}
+
+/// A tab's right-click menu.
+fn showTabMenu(window: *Window, id: tabbar.TabId) void {
+    const picked = popupMenu(window, &.{
+        .{ 1, "Rename tab..." },
+        .{ 2, "Move to new window" },
+        .{ 0, null },
+        .{ 3, "Close tab" },
+        .{ 4, "Close other tabs" },
+        .{ 5, "Close tabs to the right" },
+    });
+    // Found again after the menu, which is the only moment its index is
+    // known to be current.
+    const index = window.tabById(id) orelse return;
+    const tab = window.tabs.items[index];
+    switch (picked) {
+        1 => showRename(tab),
+        2 => moveTabToNewWindow(window.app, tab) catch |err| {
+            log.warn("failed to move tab err={}", .{err});
+        },
+        3 => closeTabAt(window, index),
+        4 => {
+            var i = window.tabs.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (window.tabs.items[i] != tab) closeTabAt(window, i);
+            }
+        },
+        5 => {
+            var i = window.tabs.items.len;
+            while (i > index + 1) {
+                i -= 1;
+                closeTabAt(window, i);
+            }
+        },
+        else => {},
+    }
+}
+
+/// Takes a tab out of its window and gives it a window of its own. The
+/// panes keep running: only what draws them changes.
+fn moveTabToNewWindow(self: *App, tab: *Tab) !void {
+    const old = tab.window;
+    // A window's only tab is already in a window of its own.
+    if (old.tabs.items.len < 2) return;
+    const index = old.indexOfTab(tab) orelse return;
+
+    setOverview(old, false);
+    if (old.tab_bar) |bar| {
+        if (tab.bar_id != 0) tabbar.ghostty_tabbar_remove_tab(bar, tab.bar_id);
+    }
+    tab.bar_id = 0;
+    _ = old.tabs.orderedRemove(index);
+    if (old.active >= old.tabs.items.len) old.active = old.tabs.items.len - 1;
+    if (old.input_tab == tab) old.input_tab = null;
+    for (tab.panes.items) |pane| {
+        if (old.input_surface == pane) old.input_surface = null;
+    }
+    old.drag_split = null;
+    if (old.tab_bar) |bar| {
+        const now = old.tabs.items[old.active];
+        if (now.bar_id != 0) tabbar.ghostty_tabbar_set_selected(bar, now.bar_id);
+    }
+    reflow(old);
+    invalidateTabBar(old);
+
+    _ = self.newWindow(tab) catch |err| {
+        // Nowhere to put it: back where it came from.
+        try old.tabs.insert(self.core_app.alloc, @min(index, old.tabs.items.len), tab);
+        attachTab(self, old, tab);
+        return err;
+    };
+}
+
+/// Makes `tab` a tab of `window`: its strip entry, its icon, its selection.
+/// The tab must already be in `window.tabs`.
+fn attachTab(self: *App, window: *Window, tab: *Tab) void {
+    tab.window = window;
+    // A profile pointer is borrowed from the window's list, and this may
+    // be a different window. The lists are detected the same way, so the
+    // same name is the same shell.
+    if (tab.profile) |p| {
+        tab.profile = for (window.profiles) |*mine| {
+            if (std.mem.eql(u8, mine.name, p.name)) break mine;
+        } else null;
+    }
+    if (window.indexOfTab(tab)) |i| window.active = i;
+    if (window.tab_bar) |bar| {
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        tab.bar_id = tabbar.ghostty_tabbar_add_tab(bar, title);
+        if (tab.bar_id != 0) {
+            setTabIcon(self, window, tab, tab.profile);
+            tabbar.ghostty_tabbar_set_selected(bar, tab.bar_id);
+        }
+    }
+    reflow(window);
+    invalidateTabBar(window);
+}
+
+/// Starts another Ghostty, elevated, running `profile`. Windows asks the
+/// user to approve it.
+fn launchElevated(self: *App, profile: *const tabbar.Profile) void {
+    const alloc = self.core_app.alloc;
+    var exe: [1024:0]u16 = undefined;
+    const exe_len = w32.GetModuleFileNameW(null, &exe, exe.len);
+    if (exe_len == 0 or exe_len >= exe.len) return;
+
+    // `-e` and then the command, each argument quoted so a path with
+    // spaces stays one argument.
+    var params: std.ArrayListUnmanaged(u8) = .empty;
+    defer params.deinit(alloc);
+    params.appendSlice(alloc, "-e") catch return;
+    for (profile.argv) |arg| {
+        params.appendSlice(alloc, " \"") catch return;
+        params.appendSlice(alloc, arg) catch return;
+        params.append(alloc, '"') catch return;
+    }
+    const wparams = std.unicode.utf8ToUtf16LeAllocZ(alloc, params.items) catch return;
+    defer alloc.free(wparams);
+
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("runas"),
+        exe[0..exe_len :0].ptr,
+        wparams.ptr,
+        null,
+        w32.SW_SHOWNORMAL,
+    );
+}
+
+/// The window an action is aimed at, or null for one aimed at the app.
+fn targetWindow(target: apprt.Target) ?*Window {
+    return switch (target) {
+        .app => null,
+        .surface => |core| core.rt_surface.tab.window,
+    };
+}
+
+/// Moves the tab at `from` to `to`. `tell_strip` is false when the strip is
+/// what did the moving and is only reporting it.
+fn moveTab(window: *Window, from: usize, to_: usize, tell_strip: bool) void {
+    const count = window.tabs.items.len;
+    if (from >= count) return;
+    const to = @min(to_, count - 1);
+    if (from == to) return;
+
+    // The active tab is tracked by position, and positions are about to
+    // shift under it.
+    const active = window.activeTabPtr();
+    const tab = window.tabs.orderedRemove(from);
+    // Cannot fail: the list just gave up the slot this takes.
+    window.tabs.insertAssumeCapacity(to, tab);
+    if (active) |a| {
+        if (window.indexOfTab(a)) |i| window.active = i;
+    }
+
+    if (tell_strip) if (window.tab_bar) |bar| {
+        if (tab.bar_id != 0) {
+            tabbar.ghostty_tabbar_move_tab(bar, tab.bar_id, @intCast(to));
+        }
+    };
+    invalidateTabBar(window);
+    if (window.overview) reflow(window);
+}
+
+/// Opens a file or URL with whatever the shell has registered for it, or
+/// `file` as a program given `param`.
+fn shellOpen(alloc: Allocator, file: []const u8, param: ?[]const u8) void {
+    const wfile = std.unicode.utf8ToUtf16LeAllocZ(alloc, file) catch return;
+    defer alloc.free(wfile);
+    const wparam: ?[:0]u16 = if (param) |p|
+        (std.unicode.utf8ToUtf16LeAllocZ(alloc, p) catch return)
+    else
+        null;
+    defer if (wparam) |p| alloc.free(p);
+
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        wfile.ptr,
+        if (wparam) |p| p.ptr else null,
+        null,
+        w32.SW_SHOWNORMAL,
+    );
+}
+
+/// True for the schemes that are safe to hand to the shell whatever the
+/// text came from: they open a browser or a mail client, never a program.
+fn isWebUrl(url: []const u8) bool {
+    for ([_][]const u8{ "http://", "https://", "mailto:" }) |scheme| {
+        if (url.len >= scheme.len and
+            std.ascii.eqlIgnoreCase(url[0..scheme.len], scheme)) return true;
+    }
+    return false;
+}
+
+fn openUrl(self: *App, value: apprt.action.OpenUrl) void {
+    // Text matched in terminal output and OSC 8 links are whatever the
+    // program on the other end wants them to be. ShellExecute "opens" an
+    // .exe by running it and a .lnk by following it, so for those only a
+    // web address goes through; a path a program printed does not get to
+    // be launched by a click. What Ghostty itself asks to open -- its own
+    // config, a file it wrote -- is trusted.
+    const trusted = switch (value.kind) {
+        .text, .html => true,
+        else => false,
+    };
+    if (!trusted and !isWebUrl(value.url)) {
+        log.info("not opening untrusted non-web link", .{});
+        return;
+    }
+    shellOpen(self.core_app.alloc, value.url, null);
+}
+
+/// Puts the window into fullscreen or takes it back out.
+fn setFullscreen(window: *Window, on: bool) void {
+    if (window.fullscreen == on) return;
+    const hwnd = window.hwnd;
+
+    if (on) {
+        const monitor = w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST) orelse return;
+        var info: w32.MONITORINFO = .{};
+        if (w32.GetMonitorInfoW(monitor, &info) == w32.FALSE) return;
+
+        window.saved_style = w32.GetWindowLongPtrW(hwnd, w32.GWL_STYLE);
+        _ = w32.GetWindowRect(hwnd, &window.saved_rect);
+        window.fullscreen = true;
+
+        // A popup has no caption and no sizing border, so the client area
+        // is the whole window and the window can be exactly the monitor.
+        const overlapped: isize = @intCast(w32.WS_OVERLAPPEDWINDOW);
+        const popup: isize = @bitCast(@as(usize, w32.WS_POPUP));
+        _ = w32.SetWindowLongPtrW(
+            hwnd,
+            w32.GWL_STYLE,
+            (window.saved_style & ~overlapped) | popup,
+        );
+        const r = info.rcMonitor;
+        _ = w32.SetWindowPos(
+            hwnd,
+            null,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED,
+        );
+    } else {
+        window.fullscreen = false;
+        _ = w32.SetWindowLongPtrW(hwnd, w32.GWL_STYLE, window.saved_style);
+        const r = window.saved_rect;
+        _ = w32.SetWindowPos(
+            hwnd,
+            null,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Moves focus to another pane of the same tab.
+fn gotoSplit(surf: *Surface, to: apprt.action.GotoSplit) bool {
+    const tab = surf.tab;
+    const root = tab.root orelse return false;
+    if (tab.panes.items.len < 2) return false;
+
+    // Directions are judged from where the panes are on screen, and a
+    // zoomed tab has only one of them on screen. Leaving the zoom is what
+    // moving to another pane means anyway.
+    if (tab.zoomed != null) {
+        tab.zoomed = null;
+        layoutNode(root, root.rect);
+    }
+
+    const target: *Surface = switch (to) {
+        .previous, .next => target: {
+            var buf: [128]*Surface = undefined;
+            var len: usize = 0;
+            collectLeaves(root, &buf, &len);
+            const at = std.mem.indexOfScalar(*Surface, buf[0..len], surf) orelse return false;
+            break :target switch (to) {
+                .previous => buf[(at + len - 1) % len],
+                else => buf[(at + 1) % len],
+            };
+        },
+        .up, .down, .left, .right => neighbour(tab, surf, to) orelse return false,
+    };
+
+    tab.focused = tab.indexOfPane(target) orelse return false;
+    reflow(tab.window);
+    return true;
+}
+
+/// The pane nearest to `surf` in a direction: the closest one that starts
+/// beyond that edge and shares some of its extent along it. Among equally
+/// close ones, the one sharing the most.
+fn neighbour(tab: *Tab, surf: *Surface, to: apprt.action.GotoSplit) ?*Surface {
+    const cur = surf.last_rect;
+    var best: ?*Surface = null;
+    var best_score: i64 = std.math.maxInt(i64);
+
+    for (tab.panes.items) |pane| {
+        if (pane == surf) continue;
+        const r = pane.last_rect;
+        if (r.right <= r.left or r.bottom <= r.top) continue;
+
+        const distance: i32 = switch (to) {
+            .right => r.left - cur.right,
+            .left => cur.left - r.right,
+            .down => r.top - cur.bottom,
+            .up => cur.top - r.bottom,
+            else => unreachable,
+        };
+        if (distance < 0) continue;
+
+        const overlap: i32 = switch (to) {
+            .left, .right => @min(r.bottom, cur.bottom) - @max(r.top, cur.top),
+            else => @min(r.right, cur.right) - @max(r.left, cur.left),
+        };
+        if (overlap <= 0) continue;
+
+        const score = @as(i64, distance) * 100_000 - overlap;
+        if (score < best_score) {
+            best_score = score;
+            best = pane;
+        }
+    }
+    return best;
+}
+
+/// Moves the nearest divider of the right orientation by `amount` pixels.
+fn resizeSplit(surf: *Surface, value: apprt.action.ResizeSplit) bool {
+    const tab = surf.tab;
+    const want: SplitDir = switch (value.direction) {
+        .left, .right => .vertical,
+        .up, .down => .horizontal,
+    };
+
+    // The nearest enclosing split that divides along the right axis: in a
+    // column of panes beside another pane, "left" has to find the divider
+    // between the column and its neighbour, not one inside the column.
+    var node = surf.node orelse return false;
+    const split_node: *SplitNode = while (node.parent) |parent| : (node = parent) {
+        if (parent.data.split.dir == want) break parent;
+    } else return false;
+
+    const r = split_node.rect;
+    const extent: f32 = @floatFromInt(switch (want) {
+        .vertical => r.right - r.left,
+        .horizontal => r.bottom - r.top,
+    });
+    if (extent <= 0) return false;
+
+    const amount: f32 = @floatFromInt(value.amount);
+    const delta = switch (value.direction) {
+        .left, .up => -amount / extent,
+        .right, .down => amount / extent,
+    };
+    const s = &split_node.data.split;
+    s.ratio = std.math.clamp(s.ratio + delta, split_ratio_min, split_ratio_max);
+
+    tab.zoomed = null;
+    reflow(tab.window);
+    return true;
+}
 
 /// Finds the shells this machine has, which is what the new-tab dropdown
 /// offers and what `windows-default-shell` names.
@@ -1046,7 +2951,10 @@ const bar_callbacks = struct {
 /// plain Win32 and registry work, and `windows-default-shell` has to keep
 /// working on the GDI fallback, where no strip exists to have a dropdown.
 fn detectProfiles(self: *App, window: *Window) void {
-    window.profiles = tabbar.detectProfiles(self.core_app.alloc) catch |err| blk: {
+    window.profiles = tabbar.detectProfiles(
+        self.core_app.alloc,
+        self.config.@"windows-profile".list.items,
+    ) catch |err| blk: {
         log.warn("shell detection failed err={}", .{err});
         break :blk &.{};
     };
@@ -1063,6 +2971,9 @@ fn initTabBar(window: *Window) void {
         .on_caption_button = bar_callbacks.onCaptionButton,
         .on_drag_start = bar_callbacks.onDragStart,
         .on_drag_double_click = bar_callbacks.onDragDoubleClick,
+        .on_tab_moved = bar_callbacks.onTabMoved,
+        .on_overview = bar_callbacks.onOverview,
+        .on_tab_context = bar_callbacks.onTabContext,
     }) orelse {
         log.info(
             "native tab strip unavailable, using the GDI strip " ++
@@ -1154,33 +3065,13 @@ fn syncTabTitle(tab: *Tab) void {
     const bar = window.tab_bar orelse return;
     if (tab.bar_id == 0) return;
 
-    const reported: []const u8 = if (tab.focusedPane()) |s|
-        s.title_buf[0..s.title_len]
-    else
-        "";
-
-    // Falling back to the profile name is what makes a Command Prompt tab
-    // read "Command Prompt" instead of the path to cmd.exe.
-    const title = if (reported.len == 0 or titleIsExePath(reported))
-        (if (tab.profile) |p|
-            p.name
-        else
-            profileNameForExe(window, reported) orelse "Ghostty")
-    else
-        reported;
-
     var buf: [513:0]u16 = undefined;
-    const n = std.unicode.utf8ToUtf16Le(buf[0..512], title) catch 0;
-    if (n == 0) {
-        const fallback = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-        tabbar.ghostty_tabbar_set_title(bar, tab.bar_id, fallback);
-        return;
-    }
+    const n = tabTitle(tab, buf[0..512]);
     buf[n] = 0;
     tabbar.ghostty_tabbar_set_title(bar, tab.bar_id, buf[0..n :0]);
 }
 
-fn newWindow(self: *App) !*Window {
+fn newWindow(self: *App, adopt: ?*Tab) !*Window {
     const alloc = self.core_app.alloc;
     const window = try alloc.create(Window);
     errdefer alloc.destroy(window);
@@ -1224,7 +3115,9 @@ fn newWindow(self: *App) !*Window {
         0,
         gl_class_name,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD | w32.WS_VISIBLE,
+        // Clipped against its siblings so that the overview's captions,
+        // which sit on top of it, are not painted over by every swap.
+        w32.WS_CHILD | w32.WS_VISIBLE | w32.WS_CLIPSIBLINGS,
         0,
         window.stripHeight(),
         client_rect.right - client_rect.left,
@@ -1235,6 +3128,9 @@ fn newWindow(self: *App) !*Window {
         window,
     ) orelse return error.Unexpected;
     window.gl_hwnd = gl_hwnd;
+    // Dropping files on the terminal types their paths.
+    w32.DragAcceptFiles(gl_hwnd, w32.TRUE);
+    try self.windows.append(alloc, window);
 
     const hdc = w32.GetDC(gl_hwnd) orelse return error.Unexpected;
     window.hdc = hdc;
@@ -1254,7 +3150,14 @@ fn newWindow(self: *App) !*Window {
     }
     window.read_fbo = try gl.Framebuffer.create();
 
-    _ = try self.newTab(window, .window, newTabProfile(self, window));
+    if (adopt) |tab| {
+        // A tab moved out of another window: it arrives with its panes
+        // running, so there is nothing to start, only somewhere to draw.
+        try window.tabs.append(alloc, tab);
+        attachTab(self, window, tab);
+    } else {
+        _ = try self.newTab(window, .window, firstTabProfile(self, window));
+    }
 
     // Show off-screen first, let the strip compose, then bring the window
     // to where it belongs.
@@ -1280,6 +3183,11 @@ fn newWindow(self: *App) !*Window {
                 w32.Sleep(4);
                 waited += 4;
             }
+
+            // And the terminal area, for the same reason as the strip: a
+            // GL window that has never swapped is white. The panes are not
+            // started yet, so this draws their background and nothing else.
+            reflow(window);
 
             _ = w32.SetWindowPos(hwnd, null, rect.left, rect.top, 0, 0, flags);
         }
@@ -1330,6 +3238,12 @@ fn newPane(
         .cursor_pos = .{ .x = 0, .y = 0 },
         .last_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     };
+
+    // Its place in the layout. Detached for now: whoever asked for the
+    // pane decides whether it is a tab's root or one side of a split.
+    const node = try alloc.create(SplitNode);
+    node.* = .{ .data = .{ .leaf = surf } };
+    surf.node = node;
 
     return surf;
 }
@@ -1526,9 +3440,15 @@ fn newTab(
     errdefer {
         self.core_app.deleteSurface(surf);
         if (surf.core_ready) surf.core_surface.deinit();
+        if (surf.node) |node| alloc.destroy(node);
         alloc.destroy(surf);
     }
     try tab.panes.append(alloc, surf);
+    tab.root = surf.node;
+
+    // A new tab is something to look at, not something to find among
+    // thumbnails.
+    setOverview(window, false);
 
     try window.tabs.append(alloc, tab);
     window.active = window.tabs.items.len - 1;
@@ -1548,14 +3468,22 @@ fn newTab(
     return surf;
 }
 
-/// Split the tab containing `pane` into two panes. MVP limitation: only a
-/// single level of splitting is supported (no recursive nesting), so this
-/// does nothing if the tab is already split.
-fn newSplit(self: *App, pane: *Surface, dir: SplitDir) !*Surface {
+/// Splits `pane` in two, giving half of its space to a new pane. `before`
+/// puts the new pane on the left or top rather than the right or bottom.
+fn newSplit(self: *App, pane: *Surface, dir: SplitDir, before: bool) !*Surface {
     const tab = pane.tab;
-    if (tab.panes.items.len >= 2) return error.AlreadySplit;
     const window = tab.window;
     const alloc = self.core_app.alloc;
+    const node = pane.node orelse return error.Unexpected;
+
+    // Too small to halve. A pane that cannot hold a prompt is not worth
+    // having, and the ratio limits could not be honoured in it anyway.
+    const r = pane.last_rect;
+    const extent = switch (dir) {
+        .vertical => r.right - r.left,
+        .horizontal => r.bottom - r.top,
+    };
+    if (extent < 120) return error.TooSmall;
 
     // A split opens the same shell a new tab would, which with nothing
     // configured means the one it is splitting away from.
@@ -1566,13 +3494,28 @@ fn newSplit(self: *App, pane: *Surface, dir: SplitDir) !*Surface {
         if (split_profile) |p| p.argv else null,
     );
     errdefer {
-        self.core_app.deleteSurface(new_pane);
-        if (new_pane.core_ready) new_pane.core_surface.deinit();
+        if (new_pane.node) |n| alloc.destroy(n);
         alloc.destroy(new_pane);
     }
+    const new_leaf = new_pane.node orelse return error.Unexpected;
 
+    // The pane being split keeps its node's place in the tree, so that
+    // node becomes the split and the pane moves down into a leaf of its
+    // own beside the new one.
+    const old_leaf = try alloc.create(SplitNode);
+    errdefer alloc.destroy(old_leaf);
     try tab.panes.append(alloc, new_pane);
-    tab.split = dir;
+
+    old_leaf.* = .{ .parent = node, .data = .{ .leaf = pane } };
+    pane.node = old_leaf;
+    new_leaf.parent = node;
+    node.data = .{ .split = .{
+        .dir = dir,
+        .a = if (before) new_leaf else old_leaf,
+        .b = if (before) old_leaf else new_leaf,
+    } };
+
+    tab.zoomed = null;
     tab.focused = tab.panes.items.len - 1;
 
     reflow(window);
@@ -1596,6 +3539,40 @@ fn closePane(surf: *Surface) void {
     }
     const i = index orelse return;
 
+    // Take the pane out of the layout: the pane beside it inherits the
+    // space, by moving up into the split that held the two of them.
+    var heir: ?*Surface = null;
+    window.drag_split = null;
+    tab.zoomed = null;
+    // A search box over a pane that is going away has nothing left to
+    // search.
+    if (window.input_surface == surf) {
+        window.input_surface = null;
+        if (window.input_mode == .search) {
+            window.input_mode = .none;
+            if (window.tab_bar) |bar| tabbar.ghostty_tabbar_input_hide(bar);
+        }
+    }
+    if (surf.node) |node| {
+        if (node.parent) |parent| {
+            const s = parent.data.split;
+            const sibling = if (s.a == node) s.b else s.a;
+            parent.data = sibling.data;
+            switch (parent.data) {
+                .leaf => |leaf| leaf.node = parent,
+                .split => |moved| {
+                    moved.a.parent = parent;
+                    moved.b.parent = parent;
+                },
+            }
+            alloc.destroy(sibling);
+            heir = parent.firstLeaf();
+        } else {
+            tab.root = null;
+        }
+        alloc.destroy(node);
+    }
+
     app.core_app.deleteSurface(surf);
     if (surf.core_ready) surf.core_surface.deinit();
     alloc.destroy(surf);
@@ -1606,8 +3583,11 @@ fn closePane(surf: *Surface) void {
         return;
     }
 
-    // Collapse back to a single full-size pane (MVP: only ever 0-2 panes).
-    tab.split = null;
+    // Focus goes to whatever took the closed pane's place, which is where
+    // the user was just looking.
+    if (heir) |h| {
+        if (tab.indexOfPane(h)) |at| tab.focused = at;
+    }
     if (tab.focused >= tab.panes.items.len) tab.focused = tab.panes.items.len - 1;
     reflow(window);
     invalidateTabBar(window);
@@ -1629,6 +3609,8 @@ fn closeTabStruct(tab: *Tab) void {
     if (window.tab_bar) |bar| {
         if (tab.bar_id != 0) tabbar.ghostty_tabbar_remove_tab(bar, tab.bar_id);
     }
+    if (window.input_tab == tab) window.input_tab = null;
+    if (tab.title_override) |name| alloc.free(name);
     alloc.destroy(tab);
     _ = window.tabs.orderedRemove(i);
 
@@ -1683,14 +3665,6 @@ fn nextTab(window: *Window, delta: isize) void {
     switchTab(window, @intCast(next));
 }
 
-/// Move keyboard/mouse focus to the other pane in the active tab's split.
-fn toggleFocus(window: *Window) void {
-    const tab = window.activeTabPtr() orelse return;
-    if (tab.panes.items.len < 2) return;
-    tab.focused = (tab.focused + 1) % tab.panes.items.len;
-    reflow(window);
-}
-
 /// Sync the active tab's (focused pane's) title to the OS window title,
 /// lay out and resize every pane of the active tab to its rect, and
 /// redraw all of them into the shared GL framebuffer before presenting
@@ -1738,59 +3712,117 @@ fn reflow(window: *Window) void {
     const win_height = client_rect.bottom - client_rect.top;
     if (win_width <= 0 or win_height <= 0) return;
 
-    // Clear the whole window first so the gap between two split panes
-    // (and any area not yet covered by a pane) isn't left with garbage
-    // from a previous frame. Each pane's own drawFrame renders into (and
-    // clears) its own offscreen target, not the default framebuffer
-    // directly, so this clear only affects the parts *outside* of what
-    // gets blitted below.
-    w32.glBindFramebuffer(w32.GL_FRAMEBUFFER, 0);
-    w32.glDisable(w32.GL_SCISSOR_TEST);
-    w32.glViewport(0, 0, win_width, win_height);
-    // Not black. This clear shows in two places: the gap between split
-    // panes, where it *is* the divider, and the whole window during
-    // startup, before any pane has produced a frame -- which read as
-    // Ghostty opening a black window before the real one. The strip's
-    // shade serves both: a divider a step darker than the terminal, and a
-    // first frame that already looks like the title bar above it.
-    //
-    // The factor matches the one the tab strip derives its own background
-    // with, so the two agree.
-    const bg = window.app.config.background;
-    const strip_factor: f32 = 0.62;
-    w32.glClearColor(
-        @as(f32, @floatFromInt(bg.r)) / 255.0 * strip_factor,
-        @as(f32, @floatFromInt(bg.g)) / 255.0 * strip_factor,
-        @as(f32, @floatFromInt(bg.b)) / 255.0 * strip_factor,
-        1,
-    );
-    w32.glClear(w32.GL_COLOR_BUFFER_BIT);
+    // The overview draws every tab and lays none of them out: the panes
+    // keep the rects they had, which is what their frames were drawn for.
+    if (window.overview) {
+        presentOverview(window, win_width, win_height);
+        return;
+    }
 
-    for (tab.panes.items, 0..) |pane, i| {
-        const rect = tab.paneRect(i, client_rect);
-        pane.last_rect = rect;
+    // Lay out first. Every pane's rect is settled before anything is
+    // drawn or started, so that both can rely on `last_rect`.
+    tab.layout(client_rect);
+    var starting = false;
+    for (tab.panes.items) |pane| {
+        const rect = pane.last_rect;
+        if (pane.pending != null and window.settled and
+            rect.right > rect.left and rect.bottom > rect.top)
+        {
+            starting = true;
+        }
+    }
 
+    if (starting) {
+        // Starting a pane brings up a whole terminal -- fonts, the pty, the
+        // shell -- on this thread, which is the one that paints. Without a
+        // frame on screen first, the window sits unpainted for as long as
+        // that takes, and an unpainted GL window is white: that was the
+        // white flash a new window opened with. So put the background up
+        // before going quiet.
+        present(window, tab, win_width, win_height);
+
+        for (tab.panes.items) |pane| {
+            if (pane.pending == null) continue;
+            const rect = pane.last_rect;
+            if (rect.right <= rect.left or rect.bottom <= rect.top) continue;
+            // The pane's rect is settled as of the loop above, so this is
+            // the first moment its shell can be started at a size it will
+            // keep. Any earlier and the pty is created at a guess and
+            // resized under a shell that has already started printing. See
+            // `Surface.pending`.
+            window.app.startPane(pane) catch |err| {
+                log.err("failed to start pane err={}", .{err});
+            };
+        }
+
+        // Starting a pane performs actions, and several of them land back
+        // in reflow, which makes its own context current on the way.
+        if (w32.wglMakeCurrent(window.hdc, window.hglrc) == w32.FALSE) return;
+    }
+
+    for (tab.panes.items) |pane| {
+        if (!pane.core_ready) continue;
+        const rect = pane.last_rect;
         const w: i32 = @max(0, rect.right - rect.left);
         const h: i32 = @max(0, rect.bottom - rect.top);
         if (w == 0 or h == 0) continue;
-
-        // The pane's rect is settled as of the line above, so this is the
-        // first moment its shell can be started at a size it will keep.
-        // Any earlier and the pty is created at a guess and resized under
-        // a shell that has already started printing. See `Surface.pending`.
-        if (pane.pending != null) {
-            if (!window.settled) continue;
-            window.app.startPane(pane) catch |err| {
-                log.err("failed to start pane err={}", .{err});
-                continue;
-            };
-        }
-        if (!pane.core_ready) continue;
-
         pane.core_surface.sizeCallback(.{
             .width = @intCast(w),
             .height = @intCast(h),
         }) catch |err| log.warn("sizeCallback failed err={}", .{err});
+    }
+
+    present(window, tab, win_width, win_height);
+}
+
+/// Draws the active tab into the window and swaps: the divider shade
+/// everywhere, then each pane's background, then each pane's latest frame
+/// over that. Expects the window's context to be current and every pane's
+/// `last_rect` to be up to date.
+fn present(window: *Window, tab: *Tab, win_width: i32, win_height: i32) void {
+    // Clear the whole window first so the gap between two split panes
+    // isn't left with garbage from a previous frame. Each pane's own
+    // drawFrame renders into (and clears) its own offscreen target, not
+    // the default framebuffer directly, so this clear only affects the
+    // parts *outside* of what gets drawn below.
+    w32.glBindFramebuffer(w32.GL_FRAMEBUFFER, 0);
+    w32.glDisable(w32.GL_SCISSOR_TEST);
+    w32.glViewport(0, 0, win_width, win_height);
+    // What is left of this clear once the panes are drawn is the divider
+    // between them, so it is the strip's shade: a step darker than the
+    // terminal. The factor matches the one the tab strip derives its own
+    // background with, so the two agree.
+    const bg = window.app.config.background;
+    const bg_r = @as(f32, @floatFromInt(bg.r)) / 255.0;
+    const bg_g = @as(f32, @floatFromInt(bg.g)) / 255.0;
+    const bg_b = @as(f32, @floatFromInt(bg.b)) / 255.0;
+    const strip_factor: f32 = 0.62;
+    w32.glClearColor(bg_r * strip_factor, bg_g * strip_factor, bg_b * strip_factor, 1);
+    w32.glClear(w32.GL_COLOR_BUFFER_BIT);
+
+    for (tab.panes.items) |pane| {
+        const rect = pane.last_rect;
+        const w: i32 = @max(0, rect.right - rect.left);
+        const h: i32 = @max(0, rect.bottom - rect.top);
+        if (w == 0 or h == 0) continue;
+
+        // A pane is the terminal's background colour before it is anything
+        // else. Its first frame takes a second or so to arrive -- the
+        // renderer has fonts to load and the shell has to start -- and
+        // until then this is all there is to show, so it has to already be
+        // the right colour. This used to be left at the divider's shade,
+        // which made every new window and tab open dark and then light up.
+        // It also covers what a frame does not: one drawn for a smaller
+        // size than the pane now has leaves the bottom and right edges to
+        // this.
+        w32.glEnable(w32.GL_SCISSOR_TEST);
+        w32.glScissor(rect.left, win_height - rect.bottom, w, h);
+        w32.glClearColor(bg_r, bg_g, bg_b, 1);
+        w32.glClear(w32.GL_COLOR_BUFFER_BIT);
+        // A blit is clipped by the scissor too.
+        w32.glDisable(w32.GL_SCISSOR_TEST);
+
+        if (!pane.core_ready) continue;
 
         // The pane's renderer draws on its own thread and leaves each
         // finished frame in a texture this context shares. All that is
@@ -1800,7 +3832,6 @@ fn reflow(window: *Window) void {
             log.warn("failed to present pane err={}", .{err});
         };
     }
-    w32.glDisable(w32.GL_SCISSOR_TEST);
 
     dimUnfocusedPanes(window, tab, win_width, win_height);
 
@@ -1902,14 +3933,15 @@ fn dimUnfocusedPanes(
     w32.glEnable(w32.GL_BLEND);
     w32.glBlendFunc(w32.GL_SRC_ALPHA, w32.GL_ONE_MINUS_SRC_ALPHA);
 
-    // Black unless the user named a fill colour. Compositing the
-    // *background* colour over a pane already painted in it is a no-op,
-    // which is what "dim" must not be.
-    const fill = window.app.config.@"unfocused-split-fill";
+    // The terminal's background unless the user named a fill colour, as
+    // on GTK and macOS: the pane's own background stays put and its text
+    // and colours fade toward it, rather than the whole pane going dark.
+    const fill = window.app.config.@"unfocused-split-fill" orelse
+        window.app.config.background;
     w32.glColor4f(
-        if (fill) |f| @as(f32, @floatFromInt(f.r)) / 255.0 else 0,
-        if (fill) |f| @as(f32, @floatFromInt(f.g)) / 255.0 else 0,
-        if (fill) |f| @as(f32, @floatFromInt(f.b)) / 255.0 else 0,
+        @as(f32, @floatFromInt(fill.r)) / 255.0,
+        @as(f32, @floatFromInt(fill.g)) / 255.0,
+        @as(f32, @floatFromInt(fill.b)) / 255.0,
         alpha,
     );
 
@@ -1933,6 +3965,415 @@ fn dimUnfocusedPanes(
     w32.glMatrixMode(w32.GL_PROJECTION);
     w32.glPopMatrix();
     w32.glMatrixMode(w32.GL_MODELVIEW);
+}
+
+/// Turns the tab overview on or off.
+///
+/// The overview is what GTK's AdwTabOverview and the macOS "Show All Tabs"
+/// are: every tab of the window as a live thumbnail, to pick one from. It
+/// takes over the terminal area, so while it is up the keyboard and mouse
+/// drive it rather than the terminal.
+fn setOverview(window: *Window, on: bool) void {
+    if (window.overview == on) return;
+    window.overview = on;
+    window.drag_split = null;
+    if (on) {
+        window.overview_sel = window.active;
+        // Any text-shaped cursor the terminal left behind is wrong here.
+        _ = w32.SetCursor(w32.LoadCursorW(null, w32.IDC_ARROW));
+    } else {
+        for (window.overview_labels.items) |label| {
+            _ = w32.ShowWindow(label, w32.SW_HIDE);
+        }
+    }
+    reflow(window);
+}
+
+/// Space around and between thumbnails, and the height of the caption
+/// under each, in pixels.
+const overview_gap: i32 = 28;
+const overview_label_height: i32 = 24;
+/// A thumbnail is never more than this share of the terminal area, so a
+/// window with one or two tabs shows thumbnails rather than near-full-size
+/// copies.
+const overview_max_scale: f32 = 0.6;
+
+/// Where the thumbnail for tab `index` goes, in the GL window's client
+/// coordinates. The grid is as square as the tab count allows and every
+/// thumbnail has the terminal area's own proportions.
+fn overviewRect(window: *Window, index: usize, width: i32, height: i32) w32.RECT {
+    const count: i32 = @intCast(@max(1, window.tabs.items.len));
+    var cols: i32 = 1;
+    while (cols * cols < count) cols += 1;
+    const rows = @divTrunc(count + cols - 1, cols);
+
+    const cell_w = @divTrunc(width - overview_gap * (cols + 1), cols);
+    const cell_h = @divTrunc(height - overview_gap * (rows + 1), rows) - overview_label_height;
+    if (cell_w <= 0 or cell_h <= 0 or width <= 0 or height <= 0) {
+        return .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    }
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    var tw: f32 = @min(
+        @as(f32, @floatFromInt(cell_w)),
+        @as(f32, @floatFromInt(width)) * overview_max_scale,
+    );
+    var th = tw / aspect;
+    if (th > @as(f32, @floatFromInt(cell_h))) {
+        th = @floatFromInt(cell_h);
+        tw = th * aspect;
+    }
+    const w: i32 = @intFromFloat(tw);
+    const h: i32 = @intFromFloat(th);
+
+    // The grid as a whole is centred, not each cell's content within a
+    // stretched cell: otherwise a few small thumbnails drift apart.
+    const grid_w = cols * w + (cols - 1) * overview_gap;
+    const grid_h = rows * (h + overview_label_height) + (rows - 1) * overview_gap;
+    const i: i32 = @intCast(index);
+    const col = @mod(i, cols);
+    const row = @divTrunc(i, cols);
+    const left = @divTrunc(width - grid_w, 2) + col * (w + overview_gap);
+    const top = @divTrunc(height - grid_h, 2) + row * (h + overview_label_height + overview_gap);
+    return .{ .left = left, .top = top, .right = left + w, .bottom = top + h };
+}
+
+/// The tab whose thumbnail or caption is at this point.
+fn overviewHit(window: *Window, x: i32, y: i32) ?usize {
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(window.gl_hwnd, &client) == w32.FALSE) return null;
+    for (window.tabs.items, 0..) |_, i| {
+        const r = overviewRect(window, i, client.right, client.bottom);
+        if (x >= r.left and x < r.right and
+            y >= r.top and y < r.bottom + overview_label_height) return i;
+    }
+    return null;
+}
+
+/// Fills a rect given in top-left client coordinates with a colour.
+fn fillRect(r: w32.RECT, win_height: i32, red: f32, green: f32, blue: f32) void {
+    const w = r.right - r.left;
+    const h = r.bottom - r.top;
+    if (w <= 0 or h <= 0) return;
+    w32.glEnable(w32.GL_SCISSOR_TEST);
+    w32.glScissor(r.left, win_height - r.bottom, w, h);
+    w32.glClearColor(red, green, blue, 1);
+    w32.glClear(w32.GL_COLOR_BUFFER_BIT);
+    w32.glDisable(w32.GL_SCISSOR_TEST);
+}
+
+/// Draws the overview: each tab's panes, scaled down, in a grid.
+fn presentOverview(window: *Window, win_width: i32, win_height: i32) void {
+    const config = &window.app.config;
+    const bg = config.background;
+    const fg = config.foreground;
+    const bg_r = @as(f32, @floatFromInt(bg.r)) / 255.0;
+    const bg_g = @as(f32, @floatFromInt(bg.g)) / 255.0;
+    const bg_b = @as(f32, @floatFromInt(bg.b)) / 255.0;
+
+    w32.glBindFramebuffer(w32.GL_FRAMEBUFFER, 0);
+    w32.glDisable(w32.GL_SCISSOR_TEST);
+    w32.glViewport(0, 0, win_width, win_height);
+    // The strip's shade, so the thumbnails -- which are the terminal's own
+    // colour -- stand out from what is behind them.
+    const strip_factor: f32 = 0.62;
+    w32.glClearColor(bg_r * strip_factor, bg_g * strip_factor, bg_b * strip_factor, 1);
+    w32.glClear(w32.GL_COLOR_BUFFER_BIT);
+
+    if (window.overview_sel >= window.tabs.items.len) {
+        window.overview_sel = window.tabs.items.len -| 1;
+    }
+
+    for (window.tabs.items, 0..) |tab, i| {
+        const r = overviewRect(window, i, win_width, win_height);
+        if (r.right <= r.left) continue;
+
+        // The frame: the foreground colour around the one that Enter or a
+        // click would open, a faint line around the rest.
+        const selected = i == window.overview_sel;
+        const border: i32 = if (selected) 3 else 1;
+        const outer: w32.RECT = .{
+            .left = r.left - border,
+            .top = r.top - border,
+            .right = r.right + border,
+            .bottom = r.bottom + border,
+        };
+        if (selected) {
+            fillRect(
+                outer,
+                win_height,
+                @as(f32, @floatFromInt(fg.r)) / 255.0,
+                @as(f32, @floatFromInt(fg.g)) / 255.0,
+                @as(f32, @floatFromInt(fg.b)) / 255.0,
+            );
+        } else {
+            // Half way from the background to the foreground.
+            fillRect(
+                outer,
+                win_height,
+                (bg_r + @as(f32, @floatFromInt(fg.r)) / 255.0) / 2 * 0.6,
+                (bg_g + @as(f32, @floatFromInt(fg.g)) / 255.0) / 2 * 0.6,
+                (bg_b + @as(f32, @floatFromInt(fg.b)) / 255.0) / 2 * 0.6,
+            );
+        }
+        fillRect(r, win_height, bg_r, bg_g, bg_b);
+
+        // The area the tab's panes cover between them, which is what the
+        // thumbnail is a scaled copy of. Taken from the panes rather than
+        // from the window because a background tab was last laid out for
+        // whatever size the window had then.
+        var bounds: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        var any = false;
+        for (tab.panes.items) |pane| {
+            const p = pane.last_rect;
+            if (p.right <= p.left or p.bottom <= p.top) continue;
+            if (!any) {
+                bounds = p;
+                any = true;
+                continue;
+            }
+            bounds.left = @min(bounds.left, p.left);
+            bounds.top = @min(bounds.top, p.top);
+            bounds.right = @max(bounds.right, p.right);
+            bounds.bottom = @max(bounds.bottom, p.bottom);
+        }
+        if (!any) continue;
+
+        const sx = @as(f32, @floatFromInt(r.right - r.left)) /
+            @as(f32, @floatFromInt(bounds.right - bounds.left));
+        const sy = @as(f32, @floatFromInt(r.bottom - r.top)) /
+            @as(f32, @floatFromInt(bounds.bottom - bounds.top));
+
+        for (tab.panes.items) |pane| {
+            if (!pane.core_ready) continue;
+            const p = pane.last_rect;
+            if (p.right <= p.left or p.bottom <= p.top) continue;
+            const dst: w32.RECT = .{
+                .left = r.left + @as(i32, @intFromFloat(@as(f32, @floatFromInt(p.left - bounds.left)) * sx)),
+                .top = r.top + @as(i32, @intFromFloat(@as(f32, @floatFromInt(p.top - bounds.top)) * sy)),
+                .right = r.left + @as(i32, @intFromFloat(@as(f32, @floatFromInt(p.right - bounds.left)) * sx)),
+                .bottom = r.top + @as(i32, @intFromFloat(@as(f32, @floatFromInt(p.bottom - bounds.top)) * sy)),
+            };
+            _ = pane.core_surface.renderer.takeFrame();
+            blitPaneScaled(window, pane, dst, win_height) catch |err| {
+                log.warn("failed to draw thumbnail err={}", .{err});
+            };
+        }
+    }
+
+    _ = w32.SwapBuffers(window.hdc);
+    syncOverviewLabels(window, win_width, win_height);
+}
+
+/// Copies a pane's latest frame into `dst`, scaled to fit it.
+fn blitPaneScaled(
+    window: *Window,
+    pane: *Surface,
+    dst: w32.RECT,
+    win_height: i32,
+) !void {
+    const fbo = window.read_fbo orelse return;
+    const front = &pane.core_surface.renderer.api.front;
+    const frame = front.lock() orelse return;
+    defer front.unlock();
+
+    // The part of the frame that is the pane: as in blitPane, a frame can
+    // trail the pane's size, and its top left is what lines up.
+    const rect = pane.last_rect;
+    const w: i32 = @min(@as(i32, @intCast(frame.width)), rect.right - rect.left);
+    const h: i32 = @min(@as(i32, @intCast(frame.height)), rect.bottom - rect.top);
+    if (w <= 0 or h <= 0) return;
+    if (dst.right <= dst.left or dst.bottom <= dst.top) return;
+
+    const bound = try fbo.bind(.read);
+    defer bound.unbind();
+    try bound.texture2D(.color0, .@"2d", frame.texture, 0);
+
+    const src_y: i32 = @as(i32, @intCast(frame.height)) - h;
+    try gl.blitFramebuffer(
+        0,
+        src_y,
+        w,
+        src_y + h,
+        dst.left,
+        win_height - dst.bottom,
+        dst.right,
+        win_height - dst.top,
+        .{ .color_buffer_bit = true },
+        .linear,
+    );
+}
+
+/// The name a tab goes by: what its shell reports, or the profile's name
+/// when that is missing or is only the path of the executable. Written
+/// into `buf` as UTF-16; returns its length.
+fn tabTitle(tab: *Tab, buf: []u16) usize {
+    const window = tab.window;
+    if (tab.title_override) |name| {
+        const n = std.unicode.utf8ToUtf16Le(buf, name) catch 0;
+        if (n > 0) return n;
+    }
+    const reported: []const u8 = if (tab.focusedPane()) |s|
+        s.title_buf[0..s.title_len]
+    else
+        "";
+
+    // Falling back to the profile name is what makes a Command Prompt tab
+    // read "Command Prompt" instead of the path to cmd.exe.
+    const title = if (reported.len == 0 or titleIsExePath(reported))
+        (if (tab.profile) |p|
+            p.name
+        else
+            profileNameForExe(window, reported) orelse "Ghostty")
+    else
+        reported;
+
+    const n = std.unicode.utf8ToUtf16Le(buf, title) catch 0;
+    if (n > 0) return n;
+    const fallback = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    @memcpy(buf[0..fallback.len], fallback);
+    return fallback.len;
+}
+
+/// Puts a caption under each thumbnail, creating the caption windows the
+/// first time each is needed. Runs after every overview frame, so it only
+/// touches what is out of date.
+fn syncOverviewLabels(window: *Window, width: i32, height: i32) void {
+    const app = window.app;
+    const alloc = app.core_app.alloc;
+    const strip = if (window.fullscreen) 0 else window.stripHeight();
+
+    while (window.overview_labels.items.len < window.tabs.items.len) {
+        const label = w32.CreateWindowExW(
+            0,
+            label_class_name,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            w32.WS_CHILD | w32.WS_CLIPSIBLINGS,
+            0,
+            0,
+            0,
+            0,
+            window.hwnd,
+            null,
+            app.hinstance,
+            window,
+        ) orelse return;
+        window.overview_labels.append(alloc, label) catch {
+            _ = w32.DestroyWindow(label);
+            return;
+        };
+    }
+
+    for (window.overview_labels.items, 0..) |label, i| {
+        if (i >= window.tabs.items.len) {
+            _ = w32.ShowWindow(label, w32.SW_HIDE);
+            continue;
+        }
+        const r = overviewRect(window, i, width, height);
+
+        var want: [256:0]u16 = undefined;
+        const n = tabTitle(window.tabs.items[i], want[0..255]);
+        want[n] = 0;
+        var have: [256:0]u16 = undefined;
+        const have_len: usize = @intCast(@max(0, w32.GetWindowTextW(label, &have, 256)));
+        if (!std.mem.eql(u16, want[0..n], have[0..have_len])) {
+            _ = w32.SetWindowTextW(label, want[0..n :0]);
+            _ = w32.InvalidateRect(label, null, w32.TRUE);
+        }
+
+        // In the frame's coordinates, which start above the strip. Placed
+        // at the top of the z-order: the caption has to be over the GL
+        // window, which is its sibling.
+        _ = w32.SetWindowPos(
+            label,
+            null,
+            r.left,
+            strip + r.bottom + 4,
+            r.right - r.left,
+            overview_label_height - 4,
+            w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW,
+        );
+    }
+}
+
+/// Window procedure for an overview caption: one line of centred text on
+/// the overview's background. Clicks fall through to the GL window under
+/// it, so a caption selects its tab just as its thumbnail does.
+fn labelWndProc(
+    hwnd: w32.HWND,
+    msg: w32.UINT,
+    wparam: w32.WPARAM,
+    lparam: w32.LPARAM,
+) callconv(.winapi) w32.LRESULT {
+    if (msg == w32.WM_NCCREATE) {
+        const cs: *const w32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (cs.lpCreateParams) |params| {
+            _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(params)));
+        }
+        return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    switch (msg) {
+        w32.WM_NCHITTEST => return w32.HTTRANSPARENT,
+        w32.WM_ERASEBKGND => return 1,
+        w32.WM_PAINT => {
+            var ps: w32.PAINTSTRUCT = undefined;
+            const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
+            defer _ = w32.EndPaint(hwnd, &ps);
+            const window = getWindow(hwnd) orelse return 0;
+            const app = window.app;
+            const bg = app.config.background;
+            const fg = app.config.foreground;
+
+            var rect: w32.RECT = undefined;
+            _ = w32.GetClientRect(hwnd, &rect);
+            // The same shade presentOverview clears to.
+            const brush = w32.CreateSolidBrush(w32.RGB(
+                scaleChannel(bg.r, 0.62),
+                scaleChannel(bg.g, 0.62),
+                scaleChannel(bg.b, 0.62),
+            )) orelse return 0;
+            _ = w32.FillRect(hdc, &rect, brush);
+            _ = w32.DeleteObject(@ptrCast(brush));
+
+            if (app.ui_font == null) {
+                app.ui_font = w32.CreateFontW(
+                    -13,
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    1, // DEFAULT_CHARSET
+                    0,
+                    0,
+                    5, // CLEARTYPE_QUALITY
+                    0,
+                    std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+                );
+            }
+            const old = if (app.ui_font) |f| w32.SelectObject(hdc, @ptrCast(f)) else null;
+            defer if (old) |o| {
+                _ = w32.SelectObject(hdc, o);
+            };
+
+            var text: [256:0]u16 = undefined;
+            const n = w32.GetWindowTextW(hwnd, &text, 256);
+            _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
+            _ = w32.SetTextColor(hdc, w32.RGB(fg.r, fg.g, fg.b));
+            _ = w32.DrawTextW(
+                hdc,
+                &text,
+                n,
+                &rect,
+                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS,
+            );
+            return 0;
+        },
+        else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 fn invalidateTabBar(window: *Window) void {
@@ -2156,6 +4597,11 @@ pub const Surface = struct {
     /// Last focus state handed to the core, so syncFocus can skip
     /// surfaces that haven't changed.
     focused: bool = false,
+    /// This pane's leaf in its tab's layout tree.
+    node: ?*SplitNode = null,
+    /// The mouse cursor the terminal last asked for (`mouse_shape`), or
+    /// null for the ordinary arrow.
+    cursor: ?w32.HCURSOR = null,
 
     pub const Pending = struct {
         context: apprt.surface.NewSurfaceContext,
@@ -2300,6 +4746,8 @@ fn currentMods() input.Mods {
         .shift = w32.GetKeyState(@intCast(w32.VK_SHIFT)) < 0,
         .ctrl = w32.GetKeyState(@intCast(w32.VK_CONTROL)) < 0,
         .alt = w32.GetKeyState(@intCast(w32.VK_MENU)) < 0,
+        .super = w32.GetKeyState(@intCast(w32.VK_LWIN)) < 0 or
+            w32.GetKeyState(@intCast(w32.VK_RWIN)) < 0,
     };
 }
 
@@ -2407,9 +4855,16 @@ fn handleKey(surf: *Surface, wparam: w32.WPARAM, action: input.Action) bool {
     // only thing that knows the user's layout and any dead-key
     // composition. Everything else -- control keys, and any chord -- is
     // encoded by Ghostty from the physical key.
+    //
+    // "Printable" is decided by whether the key types a character on this
+    // layout, not by which keys are not control keys: arrows, Home/End,
+    // Page Up/Down, Insert, Delete and the function keys type nothing, so
+    // they never produce a WM_CHAR. Counting them as printable, as this
+    // once did, meant that pressed on their own they reached nothing at
+    // all -- no history on Up, no F-keys for htop or mc.
     const printable = switch (key) {
         .backspace, .tab, .enter, .escape => false,
-        else => true,
+        else => w32.MapVirtualKeyW(vk, w32.MAPVK_VK_TO_CHAR) != 0,
     };
     if (printable and !mods.ctrl and !mods.alt) return false;
 
@@ -2455,80 +4910,6 @@ fn mouseButton(
     };
 }
 
-/// True if this WM_KEYDOWN was a tab/split-management shortcut and was
-/// handled (Ctrl+T new tab, Ctrl+W close pane/tab, Ctrl+Tab /
-/// Ctrl+Shift+Tab switch tab, Ctrl+Shift+O/E split vertical/horizontal,
-/// Ctrl+Alt+Arrow move focus between panes). These are intercepted before
-/// being forwarded to the terminal.
-fn handleTabShortcut(window: *Window, wparam: w32.WPARAM) bool {
-    const ctrl = w32.GetKeyState(@intCast(w32.VK_CONTROL)) < 0;
-    if (!ctrl) return false;
-    const shift = w32.GetKeyState(@intCast(w32.VK_SHIFT)) < 0;
-    const alt = w32.GetKeyState(@intCast(w32.VK_MENU)) < 0;
-
-    const vk: u32 = @intCast(wparam);
-
-    if (shift) {
-        switch (vk) {
-            w32.VK_O => {
-                if (window.focusedSurface()) |surf| {
-                    _ = window.app.newSplit(surf, .vertical) catch |err| {
-                        log.warn("failed to create split err={}", .{err});
-                    };
-                }
-                return true;
-            },
-            w32.VK_E => {
-                if (window.focusedSurface()) |surf| {
-                    _ = window.app.newSplit(surf, .horizontal) catch |err| {
-                        log.warn("failed to create split err={}", .{err});
-                    };
-                }
-                return true;
-            },
-            w32.VK_TAB => {
-                nextTab(window, -1);
-                return true;
-            },
-            else => {},
-        }
-        return false;
-    }
-
-    if (alt) {
-        switch (vk) {
-            w32.VK_LEFT, w32.VK_RIGHT, w32.VK_UP, w32.VK_DOWN => {
-                toggleFocus(window);
-                return true;
-            },
-            else => {},
-        }
-        return false;
-    }
-
-    switch (vk) {
-        w32.VK_T => {
-            _ = window.app.newTab(
-                window,
-                .tab,
-                newTabProfile(window.app, window),
-            ) catch |err| {
-                log.warn("failed to create tab err={}", .{err});
-            };
-            return true;
-        },
-        w32.VK_W => {
-            if (window.focusedSurface()) |surf| closePane(surf);
-            return true;
-        },
-        w32.VK_TAB => {
-            nextTab(window, 1);
-            return true;
-        },
-        else => return false,
-    }
-}
-
 /// Window procedure for the top-level frame window. This owns the tab
 /// strip (drawn with GDI) and hosts the GL child window below it.
 fn frameWndProc(
@@ -2553,16 +4934,43 @@ fn frameWndProc(
             const app = window.app;
             const alloc = app.core_app.alloc;
 
+            // While the tabs are still there to be written down.
+            app.saveSession(window);
+
+            // The children outlive this message: Windows destroys them
+            // after their parent's WM_DESTROY, and the GL surface can be
+            // sent a resize on the way out. Each finds the Window through
+            // its user data, which is about to be freed, so unhook them
+            // first -- a resize arriving afterwards then finds nothing and
+            // goes to DefWindowProc instead of into freed memory.
+            _ = w32.SetWindowLongPtrW(window.gl_hwnd, w32.GWLP_USERDATA, 0);
+            for (window.overview_labels.items) |label| {
+                _ = w32.SetWindowLongPtrW(label, w32.GWLP_USERDATA, 0);
+            }
+            _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+
             for (window.tabs.items) |tab| {
                 for (tab.panes.items) |surf| {
                     app.core_app.deleteSurface(surf);
                     if (surf.core_ready) surf.core_surface.deinit();
                     alloc.destroy(surf);
                 }
+                if (tab.root) |root| freeTree(alloc, root);
+                if (tab.title_override) |name| alloc.free(name);
                 tab.panes.deinit(alloc);
                 alloc.destroy(tab);
             }
             window.tabs.deinit(alloc);
+            window.palette_map.deinit(alloc);
+            if (app.quick_window == window) app.quick_window = null;
+            // The caption windows are children and go with the frame.
+            window.overview_labels.deinit(alloc);
+            for (app.windows.items, 0..) |w, i| {
+                if (w == window) {
+                    _ = app.windows.swapRemove(i);
+                    break;
+                }
+            }
 
             if (window.tab_bar) |bar| tabbar.ghostty_tabbar_destroy(bar);
             if (window.profiles.len > 0) tabbar.freeProfiles(alloc, window.profiles);
@@ -2587,23 +4995,41 @@ fn frameWndProc(
             return 0;
         },
 
+        wm_tab_menu => {
+            showTabMenu(window, @intCast(@as(usize, @bitCast(lparam))));
+            return 0;
+        },
+
+        wm_ipc_new_window => {
+            _ = window.app.newWindow(null) catch |err| {
+                log.warn("failed to open window for another instance err={}", .{err});
+            };
+            return 0;
+        },
+
         w32.WM_SIZE => {
             const width: i32 = w32.LOWORD(lparam);
             const height: i32 = w32.HIWORD(lparam);
-            const strip = window.stripHeight();
+            const full_strip = window.stripHeight();
+            // Fullscreen is the terminal and nothing else.
+            const strip: i32 = if (window.fullscreen) 0 else full_strip;
 
             // A maximized window with a custom frame is positioned offset
             // by the frame thickness, which would push the top of the
             // strip off-screen. Pad by exactly that much.
             const maximized = wparam == w32.SIZE_MAXIMIZED;
-            const pad: i32 = if (window.customFrame() and maximized)
+            const pad: i32 = if (window.customFrame() and maximized and !window.fullscreen)
                 w32.GetSystemMetrics(w32.SM_CYFRAME) +
                     w32.GetSystemMetrics(w32.SM_CXPADDEDBORDER)
             else
                 0;
 
             if (window.tab_bar) |bar| {
-                tabbar.ghostty_tabbar_resize(bar, 0, pad, width, strip);
+                // Out of sight above the window rather than hidden: XAML
+                // stops composing for a hidden island, and it would come
+                // back white.
+                const y: i32 = if (window.fullscreen) -full_strip else pad;
+                tabbar.ghostty_tabbar_resize(bar, 0, y, width, full_strip);
                 tabbar.ghostty_tabbar_set_maximized(bar, if (maximized) 1 else 0);
             }
 
@@ -2639,6 +5065,8 @@ fn frameWndProc(
         w32.WM_NCHITTEST => {
             const hit = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
             if (!window.customFrame() or hit != w32.HTCLIENT) return hit;
+            // Nothing to resize by in fullscreen.
+            if (window.fullscreen) return hit;
 
             var pt: w32.POINT = .{
                 .x = @as(i16, @bitCast(w32.LOWORD(lparam))),
@@ -2749,12 +5177,111 @@ fn glWndProc(
         w32.WM_ERASEBKGND => return 1,
 
         w32.WM_CHAR => {
+            // The overview owns the keyboard while it is up.
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| handleChar(surf, wparam);
             return 0;
         },
 
+        w32.WM_SETCURSOR => {
+            // Only over our own client area; the frame's edges keep their
+            // sizing arrows.
+            if (w32.LOWORD(lparam) != @as(u16, @intCast(w32.HTCLIENT))) {
+                return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            const arrow = w32.LoadCursorW(null, w32.IDC_ARROW);
+            if (window.overview) {
+                _ = w32.SetCursor(arrow);
+                return 1;
+            }
+            const tab = window.activeTabPtr() orelse return 1;
+
+            var pt: w32.POINT = undefined;
+            _ = w32.GetCursorPos(&pt);
+            _ = w32.ScreenToClient(hwnd, &pt);
+            const over_divider = window.drag_split orelse tab.dividerHit(pt.x, pt.y);
+            if (over_divider) |node| {
+                _ = w32.SetCursor(w32.LoadCursorW(null, switch (node.data.split.dir) {
+                    .vertical => w32.IDC_SIZEWE,
+                    .horizontal => w32.IDC_SIZENS,
+                }));
+                return 1;
+            }
+
+            // The shape belongs to the pane the pointer is over, not the
+            // focused one: a program in the other pane may want a pointer
+            // where this one wants an I-beam.
+            // A pane that has not been told otherwise is showing text, and
+            // the core only reports the shape when it changes from that.
+            const surf = if (tab.paneAt(pt.x, pt.y)) |i| tab.panes.items[i] else null;
+            const ibeam = w32.LoadCursorW(null, w32.IDC_IBEAM);
+            _ = w32.SetCursor(if (surf) |s| (s.cursor orelse ibeam) else arrow);
+            return 1;
+        },
+
+        w32.WM_DROPFILES => {
+            const drop: w32.HDROP = @ptrFromInt(wparam);
+            defer w32.DragFinish(drop);
+            if (window.overview) return 0;
+            const surf = window.focusedSurface() orelse return 0;
+            if (!surf.core_ready) return 0;
+
+            // The paths, space separated, each quoted if it needs to be --
+            // what a shell wants to see where a file name goes. Sent as a
+            // paste so that bracketed paste applies and nothing in a path
+            // can be taken for a keystroke.
+            const alloc = window.app.core_app.alloc;
+            var text: std.ArrayListUnmanaged(u8) = .empty;
+            defer text.deinit(alloc);
+            const count = w32.DragQueryFileW(drop, 0xFFFF_FFFF, null, 0);
+            var i: w32.UINT = 0;
+            while (i < count) : (i += 1) {
+                var wide: [1024]u16 = undefined;
+                const len = w32.DragQueryFileW(drop, i, &wide, wide.len);
+                if (len == 0) continue;
+                var utf8: [3072]u8 = undefined;
+                const n = std.unicode.utf16LeToUtf8(&utf8, wide[0..len]) catch continue;
+                const path = utf8[0..n];
+                const quote = std.mem.indexOfAny(u8, path, " &()^;,") != null;
+                if (text.items.len > 0) text.append(alloc, ' ') catch return 0;
+                if (quote) text.append(alloc, '"') catch return 0;
+                text.appendSlice(alloc, path) catch return 0;
+                if (quote) text.append(alloc, '"') catch return 0;
+            }
+            if (text.items.len == 0) return 0;
+            surf.core_surface.textCallback(text.items) catch |err| {
+                log.warn("failed to paste dropped files err={}", .{err});
+            };
+            return 0;
+        },
+
         w32.WM_KEYDOWN, w32.WM_SYSKEYDOWN => {
-            if (handleTabShortcut(window, wparam)) return 0;
+            if (window.overview) {
+                const count = window.tabs.items.len;
+                const vk: u32 = @intCast(wparam);
+                switch (vk) {
+                    w32.VK_ESCAPE => setOverview(window, false),
+                    w32.VK_RETURN, w32.VK_SPACE => {
+                        const pick = window.overview_sel;
+                        setOverview(window, false);
+                        switchTab(window, pick);
+                    },
+                    w32.VK_RIGHT, w32.VK_DOWN, w32.VK_TAB => if (count > 0) {
+                        window.overview_sel = (window.overview_sel + 1) % count;
+                        reflow(window);
+                    },
+                    w32.VK_LEFT, w32.VK_UP => if (count > 0) {
+                        window.overview_sel = (window.overview_sel + count - 1) % count;
+                        reflow(window);
+                    },
+                    // Alt chords still reach the system, so Alt+F4 and
+                    // Alt+Space keep working.
+                    else => if (msg == w32.WM_SYSKEYDOWN) {
+                        return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                    },
+                }
+                return 0;
+            }
             if (window.focusedSurface()) |surf| {
                 // Swallowing the key when it was handled is what keeps
                 // DefWindowProc from also translating it into a WM_CHAR,
@@ -2765,11 +5292,52 @@ fn glWndProc(
         },
 
         w32.WM_KEYUP, w32.WM_SYSKEYUP => {
+            if (window.overview) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
             if (window.focusedSurface()) |surf| _ = handleKey(surf, wparam, .release);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
         w32.WM_MOUSEMOVE => {
+            if (window.overview) {
+                const x: i16 = @bitCast(w32.LOWORD(lparam));
+                const y: i16 = @bitCast(w32.HIWORD(lparam));
+                if (overviewHit(window, x, y)) |i| {
+                    if (i != window.overview_sel) {
+                        window.overview_sel = i;
+                        reflow(window);
+                    }
+                }
+                return 0;
+            }
+            if (window.drag_split) |node| {
+                // The divider follows the pointer: its ratio is simply
+                // where the pointer is along the split's extent.
+                const x: i16 = @bitCast(w32.LOWORD(lparam));
+                const y: i16 = @bitCast(w32.HIWORD(lparam));
+                const r = node.rect;
+                const s = &node.data.split;
+                const pos: f32, const start: f32, const extent: f32 = switch (s.dir) {
+                    .vertical => .{
+                        @floatFromInt(x),
+                        @floatFromInt(r.left),
+                        @floatFromInt(r.right - r.left),
+                    },
+                    .horizontal => .{
+                        @floatFromInt(y),
+                        @floatFromInt(r.top),
+                        @floatFromInt(r.bottom - r.top),
+                    },
+                };
+                if (extent > 0) {
+                    s.ratio = std.math.clamp(
+                        (pos - start) / extent,
+                        split_ratio_min,
+                        split_ratio_max,
+                    );
+                    reflow(window);
+                }
+                return 0;
+            }
             if (window.focusedSurface()) |surf| {
                 const x: i16 = @bitCast(w32.LOWORD(lparam));
                 const y: i16 = @bitCast(w32.HIWORD(lparam));
@@ -2788,9 +5356,26 @@ fn glWndProc(
 
         w32.WM_LBUTTONDOWN => {
             _ = w32.SetFocus(hwnd);
+            if (window.overview) {
+                const x: i16 = @bitCast(w32.LOWORD(lparam));
+                const y: i16 = @bitCast(w32.HIWORD(lparam));
+                // A click on a thumbnail opens it; a click on the empty
+                // space around them just closes the overview.
+                const pick = overviewHit(window, x, y);
+                setOverview(window, false);
+                if (pick) |i| switchTab(window, i);
+                return 0;
+            }
             if (window.activeTabPtr()) |tab| {
                 const x: i16 = @bitCast(w32.LOWORD(lparam));
                 const y: i16 = @bitCast(w32.HIWORD(lparam));
+                if (tab.dividerHit(x, y)) |node| {
+                    // Captured, so the drag keeps going when the pointer
+                    // slips off the divider or out of the window.
+                    window.drag_split = node;
+                    _ = w32.SetCapture(hwnd);
+                    return 0;
+                }
                 if (tab.paneAt(x, y)) |idx| {
                     // Clicking into a pane focuses it. This path does not
                     // reflow, so it has to sync focus itself.
@@ -2804,27 +5389,48 @@ fn glWndProc(
             return 0;
         },
         w32.WM_LBUTTONUP => {
+            if (window.drag_split != null) {
+                window.drag_split = null;
+                _ = w32.ReleaseCapture();
+                return 0;
+            }
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| mouseButton(surf, .release, .left);
             return 0;
         },
         w32.WM_RBUTTONDOWN => {
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| mouseButton(surf, .press, .right);
             return 0;
         },
         w32.WM_RBUTTONUP => {
-            if (window.focusedSurface()) |surf| mouseButton(surf, .release, .right);
+            if (window.overview) return 0;
+            const surf = window.focusedSurface() orelse return 0;
+            mouseButton(surf, .release, .right);
+            // The menu, unless the right button is spoken for: a program
+            // that has asked for mouse events gets them (Shift overrides,
+            // as it does for selection), and the config may have given the
+            // button another job.
+            if (!surf.core_ready) return 0;
+            if (window.app.config.@"right-click-action" != .@"context-menu") return 0;
+            const shift = w32.GetKeyState(@intCast(w32.VK_SHIFT)) < 0;
+            if (surf.core_surface.mouseCaptured() and !shift) return 0;
+            showSurfaceMenu(surf);
             return 0;
         },
         w32.WM_MBUTTONDOWN => {
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| mouseButton(surf, .press, .middle);
             return 0;
         },
         w32.WM_MBUTTONUP => {
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| mouseButton(surf, .release, .middle);
             return 0;
         },
 
         w32.WM_MOUSEWHEEL => {
+            if (window.overview) return 0;
             if (window.focusedSurface()) |surf| {
                 if (surf.core_ready) {
                     const delta: i16 = @bitCast(w32.HIWORD(wparam));
