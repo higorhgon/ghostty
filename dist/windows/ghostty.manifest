@@ -1,5 +1,20 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <!-- XAML Islands refuse to start (a bare E_UNEXPECTED) in a process whose
+       own manifest has no maxversiontested, packaged or not; an MSIX build
+       gets away without it only because the package manifest carries one.
+       The entries are an array and each is needed, as Windows Terminal
+       found: 18362 turns islands on, and the OS does not read 19041 as
+       newer than it (microsoft/terminal#10265). -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <maxversiontested Id="10.0.18362.0"/>
+      <maxversiontested Id="10.0.22000.0"/>
+      <maxversiontested Id="10.0.22621.0"/>
+      <maxversiontested Id="10.0.26100.0"/>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
   <asmv3:application>
     <asmv3:windowsSettings>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
