@@ -11,7 +11,9 @@
 
 param(
     # Skips registration; just builds the layout.
-    [switch]$NoRegister
+    [switch]$NoRegister,
+    # Stages a debug build anyway, for debugging Ghostty itself.
+    [switch]$AllowDebug
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +24,18 @@ $zigOut = Join-Path $root "zig-out"
 $dll = Join-Path $root "dist\windows\tabbar\ghostty-tabbar\ghostty_tabbar.dll"
 
 if (-not (Test-Path (Join-Path $zigOut "bin\ghostty.exe"))) {
-    throw "zig-out\bin\ghostty.exe not found -- run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc"
+    throw "zig-out\bin\ghostty.exe not found -- run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast"
+}
+# `zig build` defaults to Debug, and a debug Ghostty is not just slower:
+# its allocator tracks every allocation, so heavy output can take minutes
+# and leave the window not responding. Only a debug binary carries the
+# warning it prints at startup, which makes that string a reliable tell.
+if (-not $AllowDebug) {
+    $exeBytes = [IO.File]::ReadAllBytes((Join-Path $zigOut "bin\ghostty.exe"))
+    $exeText = [Text.Encoding]::ASCII.GetString($exeBytes)
+    if ($exeText.Contains("This is a debug build. Performance will be very poor.")) {
+        throw "zig-out\bin\ghostty.exe is a debug build -- rebuild with -Doptimize=ReleaseFast, or pass -AllowDebug to stage it anyway"
+    }
 }
 if (-not (Test-Path $dll)) {
     throw "ghostty_tabbar.dll not found -- run dist\windows\tabbar\ghostty-tabbar\build.bat"

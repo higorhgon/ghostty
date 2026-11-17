@@ -30,7 +30,9 @@ The full build, from the repo root, in order:
    DLL sources changed or `ghostty_tabbar.dll` is missing (needs
    `dist\windows\tabbar\fetch-deps.ps1` to have been run once). It comes
    first because Ghostty links against the import library it produces.
-2. `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc`
+2. `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast`
+   -- the default is Debug, which is unusably slow under heavy output and
+   which `stage.ps1` refuses to stage (pass it `-AllowDebug` to override).
 3. `dist\windows\msix\stage.ps1` -- stages the MSIX layout and registers
    it (needs Developer Mode). Close any running packaged Ghostty first.
 
