@@ -3114,6 +3114,14 @@ fn titleIsExePath(title: []const u8) bool {
     return title.len >= 3 and title[1] == ':' and title[2] == '\\';
 }
 
+/// Whether `title` is just the file name of the program `profile` runs,
+/// such as "wsl.exe" for a WSL distribution's profile.
+fn titleIsProfileProgram(profile: ?*const tabbar.Profile, title: []const u8) bool {
+    const p = profile orelse return false;
+    if (p.argv.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(fileName(p.argv[0]), title);
+}
+
 /// Finds a detected profile whose executable matches `exe_path`, so a tab
 /// that was not opened from the dropdown -- the window's first tab, or one
 /// from the plain "+" -- still gets a readable name instead of a path.
@@ -3762,20 +3770,21 @@ fn reflow(window: *Window) void {
     // so the layout-only callers (a plain resize) cost nothing.
     syncFocus(window);
 
-    if (tab.focusedPane()) |focused| {
-        if (focused.title_len > 0) {
-            var zbuf: [513:0]u16 = undefined;
-            const wn = std.unicode.utf8ToUtf16Le(zbuf[0..512], focused.title_buf[0..focused.title_len]) catch 0;
-            zbuf[wn] = 0;
-            // Still worth setting with a custom frame: it is what the task
-            // bar and Alt-Tab show, even though no title bar displays it.
-            if (wn != window.shown_title_len or
-                !std.mem.eql(u16, zbuf[0..wn], window.shown_title[0..wn]))
-            {
-                _ = w32.SetWindowTextW(window.hwnd, zbuf[0..wn :0]);
-                @memcpy(window.shown_title[0..wn], zbuf[0..wn]);
-                window.shown_title_len = wn;
-            }
+    {
+        // The tab's title, not the pane's raw one, so that the window reads
+        // the same as its tab: the profile name in place of a bare
+        // "wsl.exe" or a path to cmd.exe, and a title the user renamed the
+        // tab to. Still worth setting with a custom frame: it is what the
+        // task bar and Alt-Tab show, even though no title bar displays it.
+        var zbuf: [513:0]u16 = undefined;
+        const wn = tabTitle(tab, zbuf[0..512]);
+        zbuf[wn] = 0;
+        if (wn != window.shown_title_len or
+            !std.mem.eql(u16, zbuf[0..wn], window.shown_title[0..wn]))
+        {
+            _ = w32.SetWindowTextW(window.hwnd, zbuf[0..wn :0]);
+            @memcpy(window.shown_title[0..wn], zbuf[0..wn]);
+            window.shown_title_len = wn;
         }
     }
     syncTabTitle(tab);
@@ -4295,8 +4304,15 @@ fn tabTitle(tab: *Tab, buf: []u16) usize {
         "";
 
     // Falling back to the profile name is what makes a Command Prompt tab
-    // read "Command Prompt" instead of the path to cmd.exe.
-    const title = if (reported.len == 0 or titleIsExePath(reported))
+    // read "Command Prompt" instead of the path to cmd.exe. The console
+    // host does not always report the full path: a WSL tab gets just
+    // "wsl.exe", which says nothing about which distribution it is, and
+    // every distribution's profile runs that same program. The tab's own
+    // profile is what knows, so a title that is merely the name of the
+    // program that profile runs counts as no title at all.
+    const title = if (reported.len == 0 or
+        titleIsExePath(reported) or
+        titleIsProfileProgram(tab.profile, reported))
         (if (tab.profile) |p|
             p.name
         else
